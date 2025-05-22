@@ -302,7 +302,7 @@ func (s *fakeImageService) ImageFSPaths() map[string]string { return make(map[st
 
 func (s *fakeImageService) DisableSnapshotAnnotations() bool { return false }
 
-func (s *fakeImageService) PullImage(context.Context, string, func(string) (string, string, error), *runtime.PodSandboxConfig, string) (string, error) {
+func (s *fakeImageService) PullImage(context.Context, string, func(string) (string, string, error), *runtime.PodSandboxConfig, string, string) (string, error) {
 	return "", errors.New("not implemented")
 }
 
