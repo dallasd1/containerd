@@ -99,6 +99,15 @@ import (
 
 // PullImage pulls an image with authentication config.
 func (c *GRPCCRIImageService) PullImage(ctx context.Context, r *runtime.PullImageRequest) (_ *runtime.PullImageResponse, err error) {
+	imageRef := r.GetImage().GetImage()
+	snapshotter, err := c.snapshotterFromPodSandboxConfig(ctx, imageRef, r.SandboxConfig, r.GetImage().GetRuntimeHandler())
+	if err != nil {
+		return nil, err
+	}
+	return c.pullImage(ctx, r, snapshotter)
+}
+
+func (c *GRPCCRIImageService) pullImage(ctx context.Context, r *runtime.PullImageRequest, snapshotter string) (_ *runtime.PullImageResponse, err error) {
 
 	imageRef := r.GetImage().GetImage()
 
@@ -113,14 +122,14 @@ func (c *GRPCCRIImageService) PullImage(ctx context.Context, r *runtime.PullImag
 		return ParseAuth(hostauth, host)
 	}
 
-	ref, err := c.CRIImageService.PullImage(ctx, imageRef, credentials, r.SandboxConfig, r.GetImage().GetRuntimeHandler())
+	ref, err := c.CRIImageService.PullImage(ctx, imageRef, credentials, r.SandboxConfig, r.GetImage().GetRuntimeHandler(), snapshotter)
 	if err != nil {
 		return nil, err
 	}
 	return &runtime.PullImageResponse{ImageRef: ref}, nil
 }
 
-func (c *CRIImageService) PullImage(ctx context.Context, name string, credentials func(string) (string, string, error), sandboxConfig *runtime.PodSandboxConfig, runtimeHandler string) (_ string, err error) {
+func (c *CRIImageService) PullImage(ctx context.Context, name string, credentials func(string) (string, string, error), sandboxConfig *runtime.PodSandboxConfig, runtimeHandler string, snapshotter string) (_ string, err error) {
 	span := tracing.SpanFromContext(ctx)
 	defer func() {
 		// TODO: add domain label for imagePulls metrics, and we may need to provide a mechanism
@@ -163,11 +172,6 @@ func (c *CRIImageService) PullImage(ctx context.Context, name string, credential
 	imagePullProgressTimeout, err := time.ParseDuration(c.config.ImagePullProgressTimeout)
 	if err != nil {
 		return "", fmt.Errorf("failed to parse image_pull_progress_timeout %q: %w", c.config.ImagePullProgressTimeout, err)
-	}
-
-	snapshotter, err := c.snapshotterFromPodSandboxConfig(ctx, ref, sandboxConfig, runtimeHandler)
-	if err != nil {
-		return "", err
 	}
 
 	span.SetAttributes(
