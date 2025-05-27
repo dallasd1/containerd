@@ -31,6 +31,7 @@ import (
 	"github.com/containerd/containerd/v2/internal/kmutex"
 	"github.com/containerd/containerd/v2/pkg/labels"
 	"github.com/containerd/containerd/v2/pkg/rootfs"
+	"github.com/containerd/containerd/v2/pkg/snapshotters"
 	"github.com/containerd/errdefs"
 	"github.com/containerd/platforms"
 	"github.com/opencontainers/go-digest"
@@ -344,7 +345,12 @@ func (i *image) Unpack(ctx context.Context, snapshotterName string, opts ...Unpa
 	}
 
 	for _, layer := range layers {
-		unpacked, err = rootfs.ApplyLayerWithOpts(ctx, layer, chain, sn, a, config.SnapshotOpts, config.ApplyOpts)
+		snOpts := append(config.SnapshotOpts, snapshots.WithLabels(map[string]string{
+			snapshotters.TargetLayerDigestLabel:    layer.Blob.Digest.String(),
+			snapshotters.TargetManifestDigestLabel: i.Target().Digest.String(),
+			snapshotters.TargetRefLabel: 		  	i.Name(),
+		}))
+		unpacked, err = rootfs.ApplyLayerWithOpts(ctx, layer, chain, sn, a, snOpts, config.ApplyOpts)
 		if err != nil {
 			return fmt.Errorf("apply layer error for %q: %w", i.Name(), err)
 		}
