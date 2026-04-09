@@ -33,18 +33,18 @@ import (
 
 const (
 	// TargetLayerSignatureLabel contains the base64-encoded signature for dm-verity verification
-	TargetLayerSignatureLabel = "containerd.io/snapshot/cri.layer-signature"
+	TargetLayerSignatureLabel = "containerd.io/snapshot/dmverity.layer-signature"
 
 	// TargetLayerRootHashLabel contains the dm-verity root hash for the layer
-	TargetLayerRootHashLabel = "containerd.io/snapshot/cri.layer-roothash"
+	TargetLayerRootHashLabel = "containerd.io/snapshot/dmverity.layer-roothash"
 
 	// Annotation keys used in signature manifest layers
-	sigLayerDigestAnnotation    = "image.layer.digest"
-	sigLayerRootHashAnnotation  = "image.layer.root_hash"
-	sigLayerSignatureAnnotation = "image.layer.signature"
+	sigLayerDigestAnnotation    = "io.cncf.notary.dmverity.layer-digest"
+	sigLayerRootHashAnnotation  = "io.cncf.notary.dmverity.layer-roothash"
+	sigLayerSignatureAnnotation = "io.cncf.notary.dmverity.layer-signature"
 
 	// SignatureArtifactType is the artifact type for OCI referrers containing dm-verity signatures
-	SignatureArtifactType = "application/vnd.oci.mt.pkcs7"
+	SignatureArtifactType = "application/vnd.cncf.notary.dmverity.v1"
 
 	// ociAnnotationCreated is the OCI annotation for creation timestamp
 	ociAnnotationCreated = "org.opencontainers.image.created"
