@@ -30,6 +30,7 @@ import (
 	"github.com/containerd/containerd/v2/core/images"
 	"github.com/containerd/containerd/v2/core/transfer"
 	"github.com/containerd/containerd/v2/core/unpack"
+	snpkg "github.com/containerd/containerd/v2/pkg/snapshotters"
 )
 
 func (ts *localTransferService) importStream(ctx context.Context, i transfer.ImageImporter, is transfer.ImageStorer, tops *transfer.Config) error {
@@ -104,6 +105,19 @@ func (ts *localTransferService) importStream(ctx context.Context, i transfer.Ima
 			if ts.config.DuplicationSuppressor != nil {
 				uopts = append(uopts, unpack.WithDuplicationSuppressor(ts.config.DuplicationSuppressor))
 			}
+
+			// Always wire the dm-verity signature handler when unpacking an
+			// OCI-layout import, symmetric to core/transfer/local/pull.go.
+			// The handler is a no-op if no referrer manifests exist for the
+			// imported image; when they do (e.g. a tarball produced by
+			// `oras cp --recursive` + `ctr image import --digests`) it walks
+			// the local content store, finds the dm-verity sig manifest by
+			// subject digest, and decorates the image layer descriptors with
+			// the annotations the erofs differ requires when
+			// require_signatures=true. Without this wrap the import path is
+			// the only entry point that cannot satisfy require_signatures.
+			handler = snpkg.AppendSignatureHandlerWrapper(snpkg.NewContentStoreFetcher(ts.content))(handler)
+
 			unpacker, err = unpack.NewUnpacker(ctx, ts.content, uopts...)
 			if err != nil {
 				return fmt.Errorf("unable to initialize unpacker: %w", err)
