@@ -18,12 +18,16 @@ package dmverity
 
 import (
 	"bytes"
+	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 
 	"github.com/containerd/containerd/v2/core/mount"
 	"github.com/containerd/go-dmverity/pkg/utils"
 	"github.com/containerd/go-dmverity/pkg/verity"
+	"github.com/containerd/log"
+	"github.com/google/uuid"
 )
 
 func IsSupported() (bool, error) {
@@ -198,6 +202,121 @@ func Close(name string) error {
 		return fmt.Errorf("failed to close dm-verity device: %w", err)
 	}
 	return nil
+}
+
+// FormatLayerBlob formats an existing EROFS layer blob with a dm-verity hash tree
+// in-place (appended after the data) and writes the .dmverity sidecar.
+// Returns the computed root hash.
+//
+// Idempotent: if a .dmverity sidecar already exists at MetadataPath(layerBlobPath)
+// the cached root hash is returned and no re-formatting is done.
+//
+// On error after the in-place truncate, the helper restores the original blob
+// size and removes any stale .dmverity sidecar — leaving the layer in the
+// pre-call state so the caller can clean up the bare blob via its normal
+// orphan-handling path.
+//
+// blockSize must match the EROFS image's logical block size:
+//   - tar-index mode requires 512 (mkfs.erofs --tar=i uses 512-byte metadata blocks)
+//   - all other modes use 4096 (standard page size)
+func FormatLayerBlob(ctx context.Context, layerBlobPath string, blockSize uint32) (string, error) {
+	metadataPath := MetadataPath(layerBlobPath)
+	if _, err := os.Stat(metadataPath); err == nil {
+		log.G(ctx).WithField("path", layerBlobPath).Debug("Layer already formatted with dm-verity, skipping")
+		metadata, err := ReadMetadata(layerBlobPath)
+		if err != nil {
+			return "", fmt.Errorf("failed to read existing dm-verity metadata: %w", err)
+		}
+		return metadata.RootHash, nil
+	}
+
+	fileInfo, err := os.Stat(layerBlobPath)
+	if err != nil {
+		return "", fmt.Errorf("failed to stat layer blob: %w", err)
+	}
+	originalSize := fileInfo.Size()
+
+	opts := DefaultDmverityOptions()
+	if blockSize > 0 {
+		opts.DataBlockSize = blockSize
+		opts.HashBlockSize = blockSize
+	}
+
+	dataBlocks := (originalSize + int64(opts.DataBlockSize) - 1) / int64(opts.DataBlockSize)
+	hashOffset := uint64(dataBlocks * int64(opts.DataBlockSize))
+
+	opts.HashOffset = hashOffset
+	opts.DataBlocks = uint64(dataBlocks)
+
+	hashTreeSize, err := verity.GetHashTreeSize(&verity.Params{
+		HashName:      opts.HashAlgorithm,
+		DataBlockSize: opts.DataBlockSize,
+		HashBlockSize: opts.HashBlockSize,
+		DataBlocks:    opts.DataBlocks,
+		HashType:      opts.HashType,
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to calculate hash tree size: %w", err)
+	}
+
+	superblockSize := uint64(0)
+	if !opts.NoSuperblock {
+		superblockSize = utils.AlignUp(uint64(verity.SuperblockSize), uint64(opts.HashBlockSize))
+	}
+	requiredSize := hashOffset + superblockSize + hashTreeSize
+	if err := os.Truncate(layerBlobPath, int64(requiredSize)); err != nil {
+		return "", fmt.Errorf("failed to pre-allocate space for hash tree: %w", err)
+	}
+
+	// Rollback: if we fail after the truncate, restore the original blob size
+	// and remove any partial .dmverity sidecar so the caller sees the same
+	// pre-call state (bare layer.erofs, no .dmverity). This lets the caller's
+	// orphan-handling path treat the layer uniformly.
+	formatted := false
+	defer func() {
+		if formatted {
+			return
+		}
+		if terr := os.Truncate(layerBlobPath, originalSize); terr != nil {
+			log.G(ctx).WithError(terr).WithField("path", layerBlobPath).Warn("FormatLayerBlob rollback: failed to restore original blob size")
+		}
+		if rerr := os.Remove(metadataPath); rerr != nil && !os.IsNotExist(rerr) {
+			log.G(ctx).WithError(rerr).WithField("path", metadataPath).Warn("FormatLayerBlob rollback: failed to remove stale .dmverity sidecar")
+		}
+	}()
+
+	if opts.UUID == "" {
+		opts.UUID = uuid.New().String()
+	}
+
+	rootHash, err := Format(layerBlobPath, layerBlobPath, opts)
+	if err != nil {
+		return "", fmt.Errorf("failed to format dm-verity: %w", err)
+	}
+
+	metadata := DmverityMetadata{
+		RootHash:   rootHash,
+		HashOffset: hashOffset,
+	}
+	metadataBytes, err := json.MarshalIndent(metadata, "", "  ")
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal dm-verity metadata: %w", err)
+	}
+	if err := os.WriteFile(metadataPath, metadataBytes, 0644); err != nil {
+		return "", fmt.Errorf("failed to write dm-verity metadata: %w", err)
+	}
+
+	formatted = true
+
+	log.G(ctx).WithFields(log.Fields{
+		"path":       layerBlobPath,
+		"size":       originalSize,
+		"blockSize":  opts.DataBlockSize,
+		"hashOffset": hashOffset,
+		"rootHash":   rootHash,
+	}).Info("Successfully formatted dm-verity layer")
+
+	return rootHash, nil
 }
 
 // VerifyDevice ensures an existing dm-verity device matches the expected metadata and is healthy.

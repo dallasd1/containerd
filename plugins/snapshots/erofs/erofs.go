@@ -691,6 +691,28 @@ func (s *snapshotter) Commit(ctx context.Context, name, key string, opts ...snap
 			}
 			return cerr
 		}
+
+		// Format the freshly-created layer.erofs with dm-verity so the
+		// snapshotter-built blob carries the same .dmverity sidecar that
+		// the EROFS differ produces. Without this the snapshotter mount
+		// path rejects the layer at applyDmverityPolicy time (orphan
+		// layer.erofs). Block size 4096 — commitBlock never produces a
+		// tar-index layer.
+		switch s.dmverityMode {
+		case "off":
+			// nothing to do
+		case "auto":
+			if _, ferr := dmverity.FormatLayerBlob(ctx, layerBlob, 4096); ferr != nil {
+				log.G(ctx).WithError(ferr).WithField("layerBlob", layerBlob).Warn("dm-verity auto: format failed, continuing without sidecar")
+			}
+		case "on":
+			if _, ferr := dmverity.FormatLayerBlob(ctx, layerBlob, 4096); ferr != nil {
+				// FormatLayerBlob's internal rollback has already restored
+				// the original blob size and removed any partial sidecar,
+				// so the orphan-guard below will treat this uniformly.
+				return fmt.Errorf("failed to format dm-verity for snapshotter-built layer: %w", ferr)
+			}
+		}
 	}
 
 	// Enable fsverity on the EROFS layer if configured
@@ -707,7 +729,10 @@ func (s *snapshotter) Commit(ctx context.Context, name, key string, opts ...snap
 		}
 	}
 
-	// Note: dm-verity formatting is handled by the EROFS differ, not here
+	// dm-verity formatting is done above — by the differ when layer.erofs
+	// came from a tar stream, or in the commitBlock branch above when we
+	// built layer.erofs from the overlay upperdir. The 3010 orphan-guard
+	// below catches pre-existing orphans from older snapshotter versions.
 
 	return s.ms.WithTransaction(ctx, true, func(ctx context.Context) error {
 		if _, err := os.Stat(layerBlob); err != nil {
