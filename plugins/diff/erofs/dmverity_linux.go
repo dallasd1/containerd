@@ -22,6 +22,7 @@ import (
 	"context"
 
 	"github.com/containerd/containerd/v2/internal/dmverity"
+	"github.com/containerd/log"
 )
 
 // formatDmverityLayer delegates to the shared internal/dmverity.FormatLayerBlob
@@ -34,5 +35,12 @@ func (s *erofsDiff) formatDmverityLayer(ctx context.Context, layerBlobPath strin
 	if s.enableTarIndex {
 		blockSize = 512
 	}
+	log.G(ctx).WithFields(log.Fields{
+		"tag":            "dmverity_format",
+		"event":          "differ_invoke",
+		"path":           layerBlobPath,
+		"blockSize":      blockSize,
+		"enableTarIndex": s.enableTarIndex,
+	}).Info("dmverity_format: differ.Apply invoking FormatLayerBlob (tar-stream path)")
 	return dmverity.FormatLayerBlob(ctx, layerBlobPath, blockSize)
 }

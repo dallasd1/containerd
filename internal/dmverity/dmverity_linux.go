@@ -22,6 +22,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"time"
 
 	"github.com/containerd/containerd/v2/core/mount"
 	"github.com/containerd/go-dmverity/pkg/utils"
@@ -220,13 +221,25 @@ func Close(name string) error {
 //   - tar-index mode requires 512 (mkfs.erofs --tar=i uses 512-byte metadata blocks)
 //   - all other modes use 4096 (standard page size)
 func FormatLayerBlob(ctx context.Context, layerBlobPath string, blockSize uint32) (string, error) {
+	startedAt := time.Now()
 	metadataPath := MetadataPath(layerBlobPath)
 	if _, err := os.Stat(metadataPath); err == nil {
-		log.G(ctx).WithField("path", layerBlobPath).Debug("Layer already formatted with dm-verity, skipping")
 		metadata, err := ReadMetadata(layerBlobPath)
 		if err != nil {
+			log.G(ctx).WithError(err).WithFields(log.Fields{
+				"tag":          "dmverity_format",
+				"event":        "idempotent_read_failed",
+				"path":         layerBlobPath,
+				"metadataPath": metadataPath,
+			}).Warn("dmverity_format: failed to read existing .dmverity sidecar during idempotency check")
 			return "", fmt.Errorf("failed to read existing dm-verity metadata: %w", err)
 		}
+		log.G(ctx).WithFields(log.Fields{
+			"tag":      "dmverity_format",
+			"event":    "idempotent_hit",
+			"path":     layerBlobPath,
+			"rootHash": metadata.RootHash,
+		}).Info("dmverity_format: layer already formatted (.dmverity sidecar present), returning cached root hash")
 		return metadata.RootHash, nil
 	}
 
@@ -235,6 +248,14 @@ func FormatLayerBlob(ctx context.Context, layerBlobPath string, blockSize uint32
 		return "", fmt.Errorf("failed to stat layer blob: %w", err)
 	}
 	originalSize := fileInfo.Size()
+
+	log.G(ctx).WithFields(log.Fields{
+		"tag":          "dmverity_format",
+		"event":        "enter",
+		"path":         layerBlobPath,
+		"originalSize": originalSize,
+		"blockSize":    blockSize,
+	}).Info("dmverity_format: ENTER FormatLayerBlob")
 
 	opts := DefaultDmverityOptions()
 	if blockSize > 0 {
@@ -277,6 +298,13 @@ func FormatLayerBlob(ctx context.Context, layerBlobPath string, blockSize uint32
 		if formatted {
 			return
 		}
+		log.G(ctx).WithFields(log.Fields{
+			"tag":          "dmverity_format",
+			"event":        "rollback",
+			"path":         layerBlobPath,
+			"originalSize": originalSize,
+			"elapsedMs":    time.Since(startedAt).Milliseconds(),
+		}).Warn("dmverity_format: ROLLBACK — format failed after pre-allocation; restoring blob and removing partial sidecar")
 		if terr := os.Truncate(layerBlobPath, originalSize); terr != nil {
 			log.G(ctx).WithError(terr).WithField("path", layerBlobPath).Warn("FormatLayerBlob rollback: failed to restore original blob size")
 		}
@@ -308,13 +336,23 @@ func FormatLayerBlob(ctx context.Context, layerBlobPath string, blockSize uint32
 
 	formatted = true
 
+	finalInfo, statErr := os.Stat(layerBlobPath)
+	finalSize := int64(-1)
+	if statErr == nil {
+		finalSize = finalInfo.Size()
+	}
+
 	log.G(ctx).WithFields(log.Fields{
-		"path":       layerBlobPath,
-		"size":       originalSize,
-		"blockSize":  opts.DataBlockSize,
-		"hashOffset": hashOffset,
-		"rootHash":   rootHash,
-	}).Info("Successfully formatted dm-verity layer")
+		"tag":          "dmverity_format",
+		"event":        "success",
+		"path":         layerBlobPath,
+		"originalSize": originalSize,
+		"finalSize":    finalSize,
+		"blockSize":    opts.DataBlockSize,
+		"hashOffset":   hashOffset,
+		"rootHash":     rootHash,
+		"elapsedMs":    time.Since(startedAt).Milliseconds(),
+	}).Info("dmverity_format: SUCCESS — layer formatted, .dmverity sidecar written")
 
 	return rootHash, nil
 }
