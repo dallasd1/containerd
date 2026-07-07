@@ -22,6 +22,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/containerd/containerd/v2/core/mount"
@@ -30,6 +31,34 @@ import (
 	"github.com/containerd/log"
 	"github.com/google/uuid"
 )
+
+// requireSignaturesParamPath is the sysfs entry exposing the dm-verity module's
+// require_signatures parameter (set via the dm_verity.require_signatures=1
+// kernel command line or a modprobe.d option).
+const requireSignaturesParamPath = "/sys/module/dm_verity/parameters/require_signatures"
+
+// KernelRequiresSignatures reports whether the running kernel's dm-verity
+// module mandates a trusted root-hash signature for every dm-verity device
+// (dm_verity.require_signatures=1).
+//
+// When true, the kernel refuses to open any dm-verity target that is not
+// accompanied by a signature verified against a kernel keyring, so containerd
+// must write and pass the per-layer signature. When false or unreadable, the
+// kernel does not mandate signatures; containerd must NOT pass one, so that
+// nodes without the signing CA enrolled can still run signed images. This makes
+// the kernel command line the single source of truth for enforcement.
+func KernelRequiresSignatures() bool {
+	b, err := os.ReadFile(requireSignaturesParamPath)
+	if err != nil {
+		return false
+	}
+	switch strings.TrimSpace(string(b)) {
+	case "Y", "1":
+		return true
+	default:
+		return false
+	}
+}
 
 func IsSupported() (bool, error) {
 	moduleData, err := os.ReadFile("/proc/modules")

@@ -45,3 +45,9 @@ func Close(_ string) error {
 func VerifyDevice(_ string, _ string) error {
 	return errUnsupported
 }
+
+// KernelRequiresSignatures is always false on non-Linux platforms, where
+// dm-verity is unsupported.
+func KernelRequiresSignatures() bool {
+	return false
+}

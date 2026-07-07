@@ -226,7 +226,15 @@ func (s erofsDiff) Apply(ctx context.Context, desc ocispec.Descriptor, mounts []
 			return emptyDesc, fmt.Errorf("failed to format dm-verity layer: %w", err)
 		}
 
-		if s.requireSignatures {
+		// Enforcement is driven by the kernel's dm-verity require_signatures
+		// module parameter (set via the dm_verity.require_signatures=1 kernel
+		// command line on ACL nodes) so the kernel command line is the single
+		// source of truth. The s.requireSignatures config toggle is retained
+		// as an explicit override for setups that opt in via containerd config.
+		// When neither is set, no signature is written and the mount opens the
+		// device without one, so nodes lacking the signing CA can still run
+		// signed images.
+		if s.requireSignatures || dmverity.KernelRequiresSignatures() {
 			sig := desc.Annotations[snpkg.TargetLayerSignatureLabel]
 			if sig == "" {
 				return emptyDesc, fmt.Errorf("dm-verity signature required but not present on layer %s", desc.Digest)
