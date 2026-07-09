@@ -19,7 +19,12 @@
 package erofs
 
 import (
+	"bytes"
 	"context"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
 
 	"github.com/containerd/containerd/v2/internal/dmverity"
 	"github.com/containerd/log"
@@ -43,4 +48,50 @@ func (s *erofsDiff) formatDmverityLayer(ctx context.Context, layerBlobPath strin
 		"enableTarIndex": s.enableTarIndex,
 	}).Info("dmverity_format: differ.Apply invoking FormatLayerBlob (tar-stream path)")
 	return dmverity.FormatLayerBlob(ctx, layerBlobPath, blockSize)
+}
+
+var (
+	// ipeSecurityFSPath is the securityfs directory exposed by the IPE LSM.
+	ipeSecurityFSPath    = "/sys/kernel/security/ipe"
+	ipeCheckOnce         sync.Once
+	ipeRequiresSignature bool
+)
+
+// ipeRequiresDmveritySignatures reports whether an active IPE policy consumes
+// the dm-verity signature property. The boot policy is active before containerd
+// starts, so the result is cached once per process.
+func ipeRequiresDmveritySignatures(ctx context.Context) bool {
+	ipeCheckOnce.Do(func() {
+		ipeRequiresSignature = ipePolicyRequiresDmveritySignatures(ctx)
+		log.G(ctx).WithField("ipe_requires_dmverity_signatures", ipeRequiresSignature).
+			Info("Evaluated IPE dm-verity signature requirement")
+	})
+	return ipeRequiresSignature
+}
+
+func ipePolicyRequiresDmveritySignatures(ctx context.Context) bool {
+	policiesDir := filepath.Join(ipeSecurityFSPath, "policies")
+	entries, err := os.ReadDir(policiesDir)
+	if err != nil {
+		return false
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		active, err := os.ReadFile(filepath.Join(policiesDir, entry.Name(), "active"))
+		if err != nil || strings.TrimSpace(string(active)) != "1" {
+			continue
+		}
+		policy, err := os.ReadFile(filepath.Join(policiesDir, entry.Name(), "policy"))
+		if err != nil {
+			continue
+		}
+		if bytes.Contains(policy, []byte("dmverity_signature")) {
+			log.G(ctx).WithField("ipe_policy", entry.Name()).
+				Info("Active IPE policy requires dm-verity signatures")
+			return true
+		}
+	}
+	return false
 }

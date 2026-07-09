@@ -226,20 +226,13 @@ func (s erofsDiff) Apply(ctx context.Context, desc ocispec.Descriptor, mounts []
 			return emptyDesc, fmt.Errorf("failed to format dm-verity layer: %w", err)
 		}
 
-		// Enforcement is driven by the kernel's dm-verity require_signatures
-		// module parameter (set via the dm_verity.require_signatures=1 kernel
-		// command line on ACL nodes) so the kernel command line is the single
-		// source of truth. The s.requireSignatures config toggle is retained
-		// as an explicit override for setups that opt in via containerd config.
-		// When neither is set, no signature is written and the mount opens the
-		// device without one, so nodes lacking the signing CA can still run
-		// signed images.
-		if s.requireSignatures || dmverity.KernelRequiresSignatures() {
-			sig := desc.Annotations[snpkg.TargetLayerSignatureLabel]
-			if sig == "" {
-				return emptyDesc, fmt.Errorf("dm-verity signature required but not present on layer %s", desc.Digest)
-			}
-
+		// Pass signatures only when an active IPE policy consumes the
+		// dmverity_signature property. The kernel verifies every signature it
+		// receives, so passing one on a system that does not require it could
+		// otherwise make an invalid or untrusted signature fail the mount.
+		sig := desc.Annotations[snpkg.TargetLayerSignatureLabel]
+		switch {
+		case sig != "" && ipeRequiresDmveritySignatures(ctx):
 			expectedRootHash := desc.Annotations[snpkg.TargetLayerRootHashLabel]
 			if expectedRootHash == "" {
 				return emptyDesc, fmt.Errorf("dm-verity signature present but missing expected root hash for layer %s", desc.Digest)
@@ -252,6 +245,10 @@ func (s erofsDiff) Apply(ctx context.Context, desc ocispec.Descriptor, mounts []
 				return emptyDesc, err
 			}
 			log.G(ctx).WithField("path", dmverity.SignaturePath(layerBlobPath)).Debug("Wrote dm-verity signature file")
+		case sig == "" && s.requireSignatures:
+			return emptyDesc, fmt.Errorf("dm-verity signature required but not present on layer %s", desc.Digest)
+		case sig != "":
+			log.G(ctx).WithField("digest", desc.Digest.String()).Debug("Layer has a dm-verity signature but no active IPE policy requires signatures; not passing it to the kernel")
 		}
 	}
 

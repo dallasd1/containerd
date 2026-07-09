@@ -31,6 +31,27 @@ import (
 	"github.com/containerd/containerd/v2/internal/dmverity"
 )
 
+func TestIPEPolicyRequiresDmveritySignatures(t *testing.T) {
+	originalPath := ipeSecurityFSPath
+	ipeSecurityFSPath = t.TempDir()
+	t.Cleanup(func() {
+		ipeSecurityFSPath = originalPath
+	})
+
+	policyDir := filepath.Join(ipeSecurityFSPath, "policies", "require-signature")
+	require.NoError(t, os.MkdirAll(policyDir, 0755))
+	require.NoError(t, os.WriteFile(filepath.Join(policyDir, "active"), []byte("1\n"), 0644))
+
+	policy := []byte("policy_name=test policy_version=1.0.0\nop=EXECUTE dmverity_signature=TRUE action=ALLOW\n")
+	require.NoError(t, os.WriteFile(filepath.Join(policyDir, "policy"), policy, 0644))
+	assert.True(t, ipePolicyRequiresDmveritySignatures(context.Background()))
+
+	require.NoError(t, os.Remove(filepath.Join(policyDir, "policy")))
+	require.NoError(t, os.WriteFile(filepath.Join(policyDir, "raw"), policy, 0644))
+	assert.False(t, ipePolicyRequiresDmveritySignatures(context.Background()),
+		"kernel exposes active policy text through the policy file, not raw")
+}
+
 // TestFormatDmverityLayer tests the layer formatting logic
 func TestFormatDmverityLayer(t *testing.T) {
 	supported, err := dmverity.IsSupported()

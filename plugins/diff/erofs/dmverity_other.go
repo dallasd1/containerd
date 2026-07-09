@@ -26,3 +26,8 @@ import (
 func (s *erofsDiff) formatDmverityLayer(_ context.Context, _ string) (string, error) {
 	return "", fmt.Errorf("dm-verity formatting is only supported on Linux systems")
 }
+
+// ipeRequiresDmveritySignatures always reports false on non-Linux platforms.
+func ipeRequiresDmveritySignatures(_ context.Context) bool {
+	return false
+}
