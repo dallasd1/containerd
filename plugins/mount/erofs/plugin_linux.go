@@ -95,7 +95,8 @@ func (h *erofsMountHandler) Mount(ctx context.Context, m mount.Mount, mp string,
 				"hash-offset": metadata.HashOffset,
 			}).Debug("opening dm-verity device")
 
-			devicePath, err = dmverity.OpenWithSignature(m.Source, deviceName, m.Source, metadata.RootHash, metadata.HashOffset, nil, signatureFile)
+			hashDevice := dmverity.ResolveHashDevice(m.Source, metadata)
+			devicePath, err = dmverity.OpenWithSignature(m.Source, deviceName, hashDevice, metadata.RootHash, metadata.HashOffset, nil, signatureFile)
 			if err != nil {
 				return mount.ActiveMount{}, fmt.Errorf("failed to open dm-verity device: %w", err)
 			}
