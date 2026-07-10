@@ -21,6 +21,7 @@ package erofs
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -31,6 +32,7 @@ import (
 	"github.com/containerd/containerd/v2/internal/dmverity"
 	"github.com/containerd/containerd/v2/pkg/snapshotters"
 	"github.com/containerd/containerd/v2/plugins/content/local"
+	"github.com/google/uuid"
 	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/stretchr/testify/assert"
@@ -39,7 +41,8 @@ import (
 
 func TestApplyPrecomputedArtifacts(t *testing.T) {
 	ctx := context.Background()
-	data := bytes.Repeat([]byte("precomputed-erofs-"), 4096)
+	sourceDigest := digest.FromString("source layer")
+	data := testEROFSData(sourceDigest)
 	sourceDataPath := filepath.Join(t.TempDir(), "source.erofs")
 	sourceTreePath := filepath.Join(t.TempDir(), "source.hashtree")
 	require.NoError(t, os.WriteFile(sourceDataPath, data, 0600))
@@ -61,9 +64,9 @@ func TestApplyPrecomputedArtifacts(t *testing.T) {
 	require.NoError(t, err)
 	erofsDesc := writeTestBlob(t, ctx, cs, data, snapshotters.EROFSArtifactMediaType)
 	treeDesc := writeTestBlob(t, ctx, cs, tree, snapshotters.MerkleTreeArtifactMediaType)
-	sourceDesc := descriptorWithPrecomputedArtifacts(t, erofsDesc, treeDesc, rootHash)
+	sourceDesc := descriptorWithPrecomputedArtifacts(t, sourceDigest, erofsDesc, treeDesc, rootHash)
 
-	resetIPEForTest(t)
+	setIPEForTest(t, true)
 	layerBlobPath := filepath.Join(t.TempDir(), "layer.erofs")
 	differ := erofsDiff{store: cs, enableDmverity: true}
 	used, err := differ.applyPrecomputedArtifacts(ctx, sourceDesc, layerBlobPath)
@@ -94,7 +97,8 @@ func TestApplyPrecomputedArtifacts(t *testing.T) {
 
 func TestApplyPrecomputedArtifactsRejectsWrongRootHash(t *testing.T) {
 	ctx := context.Background()
-	data := bytes.Repeat([]byte("precomputed-erofs-"), 4096)
+	sourceDigest := digest.FromString("source layer")
+	data := testEROFSData(sourceDigest)
 	sourceDataPath := filepath.Join(t.TempDir(), "source.erofs")
 	sourceTreePath := filepath.Join(t.TempDir(), "source.hashtree")
 	require.NoError(t, os.WriteFile(sourceDataPath, data, 0600))
@@ -113,9 +117,9 @@ func TestApplyPrecomputedArtifactsRejectsWrongRootHash(t *testing.T) {
 	require.NoError(t, err)
 	erofsDesc := writeTestBlob(t, ctx, cs, data, snapshotters.EROFSArtifactMediaType)
 	treeDesc := writeTestBlob(t, ctx, cs, tree, snapshotters.MerkleTreeArtifactMediaType)
-	sourceDesc := descriptorWithPrecomputedArtifacts(t, erofsDesc, treeDesc, digest.FromString("wrong root").Hex())
+	sourceDesc := descriptorWithPrecomputedArtifacts(t, sourceDigest, erofsDesc, treeDesc, digest.FromString("wrong root").Hex())
 
-	resetIPEForTest(t)
+	setIPEForTest(t, true)
 	layerBlobPath := filepath.Join(t.TempDir(), "layer.erofs")
 	differ := erofsDiff{store: cs, enableDmverity: true}
 	_, err = differ.applyPrecomputedArtifacts(ctx, sourceDesc, layerBlobPath)
@@ -125,6 +129,57 @@ func TestApplyPrecomputedArtifactsRejectsWrongRootHash(t *testing.T) {
 	assert.ErrorIs(t, statErr, os.ErrNotExist)
 	_, statErr = os.Stat(dmverity.HashDevicePath(layerBlobPath))
 	assert.ErrorIs(t, statErr, os.ErrNotExist)
+}
+
+func TestApplyPrecomputedArtifactsRejectsSourceLayerSubstitution(t *testing.T) {
+	ctx := context.Background()
+	artifactSourceDigest := digest.FromString("artifact source layer")
+	requestedSourceDigest := digest.FromString("requested source layer")
+	data := testEROFSData(artifactSourceDigest)
+	sourceDataPath := filepath.Join(t.TempDir(), "source.erofs")
+	sourceTreePath := filepath.Join(t.TempDir(), "source.hashtree")
+	require.NoError(t, os.WriteFile(sourceDataPath, data, 0600))
+	require.NoError(t, os.WriteFile(sourceTreePath, nil, 0600))
+	opts := dmverity.DefaultDmverityOptions()
+	opts.DataBlockSize = 512
+	opts.HashBlockSize = 512
+	opts.HashOffset = 512
+	opts.UUID = "11111111-1111-1111-1111-111111111111"
+	rootHash, err := dmverity.Format(sourceDataPath, sourceTreePath, opts)
+	require.NoError(t, err)
+	tree, err := os.ReadFile(sourceTreePath)
+	require.NoError(t, err)
+
+	cs, err := local.NewStore(t.TempDir())
+	require.NoError(t, err)
+	erofsDesc := writeTestBlob(t, ctx, cs, data, snapshotters.EROFSArtifactMediaType)
+	treeDesc := writeTestBlob(t, ctx, cs, tree, snapshotters.MerkleTreeArtifactMediaType)
+	sourceDesc := descriptorWithPrecomputedArtifacts(t, requestedSourceDigest, erofsDesc, treeDesc, rootHash)
+
+	setIPEForTest(t, true)
+	differ := erofsDiff{store: cs, enableDmverity: true}
+	_, err = differ.applyPrecomputedArtifacts(ctx, sourceDesc, filepath.Join(t.TempDir(), "layer.erofs"))
+	require.ErrorContains(t, err, "does not match expected source-layer UUID")
+}
+
+func TestApplyPrecomputedArtifactsFallsBackWithoutIPEPolicy(t *testing.T) {
+	ctx := context.Background()
+	sourceDigest := digest.FromString("source layer")
+	data := testEROFSData(sourceDigest)
+	cs, err := local.NewStore(t.TempDir())
+	require.NoError(t, err)
+	erofsDesc := writeTestBlob(t, ctx, cs, data, snapshotters.EROFSArtifactMediaType)
+	treeDesc := writeTestBlob(t, ctx, cs, []byte("unused tree"), snapshotters.MerkleTreeArtifactMediaType)
+	sourceDesc := descriptorWithPrecomputedArtifacts(t, sourceDigest, erofsDesc, treeDesc, "unused root")
+
+	setIPEForTest(t, false)
+	layerBlobPath := filepath.Join(t.TempDir(), "layer.erofs")
+	differ := erofsDiff{store: cs, enableDmverity: true}
+	used, err := differ.applyPrecomputedArtifacts(ctx, sourceDesc, layerBlobPath)
+	require.NoError(t, err)
+	assert.False(t, used)
+	_, err = os.Stat(layerBlobPath)
+	assert.ErrorIs(t, err, os.ErrNotExist)
 }
 
 func writeTestBlob(t *testing.T, ctx context.Context, cs content.Store, data []byte, mediaType string) ocispec.Descriptor {
@@ -138,14 +193,14 @@ func writeTestBlob(t *testing.T, ctx context.Context, cs content.Store, data []b
 	return desc
 }
 
-func descriptorWithPrecomputedArtifacts(t *testing.T, erofsDesc, treeDesc ocispec.Descriptor, rootHash string) ocispec.Descriptor {
+func descriptorWithPrecomputedArtifacts(t *testing.T, sourceDigest digest.Digest, erofsDesc, treeDesc ocispec.Descriptor, rootHash string) ocispec.Descriptor {
 	t.Helper()
 	encodedEROFSBytes, err := json.Marshal(erofsDesc)
 	require.NoError(t, err)
 	encodedTreeBytes, err := json.Marshal(treeDesc)
 	require.NoError(t, err)
 	return ocispec.Descriptor{
-		Digest: digest.FromString("source layer"),
+		Digest: sourceDigest,
 		Annotations: map[string]string{
 			snapshotters.TargetLayerEROFSDescriptorLabel:      string(encodedEROFSBytes),
 			snapshotters.TargetLayerMerkleTreeDescriptorLabel: string(encodedTreeBytes),
@@ -154,10 +209,25 @@ func descriptorWithPrecomputedArtifacts(t *testing.T, erofsDesc, treeDesc ocispe
 	}
 }
 
-func resetIPEForTest(t *testing.T) {
+func testEROFSData(sourceDigest digest.Digest) []byte {
+	data := bytes.Repeat([]byte("precomputed-erofs-"), 4096)
+	binary.LittleEndian.PutUint32(data[erofsSuperOffset:], erofsMagic)
+	expectedUUID := uuid.NewSHA1(uuid.NameSpaceURL, []byte("erofs:blobs/"+sourceDigest.String()))
+	copy(data[erofsSuperOffset+erofsUUIDOffset:erofsSuperOffset+erofsUUIDEnd], expectedUUID[:])
+	return data
+}
+
+func setIPEForTest(t *testing.T, requiresSignature bool) {
 	t.Helper()
 	oldPath := ipeSecurityFSPath
 	ipeSecurityFSPath = t.TempDir()
+	if requiresSignature {
+		policyDir := filepath.Join(ipeSecurityFSPath, "policies", "test")
+		require.NoError(t, os.MkdirAll(policyDir, 0755))
+		require.NoError(t, os.WriteFile(filepath.Join(policyDir, "active"), []byte("1\n"), 0644))
+		require.NoError(t, os.WriteFile(filepath.Join(policyDir, "policy"),
+			[]byte("policy_name=test policy_version=1.0.0\nop=EXECUTE dmverity_signature=TRUE action=ALLOW\n"), 0644))
+	}
 	ipeCheckOnce = sync.Once{}
 	ipeRequiresSignature = false
 	t.Cleanup(func() {

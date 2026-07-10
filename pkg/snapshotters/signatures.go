@@ -19,13 +19,10 @@ package snapshotters
 import (
 	"bytes"
 	"context"
-	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
-	"encoding/pem"
 	"fmt"
 	"io"
-	"os"
 	"sync"
 	"time"
 
@@ -35,7 +32,6 @@ import (
 	"github.com/containerd/log"
 	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
-	"github.com/smallstep/pkcs7"
 )
 
 const (
@@ -53,17 +49,9 @@ const (
 	sigLayerSignatureAnnotation = "io.cncf.notary.dmverity.layer-signature"
 
 	precomputedSourceLayerAnnotation = "io.cncf.notary.dmverity.source-layer-digest"
-	precomputedRootHashAnnotation    = "io.cncf.notary.dmverity.root-hash"
-	precomputedLayoutAnnotation      = "io.cncf.notary.dmverity.layout"
-	precomputedSeparateLayout        = "separate-hash-device-superblock-v1"
 
 	// SignatureArtifactType is the artifact type for OCI referrers containing dm-verity signatures.
 	SignatureArtifactType = "application/vnd.cncf.notary.dmverity.v1"
-	// BundleSignatureArtifactType identifies a detached PKCS#7 signature over
-	// the canonical bundle descriptor payload.
-	BundleSignatureArtifactType = "application/vnd.cncf.notary.dmverity.bundle-signature.v1"
-	// BundleSignatureMediaType identifies the PKCS#7 DER envelope.
-	BundleSignatureMediaType = "application/pkcs7-signature"
 	// EROFSArtifactMediaType identifies a precomputed EROFS layer blob.
 	EROFSArtifactMediaType = "application/vnd.cncf.containerd.erofs.layer.v1"
 	// MerkleTreeArtifactMediaType identifies a separate dm-verity hash device.
@@ -72,9 +60,6 @@ const (
 	LayerSignatureMediaType = "application/vnd.cncf.notary.dmverity.layer-signature+pkcs7"
 
 	ociAnnotationCreated = "org.opencontainers.image.created"
-
-	defaultBundleTrustStorePath = "/etc/containerd/dmverity-bundle-trust.pem"
-	bundleTrustStoreEnv         = "CONTAINERD_DMVERITY_BUNDLE_TRUST_STORE"
 )
 
 // LayerSignatureInfo contains signature and optional precomputed artifact information for a layer.
@@ -90,8 +75,6 @@ type referrerWithManifest struct {
 	manifest  ocispec.Manifest
 	createdAt time.Time
 }
-
-var verifyBundleSignatureFn = verifyBundleSignature
 
 // ParseTargetDescriptor parses a descriptor propagated through a layer annotation.
 func ParseTargetDescriptor(value string) (ocispec.Descriptor, error) {
@@ -166,9 +149,6 @@ func fetchSignatures(ctx context.Context, fetcher remotes.Fetcher, manifestDiges
 	}
 	if len(precomputed) == 1 {
 		candidate := precomputed[0]
-		if err := verifyBundleSignatureFn(ctx, fetcher, refFetcher, candidate.desc); err != nil {
-			return nil, nil, fmt.Errorf("verify precomputed dm-verity bundle %s: %w", candidate.desc.Digest, err)
-		}
 		infos, artifactDescs, err := parsePrecomputedBundle(ctx, fetcher, candidate.manifest)
 		if err != nil {
 			return nil, nil, fmt.Errorf("parse precomputed dm-verity bundle %s: %w", candidate.desc.Digest, err)
@@ -177,7 +157,7 @@ func fetchSignatures(ctx context.Context, fetcher remotes.Fetcher, manifestDiges
 			"bundle":   candidate.desc.Digest,
 			"manifest": manifestDigest,
 			"layers":   len(infos),
-		}).Info("Using verified precomputed EROFS dm-verity bundle")
+		}).Info("Using precomputed EROFS dm-verity bundle")
 		return infos, artifactDescs, nil
 	}
 
@@ -247,16 +227,10 @@ func parsePrecomputedBundle(ctx context.Context, fetcher remotes.Fetcher, manife
 			info.Signature = encodedSignature
 		case EROFSArtifactMediaType, MerkleTreeArtifactMediaType:
 			sourceDigest := layer.Annotations[precomputedSourceLayerAnnotation]
-			rootHash := layer.Annotations[precomputedRootHashAnnotation]
-			layout := layer.Annotations[precomputedLayoutAnnotation]
-			if sourceDigest == "" || rootHash == "" || layout != precomputedSeparateLayout {
+			if sourceDigest == "" {
 				return nil, nil, fmt.Errorf("precomputed descriptor %s has invalid annotations", layer.Digest)
 			}
 			info := getLayerInfo(infos, sourceDigest)
-			if info.RootHash != "" && info.RootHash != rootHash {
-				return nil, nil, fmt.Errorf("root hash mismatch across descriptors for layer %s", sourceDigest)
-			}
-			info.RootHash = rootHash
 			desc := layer
 			if layer.MediaType == EROFSArtifactMediaType {
 				if info.EROFS != nil {
@@ -294,93 +268,6 @@ func getLayerInfo(infos map[string]*LayerSignatureInfo, sourceDigest string) *La
 	return info
 }
 
-func verifyBundleSignature(ctx context.Context, fetcher remotes.Fetcher, refFetcher remotes.ReferrersFetcher, bundleDesc ocispec.Descriptor) error {
-	referrers, err := refFetcher.FetchReferrers(ctx, bundleDesc.Digest,
-		remotes.WithReferrerArtifactTypes(BundleSignatureArtifactType))
-	if err != nil {
-		return fmt.Errorf("fetch bundle PKCS#7 signature referrers: %w", err)
-	}
-	if len(referrers) != 1 {
-		return fmt.Errorf("expected exactly one PKCS#7 signature for bundle, found %d", len(referrers))
-	}
-	manifestBytes, err := fetchDescriptor(ctx, fetcher, referrers[0])
-	if err != nil {
-		return fmt.Errorf("fetch bundle signature manifest: %w", err)
-	}
-	var sigManifest ocispec.Manifest
-	if err := json.Unmarshal(manifestBytes, &sigManifest); err != nil {
-		return fmt.Errorf("parse bundle signature manifest: %w", err)
-	}
-	if sigManifest.Subject == nil || !descriptorsEqual(*sigManifest.Subject, bundleDesc) {
-		return fmt.Errorf("bundle signature subject does not match bundle descriptor")
-	}
-	if len(sigManifest.Layers) != 1 {
-		return fmt.Errorf("expected one PKCS#7 signature envelope, found %d", len(sigManifest.Layers))
-	}
-	envelopeDesc := sigManifest.Layers[0]
-	if envelopeDesc.MediaType != BundleSignatureMediaType {
-		return fmt.Errorf("unexpected bundle signature media type %q", envelopeDesc.MediaType)
-	}
-	envelopeBytes, err := fetchDescriptor(ctx, fetcher, envelopeDesc)
-	if err != nil {
-		return fmt.Errorf("fetch bundle PKCS#7 signature: %w", err)
-	}
-	envelope, err := pkcs7.Parse(envelopeBytes)
-	if err != nil {
-		return fmt.Errorf("parse bundle PKCS#7 signature: %w", err)
-	}
-	payload, err := json.Marshal(struct {
-		TargetArtifact ocispec.Descriptor `json:"targetArtifact"`
-	}{TargetArtifact: bundleDesc})
-	if err != nil {
-		return fmt.Errorf("marshal bundle descriptor payload: %w", err)
-	}
-	envelope.Content = payload
-	trustedCerts, err := loadBundleTrustStore()
-	if err != nil {
-		return err
-	}
-	if err := envelope.VerifyWithChain(trustedCerts); err != nil {
-		return fmt.Errorf("bundle signer is not trusted: %w", err)
-	}
-	return nil
-}
-
-func loadBundleTrustStore() (*x509.CertPool, error) {
-	path := os.Getenv(bundleTrustStoreEnv)
-	if path == "" {
-		path = defaultBundleTrustStorePath
-	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, fmt.Errorf("read dm-verity bundle trust store %q: %w", path, err)
-	}
-	pool := x509.NewCertPool()
-	certCount := 0
-	for len(data) > 0 {
-		block, rest := pem.Decode(data)
-		if block == nil {
-			break
-		}
-		data = rest
-		if block.Type != "CERTIFICATE" {
-			continue
-		}
-		parsed, err := x509.ParseCertificates(block.Bytes)
-		if err != nil {
-			return nil, fmt.Errorf("parse certificate from %q: %w", path, err)
-		}
-		for _, cert := range parsed {
-			pool.AddCert(cert)
-			certCount++
-		}
-	}
-	if certCount == 0 {
-		return nil, fmt.Errorf("no certificates found in dm-verity bundle trust store %q", path)
-	}
-	return pool, nil
-}
-
 func fetchDescriptor(ctx context.Context, fetcher remotes.Fetcher, desc ocispec.Descriptor) ([]byte, error) {
 	rc, err := fetcher.Fetch(ctx, desc)
 	if err != nil {
@@ -399,10 +286,6 @@ func fetchDescriptor(ctx context.Context, fetcher remotes.Fetcher, desc ocispec.
 		return nil, fmt.Errorf("descriptor %s digest verification failed", desc.Digest)
 	}
 	return data, nil
-}
-
-func descriptorsEqual(a, b ocispec.Descriptor) bool {
-	return a.MediaType == b.MediaType && a.Digest == b.Digest && a.Size == b.Size
 }
 
 // AppendSignatureHandlerWrapper creates a handler that fetches signatures and

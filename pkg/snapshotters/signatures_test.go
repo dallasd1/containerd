@@ -19,26 +19,16 @@ package snapshotters
 import (
 	"bytes"
 	"context"
-	"crypto/rand"
-	"crypto/rsa"
-	"crypto/x509"
-	"crypto/x509/pkix"
 	"encoding/base64"
 	"encoding/json"
-	"encoding/pem"
 	"errors"
 	"io"
-	"math/big"
-	"os"
-	"path/filepath"
 	"testing"
-	"time"
 
 	"github.com/containerd/containerd/v2/core/images"
 	"github.com/containerd/containerd/v2/core/remotes"
 	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
-	"github.com/smallstep/pkcs7"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -88,9 +78,9 @@ func TestSignatureHandlerPrecomputedBundle(t *testing.T) {
 		sigLayerSignatureAnnotation: base64.StdEncoding.EncodeToString(signatureBytes),
 	}
 	erofsDesc := descriptorFor([]byte("precomputed erofs"), EROFSArtifactMediaType)
-	erofsDesc.Annotations = precomputedAnnotations(sourceLayer.Digest.String(), "abcd")
+	erofsDesc.Annotations = precomputedAnnotations(sourceLayer.Digest.String())
 	treeDesc := descriptorFor([]byte("precomputed tree"), MerkleTreeArtifactMediaType)
-	treeDesc.Annotations = precomputedAnnotations(sourceLayer.Digest.String(), "abcd")
+	treeDesc.Annotations = precomputedAnnotations(sourceLayer.Digest.String())
 	bundle := ocispec.Manifest{
 		MediaType:    ocispec.MediaTypeImageManifest,
 		ArtifactType: SignatureArtifactType,
@@ -113,12 +103,6 @@ func TestSignatureHandlerPrecomputedBundle(t *testing.T) {
 			sourceManifest.Digest: {bundleDesc},
 		},
 	}
-
-	originalVerifier := verifyBundleSignatureFn
-	verifyBundleSignatureFn = func(context.Context, remotes.Fetcher, remotes.ReferrersFetcher, ocispec.Descriptor) error {
-		return nil
-	}
-	t.Cleanup(func() { verifyBundleSignatureFn = originalVerifier })
 
 	var fetched []digest.Digest
 	base := images.HandlerFunc(func(_ context.Context, desc ocispec.Descriptor) ([]ocispec.Descriptor, error) {
@@ -154,13 +138,10 @@ func TestSignatureHandlerRejectsInvalidPrecomputedBundle(t *testing.T) {
 		ArtifactType: SignatureArtifactType,
 		Subject:      &sourceManifest,
 		Layers: []ocispec.Descriptor{{
-			MediaType: EROFSArtifactMediaType,
-			Digest:    digest.FromString("orphan erofs"),
-			Size:      12,
-			Annotations: precomputedAnnotations(
-				digest.FromString("source layer").String(),
-				"abcd",
-			),
+			MediaType:   EROFSArtifactMediaType,
+			Digest:      digest.FromString("orphan erofs"),
+			Size:        12,
+			Annotations: precomputedAnnotations(digest.FromString("source layer").String()),
 		}},
 	}
 	bundleBytes, err := json.Marshal(bundle)
@@ -173,129 +154,12 @@ func TestSignatureHandlerRejectsInvalidPrecomputedBundle(t *testing.T) {
 			sourceManifest.Digest: {bundleDesc},
 		},
 	}
-	originalVerifier := verifyBundleSignatureFn
-	verifyBundleSignatureFn = func(context.Context, remotes.Fetcher, remotes.ReferrersFetcher, ocispec.Descriptor) error {
-		return nil
-	}
-	t.Cleanup(func() { verifyBundleSignatureFn = originalVerifier })
-
 	base := images.HandlerFunc(func(context.Context, ocispec.Descriptor) ([]ocispec.Descriptor, error) {
 		return nil, nil
 	})
 	_, err = signatureHandler(base, fetcher).Handle(context.Background(), sourceManifest)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "incomplete precomputed artifacts")
-}
-
-func TestSignatureHandlerRejectsUntrustedPrecomputedBundle(t *testing.T) {
-	sourceManifest := descriptorFor([]byte("source manifest"), ocispec.MediaTypeImageManifest)
-	bundle := ocispec.Manifest{
-		MediaType:    ocispec.MediaTypeImageManifest,
-		ArtifactType: SignatureArtifactType,
-		Subject:      &sourceManifest,
-		Layers: []ocispec.Descriptor{{
-			MediaType: EROFSArtifactMediaType,
-			Digest:    digest.FromString("erofs"),
-			Size:      5,
-			Annotations: precomputedAnnotations(
-				digest.FromString("source layer").String(),
-				"abcd",
-			),
-		}},
-	}
-	bundleBytes, err := json.Marshal(bundle)
-	require.NoError(t, err)
-	bundleDesc := descriptorFor(bundleBytes, ocispec.MediaTypeImageManifest)
-	bundleDesc.ArtifactType = SignatureArtifactType
-	fetcher := &artifactFetcher{
-		blobs: map[digest.Digest][]byte{bundleDesc.Digest: bundleBytes},
-		refs: map[digest.Digest][]ocispec.Descriptor{
-			sourceManifest.Digest: {bundleDesc},
-		},
-	}
-	originalVerifier := verifyBundleSignatureFn
-	verifyBundleSignatureFn = func(context.Context, remotes.Fetcher, remotes.ReferrersFetcher, ocispec.Descriptor) error {
-		return errors.New("untrusted signer")
-	}
-	t.Cleanup(func() { verifyBundleSignatureFn = originalVerifier })
-
-	base := images.HandlerFunc(func(context.Context, ocispec.Descriptor) ([]ocispec.Descriptor, error) {
-		return nil, nil
-	})
-	_, err = signatureHandler(base, fetcher).Handle(context.Background(), sourceManifest)
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "untrusted signer")
-}
-
-func TestVerifyBundlePKCS7Signature(t *testing.T) {
-	bundleDesc := descriptorFor([]byte("bundle manifest"), ocispec.MediaTypeImageManifest)
-	bundleDesc.ArtifactType = SignatureArtifactType
-	payload, err := json.Marshal(struct {
-		TargetArtifact ocispec.Descriptor `json:"targetArtifact"`
-	}{TargetArtifact: bundleDesc})
-	require.NoError(t, err)
-
-	key, err := rsa.GenerateKey(rand.Reader, 2048)
-	require.NoError(t, err)
-	now := time.Now().UTC()
-	template := &x509.Certificate{
-		SerialNumber:          big.NewInt(1),
-		Subject:               pkix.Name{CommonName: "dm-verity bundle test signer"},
-		NotBefore:             now.Add(-time.Hour),
-		NotAfter:              now.Add(time.Hour),
-		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
-		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageCodeSigning},
-		BasicConstraintsValid: true,
-		IsCA:                  true,
-	}
-	certDER, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
-	require.NoError(t, err)
-	cert, err := x509.ParseCertificate(certDER)
-	require.NoError(t, err)
-
-	signedData, err := pkcs7.NewSignedData(payload)
-	require.NoError(t, err)
-	signedData.SetDigestAlgorithm(pkcs7.OIDDigestAlgorithmSHA256)
-	require.NoError(t, signedData.AddSigner(cert, key, pkcs7.SignerInfoConfig{}))
-	signedData.Detach()
-	signatureBytes, err := signedData.Finish()
-	require.NoError(t, err)
-
-	signatureDesc := descriptorFor(signatureBytes, BundleSignatureMediaType)
-	signatureManifest := ocispec.Manifest{
-		MediaType:    ocispec.MediaTypeImageManifest,
-		ArtifactType: BundleSignatureArtifactType,
-		Subject:      &bundleDesc,
-		Layers:       []ocispec.Descriptor{signatureDesc},
-	}
-	signatureManifestBytes, err := json.Marshal(signatureManifest)
-	require.NoError(t, err)
-	signatureManifestDesc := descriptorFor(signatureManifestBytes, ocispec.MediaTypeImageManifest)
-	signatureManifestDesc.ArtifactType = BundleSignatureArtifactType
-
-	fetcher := &artifactFetcher{
-		blobs: map[digest.Digest][]byte{
-			signatureManifestDesc.Digest: signatureManifestBytes,
-			signatureDesc.Digest:         signatureBytes,
-		},
-		refs: map[digest.Digest][]ocispec.Descriptor{
-			bundleDesc.Digest: {signatureManifestDesc},
-		},
-	}
-	trustPath := filepath.Join(t.TempDir(), "bundle-trust.pem")
-	require.NoError(t, os.WriteFile(trustPath, pem.EncodeToMemory(&pem.Block{
-		Type:  "CERTIFICATE",
-		Bytes: cert.Raw,
-	}), 0600))
-	t.Setenv(bundleTrustStoreEnv, trustPath)
-
-	require.NoError(t, verifyBundleSignature(context.Background(), fetcher, fetcher, bundleDesc))
-
-	wrongBundle := descriptorFor([]byte("wrong bundle"), ocispec.MediaTypeImageManifest)
-	wrongBundle.ArtifactType = SignatureArtifactType
-	fetcher.refs[wrongBundle.Digest] = []ocispec.Descriptor{signatureManifestDesc}
-	err = verifyBundleSignature(context.Background(), fetcher, fetcher, wrongBundle)
-	require.ErrorContains(t, err, "subject does not match")
 }
 
 func descriptorFor(data []byte, mediaType string) ocispec.Descriptor {
@@ -306,10 +170,8 @@ func descriptorFor(data []byte, mediaType string) ocispec.Descriptor {
 	}
 }
 
-func precomputedAnnotations(sourceDigest, rootHash string) map[string]string {
+func precomputedAnnotations(sourceDigest string) map[string]string {
 	return map[string]string{
 		precomputedSourceLayerAnnotation: sourceDigest,
-		precomputedRootHashAnnotation:    rootHash,
-		precomputedLayoutAnnotation:      precomputedSeparateLayout,
 	}
 }

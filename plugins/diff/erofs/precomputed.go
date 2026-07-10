@@ -18,6 +18,7 @@ package erofs
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"os"
@@ -27,7 +28,16 @@ import (
 	"github.com/containerd/containerd/v2/internal/dmverity"
 	snpkg "github.com/containerd/containerd/v2/pkg/snapshotters"
 	"github.com/containerd/log"
+	"github.com/google/uuid"
+	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+)
+
+const (
+	erofsSuperOffset = 1024
+	erofsMagic       = 0xE0F5E1E2
+	erofsUUIDOffset  = 48
+	erofsUUIDEnd     = erofsUUIDOffset + 16
 )
 
 func (s erofsDiff) applyPrecomputedArtifacts(ctx context.Context, sourceDesc ocispec.Descriptor, layerBlobPath string) (bool, error) {
@@ -41,6 +51,11 @@ func (s erofsDiff) applyPrecomputedArtifacts(ctx context.Context, sourceDesc oci
 	}
 	if !s.enableDmverity {
 		return false, fmt.Errorf("precomputed dm-verity artifacts found for layer %s but dm-verity is disabled", sourceDesc.Digest)
+	}
+	if !ipeRequiresDmveritySignatures(ctx) {
+		log.G(ctx).WithField("layer", sourceDesc.Digest).
+			Debug("Ignoring precomputed artifacts because no active IPE policy requires dm-verity signatures")
+		return false, nil
 	}
 
 	erofsDesc, err := snpkg.ParseTargetDescriptor(erofsValue)
@@ -77,9 +92,13 @@ func (s erofsDiff) applyPrecomputedArtifacts(ctx context.Context, sourceDesc oci
 	if err := copyContentDescriptor(ctx, s.store, erofsDesc, layerBlobPath); err != nil {
 		return false, fmt.Errorf("materialize precomputed EROFS for layer %s: %w", sourceDesc.Digest, err)
 	}
+	if err := verifyEROFSUUID(layerBlobPath, sourceDesc.Digest.String()); err != nil {
+		return false, fmt.Errorf("verify precomputed EROFS source binding for layer %s: %w", sourceDesc.Digest, err)
+	}
 	if err := copyContentDescriptor(ctx, s.store, treeDesc, hashDevicePath); err != nil {
 		return false, fmt.Errorf("materialize precomputed Merkle tree for layer %s: %w", sourceDesc.Digest, err)
 	}
+
 	if err := dmverity.VerifyArtifacts(layerBlobPath, hashDevicePath, rootHash); err != nil {
 		return false, fmt.Errorf("precomputed artifacts failed dm-verity verification for layer %s: %w", sourceDesc.Digest, err)
 	}
@@ -102,6 +121,39 @@ func (s erofsDiff) applyPrecomputedArtifacts(ctx context.Context, sourceDesc oci
 		"root_hash":   rootHash,
 	}).Info("Materialized verified precomputed EROFS dm-verity artifacts")
 	return true, nil
+}
+
+func verifyEROFSUUID(path, sourceDigest string) error {
+	parsedDigest, err := digest.Parse(sourceDigest)
+	if err != nil {
+		return fmt.Errorf("invalid source layer digest: %w", err)
+	}
+	if parsedDigest.String() != sourceDigest {
+		return fmt.Errorf("source layer digest is not canonical: %q", sourceDigest)
+	}
+
+	file, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	superblock := make([]byte, erofsUUIDEnd)
+	if _, err := file.ReadAt(superblock, erofsSuperOffset); err != nil {
+		return fmt.Errorf("read EROFS superblock: %w", err)
+	}
+	if magic := binary.LittleEndian.Uint32(superblock[:4]); magic != erofsMagic {
+		return fmt.Errorf("invalid EROFS superblock magic 0x%x", magic)
+	}
+	actualUUID, err := uuid.FromBytes(superblock[erofsUUIDOffset:erofsUUIDEnd])
+	if err != nil {
+		return fmt.Errorf("parse EROFS UUID: %w", err)
+	}
+	expectedUUID := uuid.NewSHA1(uuid.NameSpaceURL, []byte("erofs:blobs/"+sourceDigest))
+	if actualUUID != expectedUUID {
+		return fmt.Errorf("EROFS UUID %s does not match expected source-layer UUID %s", actualUUID, expectedUUID)
+	}
+	return nil
 }
 
 func copyContentDescriptor(ctx context.Context, store content.Store, desc ocispec.Descriptor, target string) error {
