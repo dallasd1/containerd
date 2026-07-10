@@ -33,11 +33,9 @@ import (
 	"github.com/containerd/containerd/v2/core/remotes"
 	"github.com/containerd/errdefs"
 	"github.com/containerd/log"
-	"github.com/notaryproject/notation-core-go/signature"
-	_ "github.com/notaryproject/notation-core-go/signature/cose"
-	_ "github.com/notaryproject/notation-core-go/signature/jws"
 	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+	"github.com/smallstep/pkcs7"
 )
 
 const (
@@ -61,8 +59,11 @@ const (
 
 	// SignatureArtifactType is the artifact type for OCI referrers containing dm-verity signatures.
 	SignatureArtifactType = "application/vnd.cncf.notary.dmverity.v1"
-	// NotarySignatureArtifactType is the standard Notary signature referrer type.
-	NotarySignatureArtifactType = "application/vnd.cncf.notary.signature"
+	// BundleSignatureArtifactType identifies a detached PKCS#7 signature over
+	// the canonical bundle descriptor payload.
+	BundleSignatureArtifactType = "application/vnd.cncf.notary.dmverity.bundle-signature.v1"
+	// BundleSignatureMediaType identifies the PKCS#7 DER envelope.
+	BundleSignatureMediaType = "application/pkcs7-signature"
 	// EROFSArtifactMediaType identifies a precomputed EROFS layer blob.
 	EROFSArtifactMediaType = "application/vnd.cncf.containerd.erofs.layer.v1"
 	// MerkleTreeArtifactMediaType identifies a separate dm-verity hash device.
@@ -74,7 +75,6 @@ const (
 
 	defaultBundleTrustStorePath = "/etc/containerd/dmverity-bundle-trust.pem"
 	bundleTrustStoreEnv         = "CONTAINERD_DMVERITY_BUNDLE_TRUST_STORE"
-	notaryPayloadMediaType      = "application/vnd.cncf.notary.payload.v1+json"
 )
 
 // LayerSignatureInfo contains signature and optional precomputed artifact information for a layer.
@@ -296,63 +296,57 @@ func getLayerInfo(infos map[string]*LayerSignatureInfo, sourceDigest string) *La
 
 func verifyBundleSignature(ctx context.Context, fetcher remotes.Fetcher, refFetcher remotes.ReferrersFetcher, bundleDesc ocispec.Descriptor) error {
 	referrers, err := refFetcher.FetchReferrers(ctx, bundleDesc.Digest,
-		remotes.WithReferrerArtifactTypes(NotarySignatureArtifactType))
+		remotes.WithReferrerArtifactTypes(BundleSignatureArtifactType))
 	if err != nil {
-		return fmt.Errorf("fetch Notary signature referrers: %w", err)
+		return fmt.Errorf("fetch bundle PKCS#7 signature referrers: %w", err)
 	}
 	if len(referrers) != 1 {
-		return fmt.Errorf("expected exactly one Notary signature for bundle, found %d", len(referrers))
+		return fmt.Errorf("expected exactly one PKCS#7 signature for bundle, found %d", len(referrers))
 	}
 	manifestBytes, err := fetchDescriptor(ctx, fetcher, referrers[0])
 	if err != nil {
-		return fmt.Errorf("fetch Notary signature manifest: %w", err)
+		return fmt.Errorf("fetch bundle signature manifest: %w", err)
 	}
 	var sigManifest ocispec.Manifest
 	if err := json.Unmarshal(manifestBytes, &sigManifest); err != nil {
-		return fmt.Errorf("parse Notary signature manifest: %w", err)
+		return fmt.Errorf("parse bundle signature manifest: %w", err)
 	}
 	if sigManifest.Subject == nil || !descriptorsEqual(*sigManifest.Subject, bundleDesc) {
-		return fmt.Errorf("Notary signature subject does not match bundle descriptor")
+		return fmt.Errorf("bundle signature subject does not match bundle descriptor")
 	}
 	if len(sigManifest.Layers) != 1 {
-		return fmt.Errorf("expected one Notary signature envelope, found %d", len(sigManifest.Layers))
+		return fmt.Errorf("expected one PKCS#7 signature envelope, found %d", len(sigManifest.Layers))
 	}
 	envelopeDesc := sigManifest.Layers[0]
+	if envelopeDesc.MediaType != BundleSignatureMediaType {
+		return fmt.Errorf("unexpected bundle signature media type %q", envelopeDesc.MediaType)
+	}
 	envelopeBytes, err := fetchDescriptor(ctx, fetcher, envelopeDesc)
 	if err != nil {
-		return fmt.Errorf("fetch Notary signature envelope: %w", err)
+		return fmt.Errorf("fetch bundle PKCS#7 signature: %w", err)
 	}
-	envelope, err := signature.ParseEnvelope(envelopeDesc.MediaType, envelopeBytes)
+	envelope, err := pkcs7.Parse(envelopeBytes)
 	if err != nil {
-		return fmt.Errorf("parse Notary signature envelope: %w", err)
+		return fmt.Errorf("parse bundle PKCS#7 signature: %w", err)
 	}
-	content, err := envelope.Verify()
-	if err != nil {
-		return fmt.Errorf("verify Notary signature envelope: %w", err)
-	}
-	if content.Payload.ContentType != notaryPayloadMediaType {
-		return fmt.Errorf("unexpected Notary payload media type %q", content.Payload.ContentType)
-	}
-	var payload struct {
+	payload, err := json.Marshal(struct {
 		TargetArtifact ocispec.Descriptor `json:"targetArtifact"`
+	}{TargetArtifact: bundleDesc})
+	if err != nil {
+		return fmt.Errorf("marshal bundle descriptor payload: %w", err)
 	}
-	if err := json.Unmarshal(content.Payload.Content, &payload); err != nil {
-		return fmt.Errorf("parse Notary payload: %w", err)
-	}
-	if !descriptorsEqual(payload.TargetArtifact, bundleDesc) {
-		return fmt.Errorf("signed Notary payload does not match bundle descriptor")
-	}
+	envelope.Content = payload
 	trustedCerts, err := loadBundleTrustStore()
 	if err != nil {
 		return err
 	}
-	if _, err := signature.VerifyAuthenticity(&content.SignerInfo, trustedCerts); err != nil {
+	if err := envelope.VerifyWithChain(trustedCerts); err != nil {
 		return fmt.Errorf("bundle signer is not trusted: %w", err)
 	}
 	return nil
 }
 
-func loadBundleTrustStore() ([]*x509.Certificate, error) {
+func loadBundleTrustStore() (*x509.CertPool, error) {
 	path := os.Getenv(bundleTrustStoreEnv)
 	if path == "" {
 		path = defaultBundleTrustStorePath
@@ -361,7 +355,8 @@ func loadBundleTrustStore() ([]*x509.Certificate, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read dm-verity bundle trust store %q: %w", path, err)
 	}
-	var certs []*x509.Certificate
+	pool := x509.NewCertPool()
+	certCount := 0
 	for len(data) > 0 {
 		block, rest := pem.Decode(data)
 		if block == nil {
@@ -375,12 +370,15 @@ func loadBundleTrustStore() ([]*x509.Certificate, error) {
 		if err != nil {
 			return nil, fmt.Errorf("parse certificate from %q: %w", path, err)
 		}
-		certs = append(certs, parsed...)
+		for _, cert := range parsed {
+			pool.AddCert(cert)
+			certCount++
+		}
 	}
-	if len(certs) == 0 {
+	if certCount == 0 {
 		return nil, fmt.Errorf("no certificates found in dm-verity bundle trust store %q", path)
 	}
-	return certs, nil
+	return pool, nil
 }
 
 func fetchDescriptor(ctx context.Context, fetcher remotes.Fetcher, desc ocispec.Descriptor) ([]byte, error) {
