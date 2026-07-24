@@ -79,7 +79,7 @@ func WithImmutable() Opt {
 	}
 }
 
-// WithDmverityMode sets the dm-verity mode: "auto" (default), "on" (required), or "off" (disabled)
+// WithDmverityMode sets the dm-verity mode: "auto", "on" (required), or "off" (default).
 func WithDmverityMode(mode string) Opt {
 	return func(config *SnapshotterConfig) {
 		config.dmverityMode = mode
@@ -137,7 +137,7 @@ func NewSnapshotter(root string, opts ...Opt) (snapshots.Snapshotter, error) {
 	}
 
 	if config.dmverityMode == "" {
-		config.dmverityMode = "auto"
+		config.dmverityMode = "off"
 	}
 
 	if config.dmverityMode != "auto" && config.dmverityMode != "on" && config.dmverityMode != "off" {

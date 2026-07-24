@@ -626,12 +626,12 @@ func TestDmverityModeValidation(t *testing.T) {
 		s.Close()
 	})
 
-	t.Run("defaults to auto mode when not specified", func(t *testing.T) {
+	t.Run("defaults to off mode when not specified", func(t *testing.T) {
 		root := filepath.Join(tmpDir, "default")
 		s, err := NewSnapshotter(root)
 		require.NoError(t, err)
 		snap := s.(*snapshotter)
-		assert.Equal(t, "auto", snap.dmverityMode)
+		assert.Equal(t, "off", snap.dmverityMode)
 		s.Close()
 	})
 }

@@ -202,6 +202,10 @@ type TransferConfig struct {
 	// UnpackPlatforms are used to specify supported combination of platforms and snapshotters
 	UnpackPlatforms []unpack.Platform
 
+	// EnableDmverityReferrers enables discovery of dm-verity signature and
+	// precomputed EROFS referrers during pull and import.
+	EnableDmverityReferrers bool
+
 	// ImageVerifiers verify the image before saving into the image store.
 	Verifiers map[string]imageverifier.ImageVerifier
 
