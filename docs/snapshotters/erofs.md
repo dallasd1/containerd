@@ -207,12 +207,17 @@ The snapshotter can be configured to control dm-verity behavior using `dmverity_
 
 ```toml
 [plugins."io.containerd.snapshotter.v1.erofs"]
-  dmverity_mode = "auto"  # Options: "auto" (default), "on", "off"
+  dmverity_mode = "off"  # Options: "off" (default), "auto", "on"
 ```
 
 The available modes are:
 
-- `"auto"` (default): Uses dm-verity if `.dmverity` metadata exists for a layer,
+- `"off"` (default): Disables dm-verity completely, even if `.dmverity` metadata
+  exists. Layers are mounted as regular EROFS without integrity verification.
+  This is the default so that enabling the EROFS snapshotter does not implicitly
+  change how layers are mounted; dm-verity must be opted into.
+
+- `"auto"`: Uses dm-verity if `.dmverity` metadata exists for a layer,
   otherwise mounts as regular EROFS. This allows mixing dm-verity and non-dm-verity
   layers in the same system.
 
@@ -220,9 +225,20 @@ The available modes are:
   mounting will fail with an error. Use this mode when you want to enforce integrity
   verification for all layers.
 
-- `"off"`: Disables dm-verity completely, even if `.dmverity` metadata exists.
-  Layers are mounted as regular EROFS without integrity verification. Use this for
-  compatibility or when dm-verity overhead is unacceptable.
+Discovery of dm-verity referrers (per-layer signatures and precomputed EROFS
+artifacts) requires an extra registry lookup during pull and import, so it is
+performed only when a differ that consumes those artifacts is loaded. The EROFS
+differ advertises this when `enable_dmverity` is set:
+
+```toml
+[plugins."io.containerd.differ.v1.erofs"]
+  enable_dmverity = true
+```
+
+Both the transfer service and the CRI image service derive referrer discovery
+from that capability, so no additional configuration is needed. With
+`enable_dmverity` disabled, which is the default, no referrer lookup is
+performed and pull behaves exactly as it does without this feature.
 
 When mounting a layer with dm-verity enabled, the snapshotter reads the metadata
 from the `.dmverity` file and creates a dm-verity device. The dm-verity library

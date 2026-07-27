@@ -100,6 +100,11 @@ func init() {
 				if config.RequireSignatures {
 					opts = append(opts, erofs.WithRequireSignatures())
 				}
+
+				// Advertise that this differ consumes dm-verity referrer
+				// artifacts so pull implementations enable referrer discovery
+				// without requiring separate configuration.
+				ic.Meta.Capabilities = append(ic.Meta.Capabilities, plugins.CapabilityDmverityReferrers)
 			}
 
 			return erofs.NewErofsDiffer(cs, opts...), nil

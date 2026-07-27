@@ -285,6 +285,12 @@ type ImageConfig struct {
 	// Snapshotter is the snapshotter used by containerd.
 	Snapshotter string `toml:"snapshotter" json:"snapshotter"`
 
+	// EnableDmverityReferrers enables discovery of dm-verity signature and
+	// precomputed EROFS referrers when local image pull is used. It is derived
+	// from the capabilities advertised by the loaded diff plugins rather than
+	// being set directly.
+	EnableDmverityReferrers bool `toml:"-" json:"enableDmverityReferrers"`
+
 	// DisableSnapshotAnnotations disables to pass additional annotations (image
 	// related information) to snapshotters. These annotations are required by
 	// stargz snapshotter (https://github.com/containerd/stargz-snapshotter).
