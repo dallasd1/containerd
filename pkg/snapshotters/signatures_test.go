@@ -24,6 +24,7 @@ import (
 	"errors"
 	"io"
 	"testing"
+	"time"
 
 	"github.com/containerd/containerd/v2/core/images"
 	"github.com/containerd/containerd/v2/core/remotes"
@@ -160,6 +161,130 @@ func TestSignatureHandlerRejectsInvalidPrecomputedBundle(t *testing.T) {
 	_, err = signatureHandler(base, fetcher).Handle(context.Background(), sourceManifest)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "incomplete precomputed artifacts")
+}
+
+func TestFetchSignaturesSelectsNewestPrecomputedBundle(t *testing.T) {
+	sourceManifest := descriptorFor([]byte("source manifest"), ocispec.MediaTypeImageManifest)
+	sourceLayer := descriptorFor([]byte("source layer"), ocispec.MediaTypeImageLayerGzip)
+	older := newPrecomputedBundle(t, sourceManifest, sourceLayer, "older", "abcd", time.Date(2026, 7, 20, 1, 0, 0, 0, time.UTC))
+	newer := newPrecomputedBundle(t, sourceManifest, sourceLayer, "newer", "ef01", time.Date(2026, 7, 20, 2, 0, 0, 0, time.UTC))
+
+	fetcher := &artifactFetcher{
+		blobs: mergeBlobMaps(older.blobs, newer.blobs),
+		refs: map[digest.Digest][]ocispec.Descriptor{
+			sourceManifest.Digest: {older.descriptor, newer.descriptor},
+		},
+	}
+
+	signatures, artifacts, err := fetchSignatures(context.Background(), fetcher, sourceManifest.Digest)
+	require.NoError(t, err)
+	require.Contains(t, signatures, sourceLayer.Digest.String())
+	assert.Equal(t, "ef01", signatures[sourceLayer.Digest.String()].RootHash)
+	assert.ElementsMatch(t, []ocispec.Descriptor{newer.erofs, newer.tree}, artifacts)
+}
+
+func TestFetchSignaturesFailsClosedOnInvalidNewestPrecomputedBundle(t *testing.T) {
+	sourceManifest := descriptorFor([]byte("source manifest"), ocispec.MediaTypeImageManifest)
+	sourceLayer := descriptorFor([]byte("source layer"), ocispec.MediaTypeImageLayerGzip)
+	older := newPrecomputedBundle(t, sourceManifest, sourceLayer, "older", "abcd", time.Date(2026, 7, 20, 1, 0, 0, 0, time.UTC))
+
+	orphanEROFS := descriptorFor([]byte("orphan erofs"), EROFSArtifactMediaType)
+	orphanEROFS.Annotations = precomputedAnnotations(sourceLayer.Digest.String())
+	invalidManifest := ocispec.Manifest{
+		MediaType:    ocispec.MediaTypeImageManifest,
+		ArtifactType: SignatureArtifactType,
+		Subject:      &sourceManifest,
+		Layers:       []ocispec.Descriptor{orphanEROFS},
+		Annotations: map[string]string{
+			ociAnnotationCreated: time.Date(2026, 7, 20, 2, 0, 0, 0, time.UTC).Format(time.RFC3339),
+		},
+	}
+	invalidBytes, err := json.Marshal(invalidManifest)
+	require.NoError(t, err)
+	invalidDescriptor := descriptorFor(invalidBytes, ocispec.MediaTypeImageManifest)
+	invalidDescriptor.ArtifactType = SignatureArtifactType
+
+	fetcher := &artifactFetcher{
+		blobs: mergeBlobMaps(older.blobs, map[digest.Digest][]byte{
+			invalidDescriptor.Digest: invalidBytes,
+		}),
+		refs: map[digest.Digest][]ocispec.Descriptor{
+			sourceManifest.Digest: {older.descriptor, invalidDescriptor},
+		},
+	}
+
+	_, _, err = fetchSignatures(context.Background(), fetcher, sourceManifest.Digest)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), invalidDescriptor.Digest.String())
+	assert.Contains(t, err.Error(), "incomplete precomputed artifacts")
+}
+
+type precomputedBundleFixture struct {
+	descriptor ocispec.Descriptor
+	erofs      ocispec.Descriptor
+	tree       ocispec.Descriptor
+	blobs      map[digest.Digest][]byte
+}
+
+func newPrecomputedBundle(
+	t *testing.T,
+	subject ocispec.Descriptor,
+	sourceLayer ocispec.Descriptor,
+	name string,
+	rootHash string,
+	createdAt time.Time,
+) precomputedBundleFixture {
+	t.Helper()
+
+	signatureBytes := []byte("signature-" + name)
+	signatureDesc := descriptorFor(signatureBytes, LayerSignatureMediaType)
+	signatureDesc.Annotations = map[string]string{
+		sigLayerDigestAnnotation:    sourceLayer.Digest.String(),
+		sigLayerRootHashAnnotation:  rootHash,
+		sigLayerSignatureAnnotation: base64.StdEncoding.EncodeToString(signatureBytes),
+	}
+	erofsBytes := []byte("erofs-" + name)
+	erofsDesc := descriptorFor(erofsBytes, EROFSArtifactMediaType)
+	erofsDesc.Annotations = precomputedAnnotations(sourceLayer.Digest.String())
+	treeBytes := []byte("tree-" + name)
+	treeDesc := descriptorFor(treeBytes, MerkleTreeArtifactMediaType)
+	treeDesc.Annotations = precomputedAnnotations(sourceLayer.Digest.String())
+
+	manifest := ocispec.Manifest{
+		MediaType:    ocispec.MediaTypeImageManifest,
+		ArtifactType: SignatureArtifactType,
+		Subject:      &subject,
+		Layers:       []ocispec.Descriptor{signatureDesc, erofsDesc, treeDesc},
+		Annotations: map[string]string{
+			ociAnnotationCreated: createdAt.Format(time.RFC3339),
+		},
+	}
+	manifestBytes, err := json.Marshal(manifest)
+	require.NoError(t, err)
+	manifestDesc := descriptorFor(manifestBytes, ocispec.MediaTypeImageManifest)
+	manifestDesc.ArtifactType = SignatureArtifactType
+
+	return precomputedBundleFixture{
+		descriptor: manifestDesc,
+		erofs:      erofsDesc,
+		tree:       treeDesc,
+		blobs: map[digest.Digest][]byte{
+			manifestDesc.Digest:  manifestBytes,
+			signatureDesc.Digest: signatureBytes,
+			erofsDesc.Digest:     erofsBytes,
+			treeDesc.Digest:      treeBytes,
+		},
+	}
+}
+
+func mergeBlobMaps(maps ...map[digest.Digest][]byte) map[digest.Digest][]byte {
+	merged := make(map[digest.Digest][]byte)
+	for _, blobs := range maps {
+		for dgst, data := range blobs {
+			merged[dgst] = data
+		}
+	}
+	return merged
 }
 
 func descriptorFor(data []byte, mediaType string) ocispec.Descriptor {
