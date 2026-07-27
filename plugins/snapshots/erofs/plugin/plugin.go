@@ -19,6 +19,7 @@ package plugin
 import (
 	"errors"
 	"fmt"
+	"slices"
 
 	"github.com/containerd/platforms"
 	"github.com/containerd/plugin"
@@ -54,8 +55,14 @@ type Config struct {
 
 func init() {
 	registry.Register(&plugin.Registration{
-		Type:   plugins.SnapshotPlugin,
-		ID:     "erofs",
+		Type: plugins.SnapshotPlugin,
+		ID:   "erofs",
+		// DiffPlugin is an ordering requirement only: the snapshotter reads
+		// the erofs differ's dm-verity capability below and needs the diff
+		// plugins to have initialized first.
+		Requires: []plugin.Type{
+			plugins.DiffPlugin,
+		},
 		Config: &Config{},
 		InitFn: func(ic *plugin.InitContext) (interface{}, error) {
 			ic.Meta.Platforms = append(ic.Meta.Platforms, platforms.DefaultSpec())
@@ -93,6 +100,17 @@ func init() {
 
 			if config.DmverityMode != "" {
 				opts = append(opts, erofs.WithDmverityMode(config.DmverityMode))
+			}
+
+			// Layers the snapshotter builds itself (commitBlock path) are
+			// formatted with dm-verity only when a diff plugin says it handles
+			// dm-verity, so the two paths agree without a second setting.
+			for _, p := range ic.Plugins().GetAll() {
+				if p.Registration.Type == plugins.DiffPlugin &&
+					slices.Contains(p.Meta.Capabilities, plugins.CapabilityDmverityReferrers) {
+					opts = append(opts, erofs.WithDmverityFormat())
+					break
+				}
 			}
 
 			ic.Meta.Exports[plugins.SnapshotterRootDir] = root

@@ -228,12 +228,13 @@ func (s erofsDiff) Apply(ctx context.Context, desc ocispec.Descriptor, mounts []
 			return emptyDesc, fmt.Errorf("failed to format dm-verity layer: %w", err)
 		}
 
-		if s.requireSignatures {
-			sig := desc.Annotations[snpkg.TargetLayerSignatureLabel]
-			if sig == "" {
-				return emptyDesc, fmt.Errorf("dm-verity signature required but not present on layer %s", desc.Digest)
-			}
-
+		// Pass a layer's dm-verity signature to the kernel when the layer
+		// carries one, so the verity target is loaded with signature
+		// verification. Rejecting UNSIGNED layers is a separate decision
+		// (require_signatures).
+		sig := desc.Annotations[snpkg.TargetLayerSignatureLabel]
+		switch {
+		case sig != "":
 			expectedRootHash := desc.Annotations[snpkg.TargetLayerRootHashLabel]
 			if expectedRootHash == "" {
 				return emptyDesc, fmt.Errorf("dm-verity signature present but missing expected root hash for layer %s", desc.Digest)
@@ -246,6 +247,8 @@ func (s erofsDiff) Apply(ctx context.Context, desc ocispec.Descriptor, mounts []
 				return emptyDesc, err
 			}
 			log.G(ctx).WithField("path", dmverity.SignaturePath(layerBlobPath)).Debug("Wrote dm-verity signature file")
+		case s.requireSignatures:
+			return emptyDesc, fmt.Errorf("dm-verity signature required but not present on layer %s", desc.Digest)
 		}
 	}
 

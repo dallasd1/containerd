@@ -22,6 +22,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"time"
 
 	"github.com/containerd/continuity/fs"
 	"github.com/containerd/errdefs"
@@ -46,6 +47,11 @@ type SnapshotterConfig struct {
 	defaultSize int64
 	// dmverityMode controls dm-verity behavior: "auto" (use if .dmverity exists), "on" (require .dmverity), "off" (disable)
 	dmverityMode string
+	// dmverityFormat enables dm-verity formatting of snapshotter-built layers.
+	// It mirrors the erofs differ's enable_dmverity setting rather than being
+	// configured separately, so a layer the snapshotter builds carries the same
+	// sidecars as one the differ produces.
+	dmverityFormat bool
 }
 
 // Opt is an option to configure the erofs snapshotter
@@ -72,10 +78,18 @@ func WithImmutable() Opt {
 	}
 }
 
-// WithDmverityMode sets the dm-verity mode: "auto" (default), "on" (required), or "off" (disabled)
+// WithDmverityMode sets the dm-verity mode: "auto", "on" (required), or "off" (default).
 func WithDmverityMode(mode string) Opt {
 	return func(config *SnapshotterConfig) {
 		config.dmverityMode = mode
+	}
+}
+
+// WithDmverityFormat enables dm-verity formatting for layers the snapshotter
+// builds itself, matching what the erofs differ does for layers it applies.
+func WithDmverityFormat() Opt {
+	return func(config *SnapshotterConfig) {
+		config.dmverityFormat = true
 	}
 }
 
@@ -101,6 +115,7 @@ type snapshotter struct {
 	defaultWritable int64
 	blockMode       bool
 	dmverityMode    string
+	dmverityFormat  bool
 }
 
 // NewSnapshotter returns a Snapshotter which uses EROFS+OverlayFS. The layers
@@ -176,6 +191,7 @@ func NewSnapshotter(root string, opts ...Opt) (snapshots.Snapshotter, error) {
 		defaultWritable: config.defaultSize,
 		blockMode:       config.defaultSize > 0,
 		dmverityMode:    config.dmverityMode,
+		dmverityFormat:  config.dmverityFormat,
 	}, nil
 }
 
@@ -244,6 +260,22 @@ func (s *snapshotter) applyDmverityPolicy(layerBlob string) (string, error) {
 
 	// Validate dmverityMode policy: mode "on" requires .dmverity metadata to exist
 	if s.dmverityMode == "on" && !metadataExists {
+		blobSize := int64(-1)
+		blobMtime := "unknown"
+		if bi, berr := os.Stat(layerBlob); berr == nil {
+			blobSize = bi.Size()
+			blobMtime = bi.ModTime().UTC().Format(time.RFC3339Nano)
+		}
+		log.L.WithFields(log.Fields{
+			"tag":            "dmverity_format",
+			"event":          "policy_reject",
+			"layerBlob":      layerBlob,
+			"metadataPath":   metadataPath,
+			"metadataExists": metadataExists,
+			"mode":           s.dmverityMode,
+			"blobSize":       blobSize,
+			"blobMtime":      blobMtime,
+		}).Error("dmverity_format: REJECTING mount — mode=on but .dmverity sidecar missing for layer blob")
 		return "", fmt.Errorf("dm-verity mode is 'on' but .dmverity metadata not found for layer %s", layerBlob)
 	}
 
@@ -476,6 +508,13 @@ func (s *snapshotter) View(ctx context.Context, key, parent string, opts ...snap
 }
 
 func (s *snapshotter) commitBlock(ctx context.Context, layerBlob string, id string) error {
+	log.G(ctx).WithFields(log.Fields{
+		"tag":       "dmverity_format",
+		"event":     "commitblock_enter",
+		"snap":      id,
+		"layerBlob": layerBlob,
+		"upper":     s.upperPath(id),
+	}).Info("dmverity_format: commitBlock ENTER (walking-differ path — building layer.erofs from upperdir)")
 	layer := s.writablePath(id)
 	if _, err := os.Stat(layer); err != nil {
 		if os.IsNotExist(err) {
@@ -534,12 +573,89 @@ func (s *snapshotter) Commit(ctx context.Context, name, key string, opts ...snap
 	// the EROFS differ (possibly the walking differ), convert the upperdir instead.
 	layerBlob = s.layerBlobPath(id)
 	if _, err := os.Stat(layerBlob); err != nil {
+		log.G(ctx).WithFields(log.Fields{
+			"tag":       "dmverity_format",
+			"event":     "commit_format_path",
+			"snap":      id,
+			"layerBlob": layerBlob,
+			"mode":      s.dmverityMode,
+		}).Info("dmverity_format: Commit taking commitBlock+format path (layer.erofs missing — differ did not write it)")
+
 		if cerr := s.commitBlock(ctx, layerBlob, id); cerr != nil {
 			if errdefs.IsNotImplemented(cerr) {
 				return err
 			}
 			return cerr
 		}
+
+		blobInfo, statErr := os.Stat(layerBlob)
+		blobSize := int64(-1)
+		if statErr == nil {
+			blobSize = blobInfo.Size()
+		}
+		log.G(ctx).WithFields(log.Fields{
+			"tag":       "dmverity_format",
+			"event":     "commitblock_done",
+			"snap":      id,
+			"layerBlob": layerBlob,
+			"blobSize":  blobSize,
+			"mode":      s.dmverityMode,
+		}).Info("dmverity_format: commitBlock produced layer.erofs; entering dm-verity format switch")
+
+		// Format the freshly-created layer.erofs with dm-verity so the
+		// snapshotter-built blob carries the same .dmverity sidecar that
+		// the EROFS differ produces. Without this the snapshotter mount
+		// path rejects the layer at applyDmverityPolicy time (orphan
+		// layer.erofs). Block size 4096 — commitBlock never produces a
+		// tar-index layer.
+		//
+		// Whether to format at all follows the differ's enable_dmverity, not
+		// dmverityMode: a daemon whose differ does not produce sidecars must
+		// not start producing them here. dmverityMode only decides how strict
+		// to be, matching its meaning on the mount path.
+		switch {
+		case !s.dmverityFormat:
+			log.G(ctx).WithFields(log.Fields{
+				"tag":   "dmverity_format",
+				"event": "commit_skip_disabled",
+				"snap":  id,
+			}).Debug("dmverity_format: erofs differ has dm-verity disabled — skipping format for commitBlock-built layer")
+		case s.dmverityMode == "off":
+			log.G(ctx).WithFields(log.Fields{
+				"tag":   "dmverity_format",
+				"event": "commit_skip_off",
+				"snap":  id,
+			}).Info("dmverity_format: dmverityMode=off — skipping format for commitBlock-built layer")
+		default:
+			if _, ferr := dmverity.FormatLayerBlob(ctx, layerBlob, 4096); ferr != nil {
+				// FormatLayerBlob's internal rollback has already restored
+				// the original blob size and removed any partial sidecar,
+				// so the orphan-guard below will treat this uniformly.
+				if s.dmverityMode == "on" {
+					log.G(ctx).WithError(ferr).WithFields(log.Fields{
+						"tag":       "dmverity_format",
+						"event":     "commit_format_failed_on",
+						"snap":      id,
+						"layerBlob": layerBlob,
+					}).Error("dmverity_format: format failed under mode=on — returning error to caller")
+					return fmt.Errorf("failed to format dm-verity for snapshotter-built layer: %w", ferr)
+				}
+				log.G(ctx).WithError(ferr).WithFields(log.Fields{
+					"tag":       "dmverity_format",
+					"event":     "commit_format_failed_auto",
+					"snap":      id,
+					"layerBlob": layerBlob,
+				}).Warn("dmverity_format: format failed under mode=auto, continuing without sidecar (orphan layer)")
+			}
+		}
+	} else {
+		log.G(ctx).WithFields(log.Fields{
+			"tag":       "dmverity_format",
+			"event":     "commit_differ_path",
+			"snap":      id,
+			"layerBlob": layerBlob,
+			"mode":      s.dmverityMode,
+		}).Debug("dmverity_format: Commit found layer.erofs already present (differ-Apply path) — no commitBlock format")
 	}
 
 	// Enable fsverity on the EROFS layer if configured
@@ -556,7 +672,10 @@ func (s *snapshotter) Commit(ctx context.Context, name, key string, opts ...snap
 		}
 	}
 
-	// Note: dm-verity formatting is handled by the EROFS differ, not here
+	// dm-verity formatting is done above — by the differ when layer.erofs
+	// came from a tar stream, or in the commitBlock branch above when we
+	// built layer.erofs from the overlay upperdir. The 3010 orphan-guard
+	// below catches pre-existing orphans from older snapshotter versions.
 
 	return s.ms.WithTransaction(ctx, true, func(ctx context.Context) error {
 		if _, err := os.Stat(layerBlob); err != nil {

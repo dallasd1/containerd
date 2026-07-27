@@ -637,6 +637,17 @@ func TestDmverityModeValidation(t *testing.T) {
 		require.NoError(t, err)
 		snap := s.(*snapshotter)
 		assert.Equal(t, "auto", snap.dmverityMode)
+		assert.False(t, snap.dmverityFormat, "formatting must stay off until a differ advertises dm-verity")
+		s.Close()
+	})
+
+	t.Run("format opt is independent of mode", func(t *testing.T) {
+		root := filepath.Join(tmpDir, "format")
+		s, err := NewSnapshotter(root, WithDmverityFormat())
+		require.NoError(t, err)
+		snap := s.(*snapshotter)
+		assert.Equal(t, "auto", snap.dmverityMode)
+		assert.True(t, snap.dmverityFormat)
 		s.Close()
 	})
 }
