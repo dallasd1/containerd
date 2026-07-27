@@ -96,7 +96,8 @@ func openOrReuseDmverityDevice(ctx context.Context, source, deviceName string, m
 		"hash-offset": metadata.HashOffset,
 	}).Debug("opening dm-verity device")
 
-	devicePath, err := dmverity.OpenWithSignature(source, deviceName, source, metadata.RootHash, metadata.HashOffset, nil, signatureFile)
+	hashDevice := dmverity.ResolveHashDevice(source, metadata)
+	devicePath, err := dmverity.OpenWithSignature(source, deviceName, hashDevice, metadata.RootHash, metadata.HashOffset, nil, signatureFile)
 	if err != nil {
 		return "", fmt.Errorf("failed to open dm-verity device: %w", err)
 	}

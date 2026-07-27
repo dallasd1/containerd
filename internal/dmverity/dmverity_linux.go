@@ -19,7 +19,6 @@ package dmverity
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"os"
 	"runtime"
@@ -161,8 +160,10 @@ func OpenWithSignature(dataDevice string, name string, hashDevice string, rootHa
 	}
 
 	loopParams := mount.LoopParams{
-		Readonly:  true,
-		Autoclear: false, // Don't use autoclear - dm-verity needs the loop device to stay active
+		Readonly: true,
+		// The dm-verity target holds the loop devices open. Autoclear detaches
+		// them when the mapper is removed, including after a daemon restart.
+		Autoclear: true,
 	}
 
 	dataLoop, err := mount.SetupLoop(dataDevice, loopParams)
@@ -207,8 +208,26 @@ func OpenWithSignature(dataDevice string, name string, hashDevice string, rootHa
 		}
 		return "", fmt.Errorf("failed to open dm-verity device: %w", err)
 	}
+	dataLoop.Close()
+	if hashLoop != nil {
+		hashLoop.Close()
+	}
 
 	return devicePath, nil
+}
+
+// VerifyArtifacts verifies a precomputed EROFS data device and separate
+// dm-verity hash device against the expected root hash.
+func VerifyArtifacts(dataDevice, hashDevice, rootHash string) error {
+	rootDigest, err := utils.ParseRootHash(rootHash)
+	if err != nil {
+		return fmt.Errorf("invalid root hash: %w", err)
+	}
+	params := verity.DefaultParams()
+	if err := verity.Verify(&params, dataDevice, hashDevice, rootDigest); err != nil {
+		return fmt.Errorf("verify precomputed dm-verity artifacts: %w", err)
+	}
+	return nil
 }
 
 func Close(name string) error {
@@ -339,12 +358,8 @@ func FormatLayerBlob(ctx context.Context, layerBlobPath string, blockSize uint32
 		RootHash:   rootHash,
 		HashOffset: hashOffset,
 	}
-	metadataBytes, err := json.MarshalIndent(metadata, "", "  ")
-	if err != nil {
-		return "", fmt.Errorf("failed to marshal dm-verity metadata: %w", err)
-	}
-	if err := os.WriteFile(metadataPath, metadataBytes, 0644); err != nil {
-		return "", fmt.Errorf("failed to write dm-verity metadata: %w", err)
+	if err := WriteMetadata(layerBlobPath, metadata); err != nil {
+		return "", err
 	}
 
 	formatted = true
