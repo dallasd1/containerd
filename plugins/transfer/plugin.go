@@ -180,6 +180,7 @@ func init() {
 			}
 			lc.RegistryConfigPath = config.RegistryConfigPath
 			lc.DuplicationSuppressor = kmutex.New()
+			lc.EnableDmverityReferrers = config.EnableDmverityReferrers
 
 			return local.NewTransferService(ms.ContentStore(), metadata.NewImageStore(ms), lc), nil
 		},
@@ -205,6 +206,10 @@ type transferConfig struct {
 
 	// UnpackConfiguration is used to read config from toml
 	UnpackConfiguration []unpackConfiguration `toml:"unpack_config,omitempty"`
+
+	// EnableDmverityReferrers enables discovery of dm-verity signature and
+	// precomputed EROFS referrers during pull and import.
+	EnableDmverityReferrers bool `toml:"enable_dmverity_referrers"`
 
 	// RegistryConfigPath is a path to the root directory containing registry-specific configurations
 	RegistryConfigPath string `toml:"config_path"`
