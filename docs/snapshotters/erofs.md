@@ -224,6 +224,21 @@ The available modes are:
   Layers are mounted as regular EROFS without integrity verification. Use this for
   compatibility or when dm-verity overhead is unacceptable.
 
+Discovery of dm-verity referrers (per-layer signatures and precomputed EROFS
+artifacts) requires an extra registry lookup during pull and import, so it is
+performed only when a differ that consumes those artifacts is loaded. The EROFS
+differ advertises this when `enable_dmverity` is set:
+
+```toml
+[plugins."io.containerd.differ.v1.erofs"]
+  enable_dmverity = true
+```
+
+Both the transfer service and the CRI image service derive referrer discovery
+from that capability, so no additional configuration is needed. With
+`enable_dmverity` disabled, which is the default, no referrer lookup is
+performed and pull behaves exactly as it does without this feature.
+
 When mounting a layer with dm-verity enabled, the snapshotter reads the metadata
 from the `.dmverity` file and creates a dm-verity device. The dm-verity library
 automatically reads all parameters from the superblock, ensuring that any corruption
