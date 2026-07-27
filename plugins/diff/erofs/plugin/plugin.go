@@ -24,6 +24,7 @@ import (
 	"github.com/containerd/plugin/registry"
 
 	"github.com/containerd/containerd/v2/core/metadata"
+	"github.com/containerd/containerd/v2/internal/dmverity"
 	"github.com/containerd/containerd/v2/internal/erofsutils"
 	"github.com/containerd/containerd/v2/plugins"
 	"github.com/containerd/containerd/v2/plugins/diff/erofs"
@@ -37,6 +38,15 @@ type Config struct {
 	// EnableTarIndex enables the tar index mode where the index is generated
 	// for tar content without extracting the tar
 	EnableTarIndex bool `toml:"enable_tar_index"`
+
+	// EnableDmverity enables dm-verity formatting for EROFS layers
+	// Linux only
+	EnableDmverity bool `toml:"enable_dmverity"`
+
+	// RequireSignatures requires dm-verity signatures to be present on all layers.
+	// When enabled, layer application will fail if a signature is not present.
+	// Only has effect when EnableDmverity is true.
+	RequireSignatures bool `toml:"require_signatures"`
 }
 
 func init() {
@@ -69,12 +79,34 @@ func init() {
 
 			var opts []erofs.DifferOpt
 
+			// require_signatures is only honoured inside the dm-verity block
+			// below, so accepting this combination would silently give an
+			// operator who asked for mandatory signatures no enforcement at all.
+			if config.RequireSignatures && !config.EnableDmverity {
+				return nil, fmt.Errorf("erofs differ: require_signatures requires enable_dmverity to be true")
+			}
+
 			if len(config.MkfsOptions) > 0 {
 				opts = append(opts, erofs.WithMkfsOptions(config.MkfsOptions))
 			}
 
 			if config.EnableTarIndex {
 				opts = append(opts, erofs.WithTarIndexMode())
+			}
+
+			if config.EnableDmverity {
+				supported, err := dmverity.IsSupported()
+				if err != nil {
+					return nil, fmt.Errorf("dm-verity support check failed: %w", err)
+				}
+				if !supported {
+					return nil, fmt.Errorf("dm-verity is not supported on this system (dm_verity module not loaded): %w", plugin.ErrSkipPlugin)
+				}
+				opts = append(opts, erofs.WithDmverity())
+
+				if config.RequireSignatures {
+					opts = append(opts, erofs.WithRequireSignatures())
+				}
 			}
 
 			return erofs.NewErofsDiffer(cs, opts...), nil
