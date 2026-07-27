@@ -23,6 +23,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 )
 
 type DmverityOptions struct {
@@ -67,6 +68,11 @@ func SignaturePath(layerBlobPath string) string {
 	return layerBlobPath + ".sig"
 }
 
+// HashDevicePath returns the path used for a separate precomputed Merkle tree.
+func HashDevicePath(layerBlobPath string) string {
+	return layerBlobPath + ".hashtree"
+}
+
 // WriteSignature writes a base64-encoded signature to the signature file for a layer.
 func WriteSignature(layerBlobPath string, base64Sig string) error {
 	sigPath := SignaturePath(layerBlobPath)
@@ -87,6 +93,33 @@ func DevicePath(name string) string {
 type DmverityMetadata struct {
 	RootHash   string `json:"roothash"`
 	HashOffset uint64 `json:"hashoffset"`
+	HashDevice string `json:"hashdevice,omitempty"`
+}
+
+// WriteMetadata writes dm-verity mount metadata for a layer.
+func WriteMetadata(layerBlobPath string, metadata DmverityMetadata) error {
+	if metadata.RootHash == "" {
+		return fmt.Errorf("cannot write dm-verity metadata without a root hash")
+	}
+	data, err := json.MarshalIndent(metadata, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal dm-verity metadata: %w", err)
+	}
+	if err := os.WriteFile(MetadataPath(layerBlobPath), data, 0644); err != nil {
+		return fmt.Errorf("failed to write dm-verity metadata: %w", err)
+	}
+	return nil
+}
+
+// ResolveHashDevice returns the hash device path described by metadata.
+func ResolveHashDevice(layerBlobPath string, metadata *DmverityMetadata) string {
+	if metadata == nil || metadata.HashDevice == "" {
+		return layerBlobPath
+	}
+	if filepath.IsAbs(metadata.HashDevice) {
+		return metadata.HashDevice
+	}
+	return filepath.Join(filepath.Dir(layerBlobPath), metadata.HashDevice)
 }
 
 func ReadMetadata(layerBlobPath string) (*DmverityMetadata, error) {
