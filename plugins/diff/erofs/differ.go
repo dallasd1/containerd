@@ -197,6 +197,19 @@ func (s erofsDiff) Apply(ctx context.Context, desc ocispec.Descriptor, mounts []
 		r: io.TeeReader(processor, digester.Hash()),
 	}
 
+	if used, err := s.applyPrecomputedArtifacts(ctx, desc, layerBlobPath); err != nil {
+		return emptyDesc, err
+	} else if used {
+		if _, err := io.Copy(io.Discard, rc); err != nil {
+			return emptyDesc, fmt.Errorf("calculate diffID for precomputed EROFS layer: %w", err)
+		}
+		return ocispec.Descriptor{
+			MediaType: ocispec.MediaTypeImageLayer,
+			Size:      rc.c,
+			Digest:    digester.Digest(),
+		}, nil
+	}
+
 	// Choose between tar index or tar conversion mode
 	// Generate deterministic UUID from layer digest
 	u := uuid.NewSHA1(uuid.NameSpaceURL, []byte("erofs:blobs/"+desc.Digest))
@@ -228,27 +241,8 @@ func (s erofsDiff) Apply(ctx context.Context, desc ocispec.Descriptor, mounts []
 			return emptyDesc, fmt.Errorf("failed to format dm-verity layer: %w", err)
 		}
 
-		// Pass a layer's dm-verity signature to the kernel when the layer
-		// carries one, so the verity target is loaded with signature
-		// verification. Rejecting UNSIGNED layers is a separate decision
-		// (require_signatures).
-		sig := desc.Annotations[snpkg.TargetLayerSignatureLabel]
-		switch {
-		case sig != "":
-			expectedRootHash := desc.Annotations[snpkg.TargetLayerRootHashLabel]
-			if expectedRootHash == "" {
-				return emptyDesc, fmt.Errorf("dm-verity signature present but missing expected root hash for layer %s", desc.Digest)
-			}
-			if rootHash != expectedRootHash {
-				return emptyDesc, fmt.Errorf("dm-verity root hash mismatch for layer %s: computed %q, expected %q", desc.Digest, rootHash, expectedRootHash)
-			}
-
-			if err := dmverity.WriteSignature(layerBlobPath, sig); err != nil {
-				return emptyDesc, err
-			}
-			log.G(ctx).WithField("path", dmverity.SignaturePath(layerBlobPath)).Debug("Wrote dm-verity signature file")
-		case s.requireSignatures:
-			return emptyDesc, fmt.Errorf("dm-verity signature required but not present on layer %s", desc.Digest)
+		if err := s.writeLayerSignature(ctx, desc, layerBlobPath, rootHash); err != nil {
+			return emptyDesc, err
 		}
 	}
 
@@ -257,6 +251,27 @@ func (s erofsDiff) Apply(ctx context.Context, desc ocispec.Descriptor, mounts []
 		Size:      rc.c,
 		Digest:    digester.Digest(),
 	}, nil
+}
+
+func (s erofsDiff) writeLayerSignature(ctx context.Context, desc ocispec.Descriptor, layerBlobPath, actualRootHash string) error {
+	sig := desc.Annotations[snpkg.TargetLayerSignatureLabel]
+	switch {
+	case sig != "":
+		expectedRootHash := desc.Annotations[snpkg.TargetLayerRootHashLabel]
+		if expectedRootHash == "" {
+			return fmt.Errorf("dm-verity signature present but missing expected root hash for layer %s", desc.Digest)
+		}
+		if actualRootHash != expectedRootHash {
+			return fmt.Errorf("dm-verity root hash mismatch for layer %s: actual %q, expected %q", desc.Digest, actualRootHash, expectedRootHash)
+		}
+		if err := dmverity.WriteSignature(layerBlobPath, sig); err != nil {
+			return err
+		}
+		log.G(ctx).WithField("path", dmverity.SignaturePath(layerBlobPath)).Debug("Wrote dm-verity signature file")
+	case s.requireSignatures:
+		return fmt.Errorf("dm-verity signature required but not present on layer %s", desc.Digest)
+	}
+	return nil
 }
 
 type readCounter struct {
