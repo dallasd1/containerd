@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"runtime"
+	"slices"
 
 	containerd "github.com/containerd/containerd/v2/client"
 	"github.com/containerd/containerd/v2/core/metadata"
@@ -46,6 +47,7 @@ func init() {
 		ID:     "images",
 		Config: &config,
 		Requires: []plugin.Type{
+			plugins.DiffPlugin, // For deriving dm-verity referrer discovery
 			plugins.LeasePlugin,
 			plugins.MetadataPlugin,
 			plugins.SandboxStorePlugin,
@@ -60,6 +62,19 @@ func init() {
 				return nil, err
 			}
 			mdb := m.(*metadata.DB)
+
+			// Referrer discovery is driven by the differ that will consume the
+			// artifacts rather than by separate configuration. The local image
+			// pull path selects a differ dynamically, so any loaded differ that
+			// consumes dm-verity artifacts enables discovery.
+			for _, p := range ic.Plugins().GetAll() {
+				if p.Registration.Type == plugins.DiffPlugin &&
+					slices.Contains(p.Meta.Capabilities, plugins.CapabilityDmverityReferrers) {
+					config.EnableDmverityReferrers = true
+					log.G(ic.Context).Debugf("enabling dm-verity referrer discovery for differ %q", p.Registration.ID)
+					break
+				}
+			}
 
 			// only set the default value of config path, if both mirrors and
 			// config path are empty and we are on Linux.
