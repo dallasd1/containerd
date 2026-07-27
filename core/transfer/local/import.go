@@ -30,6 +30,7 @@ import (
 	"github.com/containerd/containerd/v2/core/images"
 	"github.com/containerd/containerd/v2/core/transfer"
 	"github.com/containerd/containerd/v2/core/unpack"
+	snpkg "github.com/containerd/containerd/v2/pkg/snapshotters"
 )
 
 func (ts *localTransferService) importStream(ctx context.Context, i transfer.ImageImporter, is transfer.ImageStorer, tops *transfer.Config) error {
@@ -104,6 +105,11 @@ func (ts *localTransferService) importStream(ctx context.Context, i transfer.Ima
 			if ts.config.DuplicationSuppressor != nil {
 				uopts = append(uopts, unpack.WithDuplicationSuppressor(ts.config.DuplicationSuppressor))
 			}
+
+			if ts.config.EnableDmverityReferrers {
+				handler = snpkg.AppendSignatureHandlerWrapper(snpkg.NewContentStoreFetcher(ts.content))(handler)
+			}
+
 			unpacker, err = unpack.NewUnpacker(ctx, ts.content, uopts...)
 			if err != nil {
 				return fmt.Errorf("unable to initialize unpacker: %w", err)
