@@ -34,7 +34,9 @@ import (
 	"github.com/containerd/containerd/v2/core/diff"
 	"github.com/containerd/containerd/v2/core/images"
 	"github.com/containerd/containerd/v2/core/mount"
+	"github.com/containerd/containerd/v2/internal/dmverity"
 	"github.com/containerd/containerd/v2/internal/erofsutils"
+	snpkg "github.com/containerd/containerd/v2/pkg/snapshotters"
 
 	"github.com/google/uuid"
 )
@@ -53,6 +55,11 @@ type erofsDiff struct {
 	// enableTarIndex enables generating tar index for tar content
 	// instead of fully converting the tar to EROFS format
 	enableTarIndex bool
+	// enableDmverity enables formatting layers with dm-verity after creation
+	enableDmverity bool
+	// requireSignatures requires dm-verity signatures to be present on layers
+	// when dm-verity is enabled. If true, Apply will fail if a layer lacks a signature.
+	requireSignatures bool
 }
 
 // DifferOpt is an option for configuring the erofs differ
@@ -69,6 +76,21 @@ func WithMkfsOptions(opts []string) DifferOpt {
 func WithTarIndexMode() DifferOpt {
 	return func(d *erofsDiff) {
 		d.enableTarIndex = true
+	}
+}
+
+// WithDmverity enables dm-verity formatting for EROFS layers
+func WithDmverity() DifferOpt {
+	return func(d *erofsDiff) {
+		d.enableDmverity = true
+	}
+}
+
+// WithRequireSignatures requires dm-verity signatures to be present on layers.
+// This option only has effect when dm-verity is enabled.
+func WithRequireSignatures() DifferOpt {
+	return func(d *erofsDiff) {
+		d.requireSignatures = true
 	}
 }
 
@@ -176,16 +198,17 @@ func (s erofsDiff) Apply(ctx context.Context, desc ocispec.Descriptor, mounts []
 	}
 
 	// Choose between tar index or tar conversion mode
+	// Generate deterministic UUID from layer digest
+	u := uuid.NewSHA1(uuid.NameSpaceURL, []byte("erofs:blobs/"+desc.Digest))
 	if s.enableTarIndex {
 		// Use the tar index method: generate tar index and append tar
-		err = erofsutils.GenerateTarIndexAndAppendTar(ctx, rc, layerBlobPath, s.mkfsExtraOpts)
+		err = erofsutils.GenerateTarIndexAndAppendTar(ctx, rc, layerBlobPath, u.String(), s.mkfsExtraOpts)
 		if err != nil {
 			return emptyDesc, fmt.Errorf("failed to generate tar index: %w", err)
 		}
 		log.G(ctx).WithField("path", layerBlobPath).Debug("Applied layer using tar index mode")
 	} else {
 		// Use the tar method: fully convert tar to EROFS
-		u := uuid.NewSHA1(uuid.NameSpaceURL, []byte("erofs:blobs/"+desc.Digest))
 		err = erofsutils.ConvertTarErofs(ctx, rc, layerBlobPath, u.String(), s.mkfsExtraOpts)
 		if err != nil {
 			return emptyDesc, fmt.Errorf("failed to convert tar to erofs: %w", err)
@@ -196,6 +219,34 @@ func (s erofsDiff) Apply(ctx context.Context, desc ocispec.Descriptor, mounts []
 	// Read any trailing data
 	if _, err := io.Copy(io.Discard, rc); err != nil {
 		return emptyDesc, err
+	}
+
+	// Format with dm-verity if enabled
+	if s.enableDmverity {
+		rootHash, err := s.formatDmverityLayer(ctx, layerBlobPath)
+		if err != nil {
+			return emptyDesc, fmt.Errorf("failed to format dm-verity layer: %w", err)
+		}
+
+		if s.requireSignatures {
+			sig := desc.Annotations[snpkg.TargetLayerSignatureLabel]
+			if sig == "" {
+				return emptyDesc, fmt.Errorf("dm-verity signature required but not present on layer %s", desc.Digest)
+			}
+
+			expectedRootHash := desc.Annotations[snpkg.TargetLayerRootHashLabel]
+			if expectedRootHash == "" {
+				return emptyDesc, fmt.Errorf("dm-verity signature present but missing expected root hash for layer %s", desc.Digest)
+			}
+			if rootHash != expectedRootHash {
+				return emptyDesc, fmt.Errorf("dm-verity root hash mismatch for layer %s: computed %q, expected %q", desc.Digest, rootHash, expectedRootHash)
+			}
+
+			if err := dmverity.WriteSignature(layerBlobPath, sig); err != nil {
+				return emptyDesc, err
+			}
+			log.G(ctx).WithField("path", dmverity.SignaturePath(layerBlobPath)).Debug("Wrote dm-verity signature file")
+		}
 	}
 
 	return ocispec.Descriptor{

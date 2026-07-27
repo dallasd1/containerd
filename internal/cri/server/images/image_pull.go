@@ -272,6 +272,10 @@ func (c *CRIImageService) pullImageWithLocalPull(
 		pullOpts = append(pullOpts,
 			containerd.WithImageHandlerWrapper(snpkg.AppendInfoHandlerWrapper(ref)))
 	}
+	// Always fetch signatures if available - the handler is a no-op if no referrers exist.
+	// The snapshotter decides whether to use them during mount.
+	pullOpts = append(pullOpts,
+		containerd.WithImageHandlerWrapper(snpkg.AppendSignatureHandlerWrapperFromResolver(resolver, ref)))
 
 	if c.config.DiscardUnpackedLayers {
 		// Allows GC to clean layers up from the content store after unpacking
@@ -285,6 +289,7 @@ func (c *CRIImageService) pullImageWithLocalPull(
 	if err != nil {
 		return nil, fmt.Errorf("failed to pull and unpack image %q: %w", ref, err)
 	}
+
 	return image, nil
 }
 
