@@ -18,7 +18,10 @@
 
 package dmverity
 
-import "fmt"
+import (
+	"context"
+	"fmt"
+)
 
 var errUnsupported = fmt.Errorf("dmverity is only supported on Linux systems")
 
@@ -44,4 +47,11 @@ func Close(_ string) error {
 
 func VerifyDevice(_ string, _ string) error {
 	return errUnsupported
+}
+
+// FormatLayerBlob appends a dm-verity hash tree to an EROFS layer blob. It is
+// only implemented on Linux; the stub keeps the package's exported surface
+// identical on every platform, matching the other entry points here.
+func FormatLayerBlob(_ context.Context, _ string, _ uint32) (string, error) {
+	return "", errUnsupported
 }
