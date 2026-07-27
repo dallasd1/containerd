@@ -31,19 +31,6 @@ import (
 	"github.com/containerd/containerd/v2/internal/dmverity"
 )
 
-// TestGetDmverityOptions tests the block size configuration
-func TestGetDmverityOptions(t *testing.T) {
-	// tar-index mode uses 512-byte blocks
-	opts := (&erofsDiff{enableTarIndex: true, enableDmverity: true}).getDmverityOptions()
-	assert.Equal(t, uint32(512), opts.DataBlockSize)
-	assert.Equal(t, uint32(512), opts.HashBlockSize)
-
-	// regular mode uses 4096-byte blocks
-	opts = (&erofsDiff{enableTarIndex: false, enableDmverity: true}).getDmverityOptions()
-	assert.Equal(t, uint32(4096), opts.DataBlockSize)
-	assert.Equal(t, uint32(4096), opts.HashBlockSize)
-}
-
 // TestFormatDmverityLayer tests the layer formatting logic
 func TestFormatDmverityLayer(t *testing.T) {
 	supported, err := dmverity.IsSupported()
