@@ -154,11 +154,8 @@ func fetchSignatures(ctx context.Context, fetcher remotes.Fetcher, manifestDiges
 			legacy = append(legacy, candidate)
 		}
 	}
-	if len(precomputed) > 1 {
-		return nil, nil, fmt.Errorf("multiple precomputed dm-verity bundles found for %s", manifestDigest)
-	}
-	if len(precomputed) == 1 {
-		candidate := precomputed[0]
+	if len(precomputed) > 0 {
+		candidate := newestReferrer(precomputed)
 		infos, artifactDescs, err := parsePrecomputedBundle(ctx, fetcher, candidate.manifest)
 		if err != nil {
 			return nil, nil, fmt.Errorf("parse precomputed dm-verity bundle %s: %w", candidate.desc.Digest, err)
@@ -174,12 +171,7 @@ func fetchSignatures(ctx context.Context, fetcher remotes.Fetcher, manifestDiges
 	if len(legacy) == 0 {
 		return signatures, nil, nil
 	}
-	newest := legacy[0]
-	for _, candidate := range legacy[1:] {
-		if candidate.createdAt.After(newest.createdAt) {
-			newest = candidate
-		}
-	}
+	newest := newestReferrer(legacy)
 	for _, layer := range newest.manifest.Layers {
 		if layer.Annotations == nil {
 			continue
@@ -192,6 +184,16 @@ func fetchSignatures(ctx context.Context, fetcher remotes.Fetcher, manifestDiges
 		}
 	}
 	return signatures, nil, nil
+}
+
+func newestReferrer(candidates []referrerWithManifest) referrerWithManifest {
+	newest := candidates[0]
+	for _, candidate := range candidates[1:] {
+		if candidate.createdAt.After(newest.createdAt) {
+			newest = candidate
+		}
+	}
+	return newest
 }
 
 func containsPrecomputedArtifacts(manifest ocispec.Manifest) bool {
