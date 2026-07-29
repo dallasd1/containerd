@@ -18,6 +18,7 @@ package transfer
 
 import (
 	"fmt"
+	"slices"
 
 	"github.com/containerd/errdefs"
 	"github.com/containerd/log"
@@ -112,7 +113,10 @@ func init() {
 					snCapabilities = p.Meta.Capabilities
 				}
 
-				var applier diff.Applier
+				var (
+					applier   diff.Applier
+					applierID string
+				)
 				target := platforms.Only(p)
 				if uc.Differ != "" {
 					inst, err := ic.GetByID(plugins.DiffPlugin, uc.Differ)
@@ -120,8 +124,8 @@ func init() {
 						return nil, fmt.Errorf("failed to get instance for diff plugin %q: %w", uc.Differ, err)
 					}
 					applier = inst.(diff.Applier)
+					applierID = uc.Differ
 				} else {
-					var applierID string
 					for name, plugin := range ic.GetAll() {
 						if plugin.Registration.Type != plugins.DiffPlugin {
 							continue
@@ -161,6 +165,14 @@ func init() {
 					return nil, fmt.Errorf("no matching diff plugins: %w", errdefs.ErrNotFound)
 				}
 
+				// Referrer discovery is driven by the differ that will consume
+				// the artifacts rather than by separate configuration.
+				if dp := ic.Plugins().Get(plugins.DiffPlugin, applierID); dp != nil &&
+					slices.Contains(dp.Meta.Capabilities, plugins.CapabilityDmverityReferrers) {
+					lc.EnableDmverityReferrers = true
+					log.G(ic.Context).Debugf("enabling dm-verity referrer discovery for differ %q", applierID)
+				}
+
 				// If CheckPlatformSupported is false, we will match all platforms
 				if !config.CheckPlatformSupported {
 					target = platforms.All
@@ -180,7 +192,6 @@ func init() {
 			}
 			lc.RegistryConfigPath = config.RegistryConfigPath
 			lc.DuplicationSuppressor = kmutex.New()
-			lc.EnableDmverityReferrers = config.EnableDmverityReferrers
 
 			return local.NewTransferService(ms.ContentStore(), metadata.NewImageStore(ms), lc), nil
 		},
@@ -206,10 +217,6 @@ type transferConfig struct {
 
 	// UnpackConfiguration is used to read config from toml
 	UnpackConfiguration []unpackConfiguration `toml:"unpack_config,omitempty"`
-
-	// EnableDmverityReferrers enables discovery of dm-verity signature and
-	// precomputed EROFS referrers during pull and import.
-	EnableDmverityReferrers bool `toml:"enable_dmverity_referrers"`
 
 	// RegistryConfigPath is a path to the root directory containing registry-specific configurations
 	RegistryConfigPath string `toml:"config_path"`
