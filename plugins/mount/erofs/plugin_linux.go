@@ -31,6 +31,7 @@ import (
 	"github.com/containerd/platforms"
 	"github.com/containerd/plugin"
 	"github.com/containerd/plugin/registry"
+	"github.com/opencontainers/selinux/go-selinux"
 
 	"github.com/containerd/containerd/v2/core/mount"
 	"github.com/containerd/containerd/v2/internal/dmverity"
@@ -62,6 +63,69 @@ func NewErofsMountHandler() mount.Handler {
 // already serializes device-mapper creation internally, so there is little
 // parallelism to win by sharding this per device name.
 var dmverityOpenMu sync.Mutex
+
+// selinuxContextOpt is the superblock-wide SELinux mount option. Unlike
+// defcontext=/rootcontext=, it labels the whole superblock, so every mount of a
+// given device must agree on its value.
+const selinuxContextOpt = "context="
+
+// sharedLayerContext is the one SELinux label every EROFS layer mount asks for.
+//
+// EROFS layers are shared by design: one image layer backs every container
+// started from that image. Each consumer is a separate mount-manager
+// activation, so the same block device is mounted once per consumer and the
+// kernel hands out a single superblock for it. "context=" is a property of that
+// superblock, so the first mount fixes it and any later mount that disagrees is
+// rejected outright:
+//
+//	SELinux: mount invalid. Same superblock, different security settings
+//	         for (dev dm-31, type erofs)
+//
+// Two containerd paths reach this handler with different settings, and they
+// cannot be reconciled by rewriting what the caller passed:
+//
+//   - container creation activates the layer with no context= at all;
+//   - task creation goes through client.getRootFS, which appends the consuming
+//     container's mount label, carrying a per-container MCS category pair.
+//
+// Normalising the label is therefore not sufficient -- an unlabelled mount and a
+// labelled one still disagree no matter how the label is rewritten. The two
+// paths have to be made to agree on a single value, so the value is synthesised
+// here instead of being derived from whatever the caller happened to supply.
+//
+// Isolation is unaffected. This label applies to the read-only shared layer
+// only; the per-container overlay stacked above it still carries the full MCS
+// pair, and that overlay, not the layer, is what the container sees. It is also
+// what overlayfs already does -- its lowerdirs sit on disk as
+// container_ro_file_t:s0 with no categories.
+const sharedLayerContext = "system_u:object_r:container_file_t:s0"
+
+// sharedLayerMountOptions returns opts with the mount-manager bookkeeping
+// options removed and the per-consumer SELinux label replaced by the single
+// shared-layer label, so that every mount of a given layer requests byte
+// identical superblock settings.
+//
+// context= is dropped rather than rewritten because callers disagree on whether
+// to supply one at all; it is then re-added unconditionally so that labelled and
+// unlabelled callers converge on the same request. It is only re-added when
+// SELinux is enabled, since mount(2) rejects the option outright otherwise.
+func sharedLayerMountOptions(opts []string, selinuxEnabled bool) []string {
+	filtered := make([]string, 0, len(opts)+1)
+	for _, v := range opts {
+		// Skip loop option (handled by loop device setup) and dmverity mode option (already processed)
+		if v == "loop" || strings.HasPrefix(v, "X-containerd.dmverity=") {
+			continue
+		}
+		if strings.HasPrefix(v, selinuxContextOpt) {
+			continue
+		}
+		filtered = append(filtered, v)
+	}
+	if selinuxEnabled {
+		filtered = append(filtered, selinuxContextOpt+`"`+sharedLayerContext+`"`)
+	}
+	return filtered
+}
 
 // openOrReuseDmverityDevice returns the /dev/mapper path for a layer, creating
 // the device if it does not already exist and validating it if it does.
@@ -182,15 +246,7 @@ func (h *erofsMountHandler) Mount(ctx context.Context, m mount.Mount, mp string,
 	}
 	// else: no metadata file, proceed with regular EROFS mount
 
-	filteredOptions := make([]string, 0, len(m.Options))
-	for _, v := range m.Options {
-		// Skip loop option (handled by loop device setup) and dmverity mode option (already processed)
-		if v == "loop" || strings.HasPrefix(v, "X-containerd.dmverity=") {
-			continue
-		}
-		filteredOptions = append(filteredOptions, v)
-	}
-	m.Options = filteredOptions
+	m.Options = sharedLayerMountOptions(m.Options, selinux.GetEnabled())
 
 	if err := os.MkdirAll(mp, 0700); err != nil {
 		if dmverityDevice != "" {
