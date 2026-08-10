@@ -43,11 +43,19 @@ import (
 
 var forceloop bool
 
-type erofsMountHandler struct{}
+type erofsMountHandler struct {
+	// sharedLayerContext is the SELinux label every EROFS layer mount asks
+	// for. Configurable because the value is policy-specific and upstream
+	// containerd cannot assume a distro's type names.
+	sharedLayerContext string
+}
 
 // NewErofsMountHandler creates a new EROFS mount handler that supports dm-verity
-func NewErofsMountHandler() mount.Handler {
-	return &erofsMountHandler{}
+func NewErofsMountHandler(sharedLayerContext string) mount.Handler {
+	if sharedLayerContext == "" {
+		sharedLayerContext = defaultSharedLayerContext
+	}
+	return &erofsMountHandler{sharedLayerContext: sharedLayerContext}
 }
 
 // dmverityOpenMu serializes the "does this device already exist?" check and the
@@ -96,9 +104,15 @@ const selinuxContextOpt = "context="
 // Isolation is unaffected. This label applies to the read-only shared layer
 // only; the per-container overlay stacked above it still carries the full MCS
 // pair, and that overlay, not the layer, is what the container sees. It is also
-// what overlayfs already does -- its lowerdirs sit on disk as
-// container_ro_file_t:s0 with no categories.
-const sharedLayerContext = "system_u:object_r:container_file_t:s0"
+// what overlayfs already does -- its lowerdirs sit on disk with a single shared
+// type and no categories.
+//
+// The type below is container_file_t rather than the read-only
+// container_ro_file_t: EROFS layers are also consumed through paths that expect
+// the standard container file type, and this is the value the deployment is
+// validated against. Override shared_layer_context to use a stricter type where
+// the local policy grants container domains read access to it.
+const defaultSharedLayerContext = "system_u:object_r:container_file_t:s0"
 
 // sharedLayerMountOptions returns opts with the mount-manager bookkeeping
 // options removed and the per-consumer SELinux label replaced by the single
@@ -109,7 +123,7 @@ const sharedLayerContext = "system_u:object_r:container_file_t:s0"
 // to supply one at all; it is then re-added unconditionally so that labelled and
 // unlabelled callers converge on the same request. It is only re-added when
 // SELinux is enabled, since mount(2) rejects the option outright otherwise.
-func sharedLayerMountOptions(opts []string, selinuxEnabled bool) []string {
+func sharedLayerMountOptions(opts []string, selinuxEnabled bool, sharedLayerContext string) []string {
 	filtered := make([]string, 0, len(opts)+1)
 	for _, v := range opts {
 		// Skip loop option (handled by loop device setup) and dmverity mode option (already processed)
@@ -227,8 +241,11 @@ func (h *erofsMountHandler) Mount(ctx context.Context, m mount.Mount, mp string,
 		log.G(ctx).WithField("source", m.Source).Debug("detected dm-verity metadata, setting up dm-verity device")
 
 		supported, err := dmverity.IsSupported()
-		if err != nil || !supported {
-			return mount.ActiveMount{}, fmt.Errorf("layer requires dm-verity but system doesn't support it (dm_verity module not loaded): %w", err)
+		if err != nil {
+			return mount.ActiveMount{}, fmt.Errorf("layer %q requires dm-verity but support could not be determined: %w", m.Source, err)
+		}
+		if !supported {
+			return mount.ActiveMount{}, fmt.Errorf("layer %q requires dm-verity but the system does not provide it", m.Source)
 		}
 
 		// Extract snapshot ID from source path
@@ -246,7 +263,7 @@ func (h *erofsMountHandler) Mount(ctx context.Context, m mount.Mount, mp string,
 	}
 	// else: no metadata file, proceed with regular EROFS mount
 
-	m.Options = sharedLayerMountOptions(m.Options, selinux.GetEnabled())
+	m.Options = sharedLayerMountOptions(m.Options, selinux.GetEnabled(), h.sharedLayerContext)
 
 	if err := os.MkdirAll(mp, 0700); err != nil {
 		if dmverityDevice != "" {
@@ -355,7 +372,11 @@ func (h *erofsMountHandler) Unmount(ctx context.Context, path string) error {
 	return err
 }
 
-type Config struct{}
+type Config struct {
+	// SharedLayerContext overrides the SELinux label applied to shared EROFS
+	// layer mounts. Empty uses defaultSharedLayerContext.
+	SharedLayerContext string `toml:"shared_layer_context"`
+}
 
 func init() {
 	registry.Register(&plugin.Registration{
@@ -367,7 +388,8 @@ func init() {
 			p.OS = runtime.GOOS
 			ic.Meta.Platforms = append(ic.Meta.Platforms, p)
 
-			return NewErofsMountHandler(), nil
+			cfg := ic.Config.(*Config)
+			return NewErofsMountHandler(cfg.SharedLayerContext), nil
 		},
 	})
 }

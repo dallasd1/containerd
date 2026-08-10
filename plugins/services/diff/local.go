@@ -19,6 +19,7 @@ package diff
 import (
 	"context"
 	"fmt"
+	"slices"
 
 	diffapi "github.com/containerd/containerd/api/services/diff/v1"
 	"github.com/containerd/errdefs"
@@ -71,6 +72,7 @@ func init() {
 			syncFs := ic.Config.(*config).SyncFs
 			orderedNames := ic.Config.(*config).Order
 			ordered := make([]differ, len(orderedNames))
+			var dmverityCapable []string
 			for i, n := range orderedNames {
 				d, ok := differs[n]
 				if !ok {
@@ -81,11 +83,18 @@ func init() {
 				if !ok {
 					return nil, fmt.Errorf("differ does not implement Comparer and Applier interface: %s", n)
 				}
+
+				if p := ic.Plugins().Get(plugins.DiffPlugin, n); p != nil &&
+					slices.Contains(p.Meta.Capabilities, plugins.CapabilityDmverityReferrers) {
+					dmverityCapable = append(dmverityCapable, n)
+				}
 			}
 
 			return &local{
-				differs: ordered,
-				syncfs:  syncFs,
+				differs:         ordered,
+				orderedNames:    orderedNames,
+				dmverityCapable: dmverityCapable,
+				syncfs:          syncFs,
 			}, nil
 		},
 	})
@@ -93,10 +102,28 @@ func init() {
 
 type local struct {
 	differs []differ
-	syncfs  bool
+	// orderedNames mirrors differs and is retained so callers can report
+	// which appliers this service will actually select.
+	orderedNames []string
+	// dmverityCapable lists the ordered differs that advertise
+	// plugins.CapabilityDmverityReferrers.
+	dmverityCapable []string
+	syncfs          bool
 }
 
 var _ diffapi.DiffClient = &local{}
+
+// DmverityAppliers reports the ordered applier chain this service will select
+// from, and the subset of it able to consume dm-verity referrer artifacts.
+//
+// Discovery of dm-verity artifacts is derived from loaded diff plugins, but
+// layers are applied by the differ this service selects. When the two disagree,
+// artifacts are fetched and then dropped, producing layers with no dm-verity
+// device while configuration still reads as though verification is enabled.
+// Callers use this to bind enforcement to the selected applier instead.
+func (l *local) DmverityAppliers() (ordered []string, capable []string) {
+	return l.orderedNames, l.dmverityCapable
+}
 
 func (l *local) Apply(ctx context.Context, er *diffapi.ApplyRequest, _ ...grpc.CallOption) (*diffapi.ApplyResponse, error) {
 	var (

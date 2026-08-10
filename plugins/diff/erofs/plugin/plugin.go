@@ -100,7 +100,7 @@ func init() {
 					return nil, fmt.Errorf("dm-verity support check failed: %w", err)
 				}
 				if !supported {
-					return nil, fmt.Errorf("dm-verity is not supported on this system (dm_verity module not loaded): %w", plugin.ErrSkipPlugin)
+					return nil, fmt.Errorf("dm-verity is not supported on this system (no dm_verity module loaded and no built-in verity target): %w", plugin.ErrSkipPlugin)
 				}
 				opts = append(opts, erofs.WithDmverity())
 

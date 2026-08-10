@@ -22,7 +22,7 @@ import (
 )
 
 func TestSharedLayerMountOptions(t *testing.T) {
-	const shared = `context="` + sharedLayerContext + `"`
+	const shared = `context="` + defaultSharedLayerContext + `"`
 
 	for _, tc := range []struct {
 		name           string
@@ -85,7 +85,7 @@ func TestSharedLayerMountOptions(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			got := sharedLayerMountOptions(tc.opts, tc.selinuxEnabled)
+			got := sharedLayerMountOptions(tc.opts, tc.selinuxEnabled, defaultSharedLayerContext)
 			if !slices.Equal(got, tc.expected) {
 				t.Errorf("sharedLayerMountOptions(%q, %v) = %q, want %q",
 					tc.opts, tc.selinuxEnabled, got, tc.expected)
@@ -100,10 +100,10 @@ func TestSharedLayerMountOptions(t *testing.T) {
 // different security settings" and only one pod per image can start.
 func TestSharedLayerMountOptionsConverge(t *testing.T) {
 	taskPath := sharedLayerMountOptions(
-		[]string{"ro", "loop", `context="system_u:object_r:container_file_t:s0:c646,c927"`}, true)
-	containerPath := sharedLayerMountOptions([]string{"ro", "loop"}, true)
+		[]string{"ro", "loop", `context="system_u:object_r:container_file_t:s0:c646,c927"`}, true, defaultSharedLayerContext)
+	containerPath := sharedLayerMountOptions([]string{"ro", "loop"}, true, defaultSharedLayerContext)
 	otherPod := sharedLayerMountOptions(
-		[]string{"ro", "loop", `context="system_u:object_r:container_file_t:s0:c154,c335"`}, true)
+		[]string{"ro", "loop", `context="system_u:object_r:container_file_t:s0:c154,c335"`}, true, defaultSharedLayerContext)
 
 	if !slices.Equal(taskPath, containerPath) {
 		t.Errorf("task path %q and container path %q disagree", taskPath, containerPath)

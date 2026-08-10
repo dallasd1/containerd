@@ -31,16 +31,37 @@ import (
 	"github.com/google/uuid"
 )
 
+// IsSupported reports whether the kernel can back a dm-verity device.
+//
+// A false return with a nil error means the answer is determinate: dm-verity
+// is genuinely unavailable, and callers may skip cleanly. A non-nil error
+// means the answer is indeterminate — the check itself could not be
+// completed — and callers should treat that as a hard failure rather than
+// assume absence.
 func IsSupported() (bool, error) {
-	moduleData, err := os.ReadFile("/proc/modules")
-	if err != nil {
+	// dm-verity may be a loadable module or built into the kernel. Checking
+	// only /proc/modules reports unsupported on a CONFIG_DM_VERITY=y kernel and
+	// silently disables verification, so consult the built-in target list too.
+	if moduleData, err := os.ReadFile("/proc/modules"); err == nil {
+		if bytes.Contains(moduleData, []byte("dm_verity")) {
+			return true, nil
+		}
+	} else if !os.IsNotExist(err) {
 		return false, fmt.Errorf("failed to read /proc/modules: %w", err)
 	}
-	if !bytes.Contains(moduleData, []byte("dm_verity")) {
-		return false, fmt.Errorf("dm_verity module not loaded")
+
+	// /sys/module/dm_verity is present for a built-in target as well as a
+	// loaded module, so it covers CONFIG_DM_VERITY=y kernels that never
+	// appear in /proc/modules.
+	if _, err := os.Stat("/sys/module/dm_verity"); err == nil {
+		return true, nil
+	} else if !os.IsNotExist(err) {
+		return false, fmt.Errorf("failed to stat /sys/module/dm_verity: %w", err)
 	}
 
-	return true, nil
+	// Both probes succeeded and neither found dm-verity, so this is a
+	// determinate "not available" rather than a failed check.
+	return false, nil
 }
 
 func convertToVerityParams(opts *DmverityOptions) (verity.Params, error) {

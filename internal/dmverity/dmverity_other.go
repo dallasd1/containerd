@@ -25,8 +25,11 @@ import (
 
 var errUnsupported = fmt.Errorf("dmverity is only supported on Linux systems")
 
+// IsSupported reports whether the kernel can back a dm-verity device. On
+// non-Linux platforms the answer is determinate, so this returns a nil error
+// and lets callers skip cleanly rather than treating it as a failed check.
 func IsSupported() (bool, error) {
-	return false, errUnsupported
+	return false, nil
 }
 
 func Format(_ string, _ string, _ *DmverityOptions) (string, error) {

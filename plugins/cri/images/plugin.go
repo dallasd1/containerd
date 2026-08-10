@@ -22,6 +22,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"slices"
+	"strings"
 
 	containerd "github.com/containerd/containerd/v2/client"
 	"github.com/containerd/containerd/v2/core/metadata"
@@ -31,6 +32,7 @@ import (
 	"github.com/containerd/containerd/v2/internal/cri/constants"
 	"github.com/containerd/containerd/v2/internal/cri/server/images"
 	"github.com/containerd/containerd/v2/plugins"
+	"github.com/containerd/containerd/v2/plugins/services"
 	"github.com/containerd/containerd/v2/plugins/services/warning"
 	"github.com/containerd/containerd/v2/version"
 	"github.com/containerd/log"
@@ -64,9 +66,9 @@ func init() {
 			mdb := m.(*metadata.DB)
 
 			// Referrer discovery is driven by the differ that will consume the
-			// artifacts rather than by separate configuration. The local image
-			// pull path selects a differ dynamically, so any loaded differ that
-			// consumes dm-verity artifacts enables discovery.
+			// artifacts rather than by separate configuration. This pass only
+			// establishes that a capable differ is loaded; it is narrowed below
+			// once the pull path, and therefore the applier, is known.
 			for _, p := range ic.Plugins().GetAll() {
 				if p.Registration.Type == plugins.DiffPlugin &&
 					slices.Contains(p.Meta.Capabilities, plugins.CapabilityDmverityReferrers) {
@@ -101,6 +103,42 @@ func init() {
 
 			if !config.UseLocalImagePull {
 				criconfig.CheckLocalImagePullConfigs(ic.Context, &config)
+			}
+
+			// A capable differ being loaded does not mean it is the one that
+			// applies layers. The transfer service takes its differ from
+			// unpack_config, but the local pull path takes it from the diff
+			// service, whose default order is walking-only. Falling back to
+			// local pull therefore silently drops dm-verity verification while
+			// discovery stays on, so bind enforcement to the selected applier.
+			if config.EnableDmverityReferrers && config.UseLocalImagePull {
+				ds, err := ic.GetByID(plugins.ServicePlugin, services.DiffService)
+				if err != nil {
+					return nil, fmt.Errorf("dm-verity referrer discovery is enabled but the diff service is unavailable: %w", err)
+				}
+				reporter, ok := ds.(interface {
+					DmverityAppliers() (ordered []string, capable []string)
+				})
+				if !ok {
+					return nil, fmt.Errorf("dm-verity referrer discovery is enabled but the diff service cannot report applier capabilities")
+				}
+				ordered, capable := reporter.DmverityAppliers()
+				if len(capable) == 0 {
+					return nil, fmt.Errorf(
+						"dm-verity referrer discovery is enabled but CRI fell back to local image pull, "+
+							"whose applier chain [%s] cannot consume dm-verity artifacts: layers would be applied "+
+							"without a dm-verity device. Either keep CRI on the transfer service (remove the "+
+							"configuration that forced local pull, e.g. disable_snapshot_annotations, registry.mirrors, "+
+							"registry.configs, max_concurrent_downloads) or add a dm-verity capable differ to "+
+							"[plugins.\"io.containerd.service.v1.diff-service\"] default",
+						strings.Join(ordered, ", "))
+				}
+				if ordered[0] != capable[0] {
+					log.G(ic.Context).Warnf(
+						"dm-verity capable differ %q is not first in the diff service order [%s]; "+
+							"layers may be applied by an earlier differ without dm-verity verification",
+						capable[0], strings.Join(ordered, ", "))
+				}
 			}
 
 			ts, err := ic.GetSingle(plugins.TransferPlugin)
