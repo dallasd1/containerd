@@ -17,8 +17,14 @@
 package erofs
 
 import (
+	"context"
+	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
+	"time"
+
+	"github.com/containerd/containerd/v2/internal/dmverity"
 )
 
 func TestSharedLayerMountOptions(t *testing.T) {
@@ -110,5 +116,44 @@ func TestSharedLayerMountOptionsConverge(t *testing.T) {
 	}
 	if !slices.Equal(taskPath, otherPod) {
 		t.Errorf("two pods disagree: %q vs %q", taskPath, otherPod)
+	}
+}
+
+// TestOpenOrReuseDmverityDeviceDoesNotSelfLock guards the reentrancy hazard
+// introduced when dmverityLifecycleMu was widened from "guard the create" to
+// "guard the whole mount lifecycle".
+//
+// The lock is now taken by Mount, above the call to openOrReuseDmverityDevice,
+// and is held until Mount returns. Go mutexes are not reentrant, so if anyone
+// reinstates the Lock/Unlock pair that used to live inside the helper, every
+// dm-verity mount deadlocks permanently -- and it deadlocks in the field, on the
+// first layer that carries verity metadata, not in any test that does not hold
+// the lock first.
+//
+// This reproduces the caller's contract: acquire the lock, then call the helper.
+// The call is expected to fail (there is no such device and no privilege to
+// create one); all that matters is that it returns at all.
+func TestOpenOrReuseDmverityDeviceDoesNotSelfLock(t *testing.T) {
+	dmverityLifecycleMu.Lock()
+	defer dmverityLifecycleMu.Unlock()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		// Name is deliberately one that cannot exist, so the reuse branch is
+		// skipped and the create path is reached without touching real devices.
+		_, _ = openOrReuseDmverityDevice(
+			context.Background(),
+			filepath.Join(t.TempDir(), "layer.erofs"),
+			"containerd-erofs-selflock-probe-does-not-exist",
+			&dmverity.DmverityMetadata{RootHash: strings.Repeat("00", 32)},
+		)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(30 * time.Second):
+		t.Fatal("openOrReuseDmverityDevice blocked while the caller held dmverityLifecycleMu: " +
+			"it must not lock the mutex itself, the caller already holds it")
 	}
 }

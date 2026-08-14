@@ -58,8 +58,9 @@ func NewErofsMountHandler(sharedLayerContext string) mount.Handler {
 	return &erofsMountHandler{sharedLayerContext: sharedLayerContext}
 }
 
-// dmverityOpenMu serializes the "does this device already exist?" check and the
-// creation that follows it.
+// dmverityLifecycleMu serializes the whole lifetime of a shared dm-verity
+// mapper: inspect-or-create and the mount that follows it, against unmount and
+// the removal that follows that.
 //
 // Device-mapper names are derived from the snapshot ID, so two concurrent mounts
 // of the same layer -- routine when several pods start from one image -- can both
@@ -67,10 +68,39 @@ func NewErofsMountHandler(sharedLayerContext string) mount.Handler {
 // DM_DEV_CREATE fails because the name is taken, and its cleanup then removes the
 // winner's device out from under a live mount.
 //
-// One lock is enough. The guarded section is a handful of ioctls, and the kernel
-// already serializes device-mapper creation internally, so there is little
-// parallelism to win by sharding this per device name.
-var dmverityOpenMu sync.Mutex
+// Covering only create was not enough, and shipped a bug. The kernel refuses
+// DM_DEV_REMOVE with EBUSY while any filesystem holds the mapper open, so a
+// mapper with live mounts is safe -- but verification does not open it. Between
+// the moment the last mount goes away and the moment a new mount(2) lands, the
+// open count is zero and removal succeeds. A starting container that has already
+// passed its existence check then finds the device gone mid-verify and fails with
+// what reads as an integrity error:
+//
+//	container A: mount.Unmount(path)                 -- open count drops to 0
+//	container B: os.Stat(/dev/mapper/...)            -- present
+//	container B: DeviceStatus                        -- ActivePresent
+//	container A: RemoveDevice                        -- succeeds, nothing has it open
+//	container B: TableStatus                         -- ENXIO
+//	container B: "refusing to reuse existing dm-verity device ... verification failed"
+//
+// Widening the guarded section to include the mount(2) closes that gap: B's mount
+// either happens before A's removal is allowed to run, in which case the open
+// count is non-zero and the kernel returns EBUSY, or after A has fully removed the
+// device, in which case B sees it absent and creates it. There is no longer a
+// window where the device is visible, unopened, and about to be removed.
+//
+// The kernel's open count is the authoritative reference count for a shared
+// mapper, which is why there is no userspace count here: a userspace count would
+// start at zero after a containerd restart while mounts and mappers are still
+// live. EBUSY from Close is the expected outcome for a device someone else is
+// using, not an error.
+//
+// One global lock is enough for now. The guarded section is a handful of ioctls
+// plus one mount(2), it is taken only by layers that actually carry dm-verity,
+// and same-device operations are the ones that must serialize anyway. If mount
+// convoying ever shows up in a burst benchmark, shard it per device name -- the
+// invariant is per-mapper, not global.
+var dmverityLifecycleMu sync.Mutex
 
 // selinuxContextOpt is the superblock-wide SELinux mount option. Unlike
 // defcontext=/rootcontext=, it labels the whole superblock, so every mount of a
@@ -143,10 +173,11 @@ func sharedLayerMountOptions(opts []string, selinuxEnabled bool, sharedLayerCont
 
 // openOrReuseDmverityDevice returns the /dev/mapper path for a layer, creating
 // the device if it does not already exist and validating it if it does.
+//
+// The caller must hold dmverityLifecycleMu, and must keep holding it until the
+// returned device has been mounted or rolled back. Returning while the device is
+// merely created is exactly the zero-open window described on the mutex.
 func openOrReuseDmverityDevice(ctx context.Context, source, deviceName string, metadata *dmverity.DmverityMetadata) (string, error) {
-	dmverityOpenMu.Lock()
-	defer dmverityOpenMu.Unlock()
-
 	devicePath := dmverity.DevicePath(deviceName)
 	if _, err := os.Stat(devicePath); !os.IsNotExist(err) {
 		// Device-mapper names are host-global while snapshot IDs are only
@@ -239,6 +270,12 @@ func (h *erofsMountHandler) Mount(ctx context.Context, m mount.Mount, mp string,
 
 	if metadata != nil {
 		log.G(ctx).WithField("source", m.Source).Debug("detected dm-verity metadata, setting up dm-verity device")
+
+		// Held until Mount returns, so it covers the mount(2) below and every
+		// rollback Close on the way out. Deferred inside this block on purpose:
+		// a layer with no dm-verity metadata never contends for it.
+		dmverityLifecycleMu.Lock()
+		defer dmverityLifecycleMu.Unlock()
 
 		supported, err := dmverity.IsSupported()
 		if err != nil {
@@ -357,11 +394,25 @@ func (h *erofsMountHandler) Unmount(ctx context.Context, path string) error {
 	err = mount.Unmount(path, 0)
 
 	if deviceName != "" {
+		// Only the removal needs the lock, not the unmount above. The window
+		// that caused the bug was a removal landing between another mounter's
+		// verify and its mount(2); holding the lock here and across that whole
+		// section on the mount side closes it. Once this lock is acquired the
+		// competing mounter has either not started (it will then find the
+		// device absent and create it) or has already completed its mount(2)
+		// (the open count is non-zero and the kernel returns EBUSY). Leaving
+		// mount.Unmount outside avoids serialising unmounts for no gain.
+		dmverityLifecycleMu.Lock()
+		defer dmverityLifecycleMu.Unlock()
+
 		log.G(ctx).WithFields(log.Fields{
 			"mount-point": path,
 			"device":      deviceName,
 		}).Debug("attempting to close dm-verity device")
 
+		// EBUSY here is the normal outcome when another container still has the
+		// layer mounted: the kernel's open count is the reference count, and it
+		// is refusing to remove a device in use. Debug, not error.
 		if closeErr := dmverity.Close(deviceName); closeErr != nil {
 			log.G(ctx).WithError(closeErr).WithField("device", deviceName).Debug("unable to close dm-verity device")
 		} else {
