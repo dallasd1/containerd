@@ -472,7 +472,7 @@ func testDmverityEndToEndWithMode(t *testing.T, useTarIndex bool) {
 
 	mountTargetDir := filepath.Join(tempDir, "mount-manager")
 	mgr, err := mountmanager.NewManager(db, mountTargetDir,
-		mountmanager.WithMountHandler("erofs", erofsmount.NewErofsMountHandler()))
+		mountmanager.WithMountHandler("erofs", erofsmount.NewErofsMountHandler("")))
 	require.NoError(t, err)
 
 	contentStore, err := local.NewStore(filepath.Join(tempDir, "content"))
