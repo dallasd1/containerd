@@ -286,8 +286,8 @@ type ImageConfig struct {
 	Snapshotter string `toml:"snapshotter" json:"snapshotter"`
 
 	// EnableDmverityReferrers enables discovery of dm-verity signature and
-	// precomputed EROFS referrers when local image pull is used. It is derived
-	// from the capabilities advertised by the loaded diff plugins rather than
+	// precomputed EROFS referrers. It is derived from the capabilities
+	// advertised by the loaded diff and active snapshotter plugins rather than
 	// being set directly.
 	EnableDmverityReferrers bool `toml:"-" json:"enableDmverityReferrers"`
 

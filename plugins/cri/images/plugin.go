@@ -65,15 +65,14 @@ func init() {
 			}
 			mdb := m.(*metadata.DB)
 
-			// Referrer discovery is driven by the differ that will consume the
-			// artifacts rather than by separate configuration. This pass only
-			// establishes that a capable differ is loaded; it is narrowed below
-			// once the pull path, and therefore the applier, is known.
+			// Referrer discovery is derived from both sides of the signed EROFS
+			// path: a differ that consumes the artifacts and an active snapshotter
+			// that mounts the result.
+			dmverityDifferAvailable := false
 			for _, p := range ic.Plugins().GetAll() {
 				if p.Registration.Type == plugins.DiffPlugin &&
 					slices.Contains(p.Meta.Capabilities, plugins.CapabilityDmverityReferrers) {
-					config.EnableDmverityReferrers = true
-					log.G(ic.Context).Debugf("enabling dm-verity referrer discovery for differ %q", p.Registration.ID)
+					dmverityDifferAvailable = true
 					break
 				}
 			}
@@ -105,13 +104,42 @@ func init() {
 				criconfig.CheckLocalImagePullConfigs(ic.Context, &config)
 			}
 
-			// A capable differ being loaded does not mean it is the one that
-			// applies layers. The transfer service takes its differ from
-			// unpack_config, but the local pull path takes it from the diff
-			// service, whose default order is walking-only. Falling back to
-			// local pull therefore silently drops dm-verity verification while
-			// discovery stays on, so bind enforcement to the selected applier.
-			if config.EnableDmverityReferrers && config.UseLocalImagePull {
+			snapshotters := map[string]struct{}{config.Snapshotter: {}}
+			for _, platform := range config.RuntimePlatforms {
+				name := platform.Snapshotter
+				if name == "" {
+					name = config.Snapshotter
+				}
+				snapshotters[name] = struct{}{}
+			}
+			var dmveritySnapshotter string
+			for name := range snapshotters {
+				if p := ic.Plugins().Get(plugins.SnapshotPlugin, name); p != nil &&
+					slices.Contains(p.Meta.Capabilities, plugins.CapabilityDmverityReferrers) {
+					dmveritySnapshotter = name
+					break
+				}
+			}
+			if dmveritySnapshotter != "" && !dmverityDifferAvailable {
+				return nil, fmt.Errorf(
+					"snapshotter %q enables dm-verity referrers but no capable differ is available",
+					dmveritySnapshotter,
+				)
+			}
+			if dmveritySnapshotter != "" {
+				config.EnableDmverityReferrers = true
+				log.G(ic.Context).Debugf(
+					"enabling dm-verity referrer discovery for snapshotter %q",
+					dmveritySnapshotter,
+				)
+			}
+
+			// Local pulls and first-use unpack after a fetch-only transfer both
+			// apply layers through the diff service. Require its first applier
+			// to consume dm-verity artifacts; a merely loaded capable differ is
+			// insufficient because an earlier walking differ can consume the
+			// layer without verification.
+			if config.EnableDmverityReferrers {
 				ds, err := ic.GetByID(plugins.ServicePlugin, services.DiffService)
 				if err != nil {
 					return nil, fmt.Errorf("dm-verity referrer discovery is enabled but the diff service is unavailable: %w", err)
@@ -125,18 +153,16 @@ func init() {
 				ordered, capable := reporter.DmverityAppliers()
 				if len(capable) == 0 {
 					return nil, fmt.Errorf(
-						"dm-verity referrer discovery is enabled but CRI fell back to local image pull, "+
-							"whose applier chain [%s] cannot consume dm-verity artifacts: layers would be applied "+
-							"without a dm-verity device. Either keep CRI on the transfer service (remove the "+
-							"configuration that forced local pull, e.g. disable_snapshot_annotations, registry.mirrors, "+
-							"registry.configs, max_concurrent_downloads) or add a dm-verity capable differ to "+
+						"dm-verity referrer discovery is enabled but the diff service applier chain [%s] "+
+							"cannot consume dm-verity artifacts during local or deferred unpack; add a "+
+							"dm-verity capable differ to "+
 							"[plugins.\"io.containerd.service.v1.diff-service\"] default",
 						strings.Join(ordered, ", "))
 				}
 				if ordered[0] != capable[0] {
-					log.G(ic.Context).Warnf(
-						"dm-verity capable differ %q is not first in the diff service order [%s]; "+
-							"layers may be applied by an earlier differ without dm-verity verification",
+					return nil, fmt.Errorf(
+						"dm-verity capable differ %q must be first in the diff service order [%s] "+
+							"so local and deferred unpack cannot bypass dm-verity verification",
 						capable[0], strings.Join(ordered, ", "))
 				}
 			}
@@ -147,11 +173,12 @@ func init() {
 			}
 
 			options := &images.CRIImageServiceOptions{
-				Content:          mdb.ContentStore(),
-				RuntimePlatforms: map[string]images.ImagePlatform{},
-				Snapshotters:     map[string]snapshots.Snapshotter{},
-				ImageFSPaths:     map[string]string{},
-				Transferrer:      ts.(transfer.Transferrer),
+				Content:                 mdb.ContentStore(),
+				RuntimePlatforms:        map[string]images.ImagePlatform{},
+				Snapshotters:            map[string]snapshots.Snapshotter{},
+				SnapshotterCapabilities: map[string][]string{},
+				ImageFSPaths:            map[string]string{},
+				Transferrer:             ts.(transfer.Transferrer),
 			}
 
 			ctrdCli, err := containerd.New(
@@ -172,6 +199,9 @@ func init() {
 				options.Snapshotters[defaultSnapshotter] = s
 			} else {
 				return nil, fmt.Errorf("failed to find snapshotter %q", defaultSnapshotter)
+			}
+			if p := ic.Plugins().Get(plugins.SnapshotPlugin, defaultSnapshotter); p != nil {
+				options.SnapshotterCapabilities[defaultSnapshotter] = p.Meta.Capabilities
 			}
 
 			snapshotRoot := func(snapshotter string) (snapshotRoot string) {
@@ -197,6 +227,11 @@ func init() {
 				if _, ok := options.ImageFSPaths[snapshotter]; !ok {
 					options.ImageFSPaths[snapshotter] = snapshotRoot(snapshotter)
 					log.L.Infof("Get image filesystem path %q for snapshotter %q", options.ImageFSPaths[snapshotter], snapshotter)
+				}
+				if _, ok := options.SnapshotterCapabilities[snapshotter]; !ok {
+					if p := ic.Plugins().Get(plugins.SnapshotPlugin, snapshotter); p != nil {
+						options.SnapshotterCapabilities[snapshotter] = p.Meta.Capabilities
+					}
 				}
 
 				platform := platforms.DefaultSpec()

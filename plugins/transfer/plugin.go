@@ -165,12 +165,17 @@ func init() {
 					return nil, fmt.Errorf("no matching diff plugins: %w", errdefs.ErrNotFound)
 				}
 
-				// Referrer discovery is driven by the differ that will consume
-				// the artifacts rather than by separate configuration.
+				// Referrer discovery requires both the differ that consumes the
+				// artifacts and a snapshotter that mounts the signed result.
 				if dp := ic.Plugins().Get(plugins.DiffPlugin, applierID); dp != nil &&
-					slices.Contains(dp.Meta.Capabilities, plugins.CapabilityDmverityReferrers) {
+					slices.Contains(dp.Meta.Capabilities, plugins.CapabilityDmverityReferrers) &&
+					slices.Contains(snCapabilities, plugins.CapabilityDmverityReferrers) {
 					lc.EnableDmverityReferrers = true
-					log.G(ic.Context).Debugf("enabling dm-verity referrer discovery for differ %q", applierID)
+					log.G(ic.Context).Debugf(
+						"enabling dm-verity referrer discovery for differ %q and snapshotter %q",
+						applierID,
+						uc.Snapshotter,
+					)
 				}
 
 				// If CheckPlatformSupported is false, we will match all platforms

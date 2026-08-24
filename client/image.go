@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"sync"
 
 	"github.com/containerd/containerd/v2/core/content"
@@ -32,6 +33,7 @@ import (
 	"github.com/containerd/containerd/v2/pkg/labels"
 	"github.com/containerd/containerd/v2/pkg/rootfs"
 	"github.com/containerd/containerd/v2/pkg/snapshotters"
+	"github.com/containerd/containerd/v2/plugins"
 	"github.com/containerd/errdefs"
 	"github.com/containerd/platforms"
 	"github.com/opencontainers/go-digest"
@@ -313,9 +315,42 @@ func (i *image) Unpack(ctx context.Context, snapshotterName string, opts ...Unpa
 		}
 	}
 
-	manifest, err := i.getManifest(ctx, i.platform)
+	snapshotterName, err = i.client.resolveSnapshotterName(ctx, snapshotterName)
 	if err != nil {
 		return err
+	}
+	sn, err := i.client.getSnapshotter(ctx, snapshotterName)
+	if err != nil {
+		return err
+	}
+	capabilities, err := i.client.GetSnapshotterCapabilities(ctx, snapshotterName)
+	if err != nil {
+		return err
+	}
+
+	manifestDesc, manifest, err := images.ManifestWithDescriptor(ctx, i.ContentStore(), i.i.Target, i.platform)
+	if err != nil {
+		return err
+	}
+	if slices.Contains(capabilities, plugins.CapabilityDmverityReferrers) {
+		annotations, err := snapshotters.CachedSignatureAnnotations(ctx, i.ContentStore(), manifestDesc)
+		if err != nil {
+			return err
+		}
+		for idx := range manifest.Layers {
+			cached, ok := annotations[manifest.Layers[idx].Digest]
+			if !ok {
+				continue
+			}
+			merged := make(map[string]string, len(manifest.Layers[idx].Annotations)+len(cached))
+			for key, value := range manifest.Layers[idx].Annotations {
+				merged[key] = value
+			}
+			for key, value := range cached {
+				merged[key] = value
+			}
+			manifest.Layers[idx].Annotations = merged
+		}
 	}
 
 	layers, err := i.getLayers(ctx, manifest)
@@ -330,14 +365,6 @@ func (i *image) Unpack(ctx context.Context, snapshotterName string, opts ...Unpa
 		chain    []digest.Digest
 		unpacked bool
 	)
-	snapshotterName, err = i.client.resolveSnapshotterName(ctx, snapshotterName)
-	if err != nil {
-		return err
-	}
-	sn, err := i.client.getSnapshotter(ctx, snapshotterName)
-	if err != nil {
-		return err
-	}
 	if config.CheckPlatformSupported {
 		if err := i.checkSnapshotterSupport(ctx, snapshotterName, manifest); err != nil {
 			return err
@@ -348,7 +375,7 @@ func (i *image) Unpack(ctx context.Context, snapshotterName string, opts ...Unpa
 		snOpts := append(config.SnapshotOpts, snapshots.WithLabels(map[string]string{
 			snapshotters.TargetLayerDigestLabel:    layer.Blob.Digest.String(),
 			snapshotters.TargetManifestDigestLabel: i.Target().Digest.String(),
-			snapshotters.TargetRefLabel: 		  	i.Name(),
+			snapshotters.TargetRefLabel:            i.Name(),
 		}))
 		unpacked, err = rootfs.ApplyLayerWithOpts(ctx, layer, chain, sn, a, snOpts, config.ApplyOpts)
 		if err != nil {

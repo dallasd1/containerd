@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"slices"
+	"strings"
 
 	diffapi "github.com/containerd/containerd/api/services/diff/v1"
 	"github.com/containerd/errdefs"
@@ -32,7 +33,9 @@ import (
 
 	"github.com/containerd/containerd/v2/core/diff"
 	"github.com/containerd/containerd/v2/core/mount"
+	"github.com/containerd/containerd/v2/internal/erofsutils"
 	"github.com/containerd/containerd/v2/pkg/oci"
+	"github.com/containerd/containerd/v2/pkg/snapshotters"
 	"github.com/containerd/containerd/v2/plugins"
 	"github.com/containerd/containerd/v2/plugins/services"
 )
@@ -146,6 +149,9 @@ func (l *local) Apply(ctx context.Context, er *diffapi.ApplyRequest, _ ...grpc.C
 	}
 	opts = append(opts, diff.WithSyncFs(er.SyncFs))
 
+	if err := l.validateDmverityApply(desc, mounts); err != nil {
+		return nil, errgrpc.ToGRPC(err)
+	}
 	for _, differ := range l.differs {
 		ocidesc, err = differ.Apply(ctx, desc, mounts, opts...)
 		if !errdefs.IsNotImplemented(err) {
@@ -161,6 +167,33 @@ func (l *local) Apply(ctx context.Context, er *diffapi.ApplyRequest, _ ...grpc.C
 		Applied: oci.DescriptorToProto(ocidesc),
 	}, nil
 
+}
+
+func (l *local) validateDmverityApply(desc ocispec.Descriptor, mounts []mount.Mount) error {
+	if desc.Annotations[snapshotters.TargetLayerSignatureLabel] == "" &&
+		desc.Annotations[snapshotters.TargetLayerRootHashLabel] == "" &&
+		desc.Annotations[snapshotters.TargetLayerEROFSDescriptorLabel] == "" &&
+		desc.Annotations[snapshotters.TargetLayerMerkleTreeDescriptorLabel] == "" {
+		return nil
+	}
+	if len(mounts) == 0 {
+		return nil
+	}
+	if _, err := erofsutils.MountsToLayer(mounts); err != nil {
+		if errdefs.IsNotImplemented(err) {
+			return nil
+		}
+		return err
+	}
+	if len(l.orderedNames) == 0 || len(l.dmverityCapable) == 0 ||
+		l.orderedNames[0] != l.dmverityCapable[0] {
+		return fmt.Errorf(
+			"dm-verity layer annotations require a capable first differ; ordered [%s], capable [%s]",
+			strings.Join(l.orderedNames, ", "),
+			strings.Join(l.dmverityCapable, ", "),
+		)
+	}
+	return nil
 }
 
 func (l *local) Diff(ctx context.Context, dr *diffapi.DiffRequest, _ ...grpc.CallOption) (*diffapi.DiffResponse, error) {

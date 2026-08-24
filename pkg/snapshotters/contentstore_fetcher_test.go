@@ -22,6 +22,7 @@ import (
 	"encoding/json"
 	"io"
 	"sort"
+	"sync"
 	"testing"
 
 	"github.com/containerd/containerd/v2/core/content"
@@ -32,6 +33,46 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+type memoryLabelStore struct {
+	mu     sync.Mutex
+	labels map[digest.Digest]map[string]string
+}
+
+func newMemoryLabelStore() *memoryLabelStore {
+	return &memoryLabelStore{labels: map[digest.Digest]map[string]string{}}
+}
+
+func (s *memoryLabelStore) Get(dgst digest.Digest) (map[string]string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.labels[dgst], nil
+}
+
+func (s *memoryLabelStore) Set(dgst digest.Digest, labels map[string]string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.labels[dgst] = labels
+	return nil
+}
+
+func (s *memoryLabelStore) Update(dgst digest.Digest, update map[string]string) (map[string]string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	labels := s.labels[dgst]
+	if labels == nil {
+		labels = map[string]string{}
+	}
+	for key, value := range update {
+		if value == "" {
+			delete(labels, key)
+		} else {
+			labels[key] = value
+		}
+	}
+	s.labels[dgst] = labels
+	return labels, nil
+}
 
 // writeBlob writes data into cs and returns its descriptor.
 func writeBlob(t *testing.T, ctx context.Context, cs content.Store, mediaType string, data []byte) ocispec.Descriptor {
@@ -140,6 +181,50 @@ func TestContentStoreFetcherFetchReferrers(t *testing.T) {
 		assert.Equal(t, SignatureArtifactType, got[0].ArtifactType)
 		assert.Equal(t, ocispec.MediaTypeImageManifest, got[0].MediaType)
 	}
+}
+
+func TestContentStoreFetcherSeparatesCachedLookupFromImportDiscovery(t *testing.T) {
+	ctx := context.Background()
+	cs, err := local.NewLabeledStore(t.TempDir(), newMemoryLabelStore())
+	require.NoError(t, err)
+
+	config := writeBlob(t, ctx, cs, ocispec.MediaTypeImageConfig, []byte("{}"))
+	subject := writeManifest(t, ctx, cs, ocispec.Manifest{
+		MediaType: ocispec.MediaTypeImageManifest,
+		Config:    config,
+	})
+	selected := writeManifest(t, ctx, cs, ocispec.Manifest{
+		MediaType:    ocispec.MediaTypeImageManifest,
+		ArtifactType: SignatureArtifactType,
+		Subject:      &subject,
+		Config:       config,
+		Annotations:  map[string]string{ociAnnotationCreated: "2026-07-20T01:00:00Z"},
+	})
+	newer := writeManifest(t, ctx, cs, ocispec.Manifest{
+		MediaType:    ocispec.MediaTypeImageManifest,
+		ArtifactType: SignatureArtifactType,
+		Subject:      &subject,
+		Config:       config,
+		Annotations:  map[string]string{ociAnnotationCreated: "2026-07-20T02:00:00Z"},
+	})
+	_, err = cs.Update(ctx, content.Info{
+		Digest: subject.Digest,
+		Labels: map[string]string{DmverityReferrerLabel: selected.Digest.String()},
+	}, "labels."+DmverityReferrerLabel)
+	require.NoError(t, err)
+
+	cached, err := newCachedContentStoreFetcher(cs).FetchReferrers(ctx, subject.Digest,
+		remotes.WithReferrerArtifactTypes(SignatureArtifactType))
+	require.NoError(t, err)
+	require.Len(t, cached, 1)
+	assert.Equal(t, selected.Digest, cached[0].Digest)
+
+	discovered, err := NewContentStoreFetcher(cs).FetchReferrers(ctx, subject.Digest,
+		remotes.WithReferrerArtifactTypes(SignatureArtifactType))
+	require.NoError(t, err)
+	require.Len(t, discovered, 2)
+	assert.ElementsMatch(t, []digest.Digest{selected.Digest, newer.Digest},
+		[]digest.Digest{discovered[0].Digest, discovered[1].Digest})
 }
 
 // TestContentStoreFetcherFetchReferrersEmpty verifies a store with no

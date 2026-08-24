@@ -65,6 +65,9 @@ type CRIImageService struct {
 	imageFSPaths map[string]string
 	// runtimePlatforms are the platforms configured for a runtime.
 	runtimePlatforms map[string]ImagePlatform
+	// snapshotterCapabilities are the capabilities advertised by each configured
+	// snapshotter plugin.
+	snapshotterCapabilities map[string][]string
 	// imageStore stores all resources associated with images.
 	imageStore *imagestore.Store
 	// snapshotStore stores information of all snapshots.
@@ -95,6 +98,8 @@ type CRIImageServiceOptions struct {
 
 	Snapshotters map[string]snapshots.Snapshotter
 
+	SnapshotterCapabilities map[string][]string
+
 	Client imageClient
 
 	Transferrer transfer.Transferrer
@@ -122,6 +127,7 @@ func NewService(config criconfig.ImageConfig, options *CRIImageServiceOptions) (
 		imageStore:                  imagestore.NewStore(options.Images, options.Content, platforms.Default()),
 		imageFSPaths:                options.ImageFSPaths,
 		runtimePlatforms:            options.RuntimePlatforms,
+		snapshotterCapabilities:     options.SnapshotterCapabilities,
 		snapshotStore:               snapshotstore.NewStore(),
 		transferrer:                 options.Transferrer,
 		unpackDuplicationSuppressor: kmutex.New(),

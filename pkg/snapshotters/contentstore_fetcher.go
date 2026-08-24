@@ -25,6 +25,7 @@ import (
 	"github.com/containerd/containerd/v2/core/content"
 	"github.com/containerd/containerd/v2/core/images"
 	"github.com/containerd/containerd/v2/core/remotes"
+	"github.com/containerd/errdefs"
 	"github.com/containerd/log"
 	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
@@ -42,24 +43,24 @@ const maxManifestSize = 4 * 1024 * 1024 // 4 MiB
 // against a registry-backed fetcher (e.g. AppendSignatureHandlerWrapper)
 // can be used during local OCI-layout imports.
 //
-// FetchReferrers walks the content store, parses each candidate blob as an
-// OCI manifest, and returns the descriptors whose `subject.digest` matches
-// the request. When FetchReferrersConfig.ArtifactTypes is non-empty the
-// results are filtered to manifests whose artifactType is in the set.
-//
-// This is intentionally an O(n) scan over the content store: it is meant to
-// run once per imported image during a transfer.Import, when n is small
-// (the freshly-imported OCI layout's manifests + layers + config blobs).
-// If a use case appears that needs sub-linear lookup, switch to a labeled
-// index (e.g. write a "containerd.io/manifest.subject" label at ingest
-// time and look up by label filter); the interface stays the same.
+// FetchReferrers walks the content store, parses candidate OCI manifests, and
+// matches their `subject.digest`. A cached-only fetcher instead resolves the
+// selected dm-verity referrer directly from DmverityReferrerLabel.
 type ContentStoreFetcher struct {
-	store content.Store
+	store      content.Store
+	cachedOnly bool
 }
 
 // NewContentStoreFetcher constructs a ContentStoreFetcher backed by store.
 func NewContentStoreFetcher(store content.Store) *ContentStoreFetcher {
 	return &ContentStoreFetcher{store: store}
+}
+
+func newCachedContentStoreFetcher(store content.Store) *ContentStoreFetcher {
+	return &ContentStoreFetcher{
+		store:      store,
+		cachedOnly: true,
+	}
 }
 
 // Fetch implements remotes.Fetcher by reading the blob identified by desc
@@ -89,6 +90,15 @@ func (f *ContentStoreFetcher) FetchReferrers(ctx context.Context, dgst digest.Di
 	allowed := make(map[string]struct{}, len(cfg.ArtifactTypes))
 	for _, t := range cfg.ArtifactTypes {
 		allowed[t] = struct{}{}
+	}
+	if f.cachedOnly && len(allowed) == 1 {
+		if _, ok := allowed[SignatureArtifactType]; ok {
+			if referrers, found, err := f.labeledDmverityReferrer(ctx, dgst); err != nil {
+				return nil, err
+			} else if found {
+				return referrers, nil
+			}
+		}
 	}
 
 	var result []ocispec.Descriptor
@@ -147,6 +157,59 @@ func (f *ContentStoreFetcher) FetchReferrers(ctx context.Context, dgst digest.Di
 		return nil, fmt.Errorf("walk content store for referrers of %s: %w", dgst, walkErr)
 	}
 	return result, nil
+}
+
+func (f *ContentStoreFetcher) labeledDmverityReferrer(ctx context.Context, subject digest.Digest) ([]ocispec.Descriptor, bool, error) {
+	subjectInfo, err := f.store.Info(ctx, subject)
+	if err != nil {
+		if errdefs.IsNotFound(err) {
+			return nil, false, nil
+		}
+		return nil, false, fmt.Errorf("inspect subject manifest %s: %w", subject, err)
+	}
+	value := subjectInfo.Labels[DmverityReferrerLabel]
+	if value == "" {
+		return nil, false, nil
+	}
+
+	referrerDigest, err := digest.Parse(value)
+	if err != nil {
+		return nil, true, fmt.Errorf("invalid dm-verity referrer label on %s: %w", subject, err)
+	}
+	info, err := f.store.Info(ctx, referrerDigest)
+	if err != nil {
+		return nil, true, fmt.Errorf("inspect labeled dm-verity referrer %s: %w", referrerDigest, err)
+	}
+	if info.Size <= 0 || info.Size > maxManifestSize {
+		return nil, true, fmt.Errorf("labeled dm-verity referrer %s size %d out of range", referrerDigest, info.Size)
+	}
+
+	desc := ocispec.Descriptor{
+		Digest: referrerDigest,
+		Size:   info.Size,
+	}
+	data, err := content.ReadBlob(ctx, f.store, desc)
+	if err != nil {
+		return nil, true, fmt.Errorf("read labeled dm-verity referrer %s: %w", referrerDigest, err)
+	}
+	var probe struct {
+		MediaType    string              `json:"mediaType"`
+		ArtifactType string              `json:"artifactType"`
+		Subject      *ocispec.Descriptor `json:"subject"`
+	}
+	if err := json.Unmarshal(data, &probe); err != nil {
+		return nil, true, fmt.Errorf("parse labeled dm-verity referrer %s: %w", referrerDigest, err)
+	}
+	if !images.IsManifestType(probe.MediaType) || probe.ArtifactType != SignatureArtifactType {
+		return nil, true, fmt.Errorf("labeled content %s is not a dm-verity referrer manifest", referrerDigest)
+	}
+	if probe.Subject == nil || probe.Subject.Digest != subject {
+		return nil, true, fmt.Errorf("labeled dm-verity referrer %s does not target subject %s", referrerDigest, subject)
+	}
+
+	desc.MediaType = probe.MediaType
+	desc.ArtifactType = probe.ArtifactType
+	return []ocispec.Descriptor{desc}, true, nil
 }
 
 type readerAtCloser struct {

@@ -26,6 +26,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/containerd/containerd/v2/core/content"
 	"github.com/containerd/containerd/v2/core/images"
 	"github.com/containerd/containerd/v2/core/remotes"
 	"github.com/containerd/errdefs"
@@ -53,6 +54,11 @@ const (
 	TargetLayerEROFSDescriptorLabel = "containerd.io/dmverity/erofs-descriptor"
 	// TargetLayerMerkleTreeDescriptorLabel contains the JSON descriptor for a precomputed Merkle-tree blob.
 	TargetLayerMerkleTreeDescriptorLabel = "containerd.io/dmverity/merkle-tree-descriptor"
+
+	// DmverityReferrerLabel roots the selected dm-verity referrer from its
+	// subject manifest and marks that manifest for deferred local discovery.
+	// The content GC recognizes the containerd.io/gc.ref.content prefix.
+	DmverityReferrerLabel = "containerd.io/gc.ref.content.dmverity"
 
 	sigLayerDigestAnnotation    = "io.cncf.notary.dmverity.layer-digest"
 	sigLayerRootHashAnnotation  = "io.cncf.notary.dmverity.layer-roothash"
@@ -101,38 +107,38 @@ func ParseTargetDescriptor(value string) (ocispec.Descriptor, error) {
 	return desc, nil
 }
 
-func fetchSignatures(ctx context.Context, fetcher remotes.Fetcher, manifestDigest digest.Digest) (map[string]*LayerSignatureInfo, []ocispec.Descriptor, error) {
+func fetchSignatures(ctx context.Context, fetcher remotes.Fetcher, manifestDigest digest.Digest) (map[string]*LayerSignatureInfo, []ocispec.Descriptor, *referrerWithManifest, error) {
 	signatures := make(map[string]*LayerSignatureInfo)
 	refFetcher, ok := fetcher.(remotes.ReferrersFetcher)
 	if !ok {
 		log.G(ctx).Debug("Fetcher does not support referrers API, skipping signature fetch")
-		return signatures, nil, nil
+		return signatures, nil, nil, nil
 	}
 
 	referrers, err := refFetcher.FetchReferrers(ctx, manifestDigest,
 		remotes.WithReferrerArtifactTypes(SignatureArtifactType))
 	if err != nil {
 		if errdefs.IsNotFound(err) {
-			return signatures, nil, nil
+			return signatures, nil, nil, nil
 		}
-		return nil, nil, fmt.Errorf("fetch dm-verity referrers for %s: %w", manifestDigest, err)
+		return nil, nil, nil, fmt.Errorf("fetch dm-verity referrers for %s: %w", manifestDigest, err)
 	}
 	if len(referrers) == 0 {
-		return signatures, nil, nil
+		return signatures, nil, nil, nil
 	}
 
 	parsed := make([]referrerWithManifest, 0, len(referrers))
 	for _, refDesc := range referrers {
 		manifestData, err := fetchDescriptor(ctx, fetcher, refDesc)
 		if err != nil {
-			return nil, nil, fmt.Errorf("fetch dm-verity manifest %s: %w", refDesc.Digest, err)
+			return nil, nil, nil, fmt.Errorf("fetch dm-verity manifest %s: %w", refDesc.Digest, err)
 		}
 		var manifest ocispec.Manifest
 		if err := json.Unmarshal(manifestData, &manifest); err != nil {
-			return nil, nil, fmt.Errorf("parse dm-verity manifest %s: %w", refDesc.Digest, err)
+			return nil, nil, nil, fmt.Errorf("parse dm-verity manifest %s: %w", refDesc.Digest, err)
 		}
 		if manifest.Subject == nil || manifest.Subject.Digest != manifestDigest {
-			return nil, nil, fmt.Errorf("dm-verity manifest %s subject does not match image manifest %s", refDesc.Digest, manifestDigest)
+			return nil, nil, nil, fmt.Errorf("dm-verity manifest %s subject does not match image manifest %s", refDesc.Digest, manifestDigest)
 		}
 		var createdAt time.Time
 		if created := manifest.Annotations[ociAnnotationCreated]; created != "" {
@@ -158,18 +164,18 @@ func fetchSignatures(ctx context.Context, fetcher remotes.Fetcher, manifestDiges
 		candidate := newestReferrer(precomputed)
 		infos, artifactDescs, err := parsePrecomputedBundle(ctx, fetcher, candidate.manifest)
 		if err != nil {
-			return nil, nil, fmt.Errorf("parse precomputed dm-verity bundle %s: %w", candidate.desc.Digest, err)
+			return nil, nil, nil, fmt.Errorf("parse precomputed dm-verity bundle %s: %w", candidate.desc.Digest, err)
 		}
 		log.G(ctx).WithFields(log.Fields{
 			"bundle":   candidate.desc.Digest,
 			"manifest": manifestDigest,
 			"layers":   len(infos),
 		}).Info("Using precomputed EROFS dm-verity bundle")
-		return infos, artifactDescs, nil
+		return infos, artifactDescs, &candidate, nil
 	}
 
 	if len(legacy) == 0 {
-		return signatures, nil, nil
+		return signatures, nil, nil, nil
 	}
 	newest := newestReferrer(legacy)
 	for _, layer := range newest.manifest.Layers {
@@ -183,7 +189,7 @@ func fetchSignatures(ctx context.Context, fetcher remotes.Fetcher, manifestDiges
 			signatures[layerDigest] = &LayerSignatureInfo{RootHash: rootHash, Signature: sig}
 		}
 	}
-	return signatures, nil, nil
+	return signatures, nil, &newest, nil
 }
 
 func newestReferrer(candidates []referrerWithManifest) referrerWithManifest {
@@ -316,7 +322,15 @@ func fetchDescriptor(ctx context.Context, fetcher remotes.Fetcher, desc ocispec.
 // precomputed EROFS artifacts when processing an image manifest.
 func AppendSignatureHandlerWrapper(fetcher remotes.Fetcher) func(f images.Handler) images.Handler {
 	return func(f images.Handler) images.Handler {
-		return signatureHandler(f, fetcher)
+		return signatureHandler(f, fetcher, nil, false)
+	}
+}
+
+// AppendRetainedSignatureHandlerWrapper additionally persists and GC-roots the
+// selected referrer graph for a later deferred unpack.
+func AppendRetainedSignatureHandlerWrapper(fetcher remotes.Fetcher, store content.Store) func(f images.Handler) images.Handler {
+	return func(f images.Handler) images.Handler {
+		return signatureHandler(f, fetcher, store, false)
 	}
 }
 
@@ -335,12 +349,40 @@ func AppendSignatureHandlerWrapperFromResolver(resolver remotes.Resolver, ref st
 			if fetcherErr != nil {
 				return nil, fmt.Errorf("create fetcher for dm-verity artifact lookup: %w", fetcherErr)
 			}
-			return signatureHandler(f, fetcher).Handle(ctx, desc)
+			return signatureHandler(f, fetcher, nil, false).Handle(ctx, desc)
 		})
 	}
 }
 
-func signatureHandler(f images.Handler, fetcher remotes.Fetcher) images.Handler {
+// AppendCachedSignatureHandlerWrapper restores dm-verity layer annotations
+// from a referrer graph retained by an earlier fetch-only pull. Manifests
+// without DmverityReferrerLabel are left untouched.
+func AppendCachedSignatureHandlerWrapper(store content.Store) func(f images.Handler) images.Handler {
+	return func(f images.Handler) images.Handler {
+		return signatureHandler(f, newCachedContentStoreFetcher(store), store, true)
+	}
+}
+
+// CachedSignatureAnnotations resolves the retained dm-verity bundle for an
+// already-selected image manifest and returns the annotations needed to apply
+// each signed layer. It performs no remote access and leaves unmarked images
+// unchanged.
+func CachedSignatureAnnotations(ctx context.Context, store content.Store, manifest ocispec.Descriptor) (map[digest.Digest]map[string]string, error) {
+	children := AppendCachedSignatureHandlerWrapper(store)(images.ChildrenHandler(store))
+	resolved, err := children.Handle(ctx, manifest)
+	if err != nil {
+		return nil, fmt.Errorf("resolve cached dm-verity annotations: %w", err)
+	}
+	annotations := map[digest.Digest]map[string]string{}
+	for _, child := range resolved {
+		if child.Annotations[TargetLayerSignatureLabel] != "" {
+			annotations[child.Digest] = child.Annotations
+		}
+	}
+	return annotations, nil
+}
+
+func signatureHandler(f images.Handler, fetcher remotes.Fetcher, store content.Store, cachedOnly bool) images.Handler {
 	return images.HandlerFunc(func(ctx context.Context, desc ocispec.Descriptor) ([]ocispec.Descriptor, error) {
 		children, err := f.Handle(ctx, desc)
 		if err != nil {
@@ -350,16 +392,36 @@ func signatureHandler(f images.Handler, fetcher remotes.Fetcher) images.Handler 
 			return children, nil
 		}
 
-		signatures, artifacts, err := fetchSignatures(ctx, fetcher, desc.Digest)
+		if cachedOnly {
+			info, err := store.Info(ctx, desc.Digest)
+			if err != nil {
+				return nil, fmt.Errorf("inspect cached image manifest %s: %w", desc.Digest, err)
+			}
+			if info.Labels[DmverityReferrerLabel] == "" {
+				return children, nil
+			}
+		}
+
+		signatures, artifacts, referrer, err := fetchSignatures(ctx, fetcher, desc.Digest)
 		if err != nil {
 			return nil, err
 		}
 		if len(signatures) == 0 {
 			return children, nil
 		}
-		for _, artifact := range artifacts {
-			if _, err := f.Handle(ctx, artifact); err != nil {
-				return nil, fmt.Errorf("fetch precomputed artifact %s: %w", artifact.Digest, err)
+
+		if !cachedOnly && store != nil {
+			if referrer == nil {
+				return nil, fmt.Errorf("dm-verity signatures for %s have no source referrer", desc.Digest)
+			}
+			if err := persistSignatureReferrer(ctx, f, store, desc, *referrer); err != nil {
+				return nil, err
+			}
+		} else if store == nil {
+			for _, artifact := range artifacts {
+				if _, err := f.Handle(ctx, artifact); err != nil {
+					return nil, fmt.Errorf("fetch precomputed artifact %s: %w", artifact.Digest, err)
+				}
 			}
 		}
 
@@ -404,4 +466,60 @@ func signatureHandler(f images.Handler, fetcher remotes.Fetcher) images.Handler 
 		}
 		return children, nil
 	})
+}
+
+func persistSignatureReferrer(ctx context.Context, handler images.Handler, store content.Store, subject ocispec.Descriptor, referrer referrerWithManifest) error {
+	if _, err := handler.Handle(ctx, referrer.desc); err != nil {
+		return fmt.Errorf("fetch dm-verity referrer manifest %s: %w", referrer.desc.Digest, err)
+	}
+	if err := verifyRetainedContent(ctx, store, referrer.desc); err != nil {
+		return err
+	}
+	children := append([]ocispec.Descriptor(nil), referrer.manifest.Layers...)
+	if referrer.manifest.Config.Digest != "" {
+		children = append([]ocispec.Descriptor{referrer.manifest.Config}, children...)
+	}
+	for _, child := range children {
+		if _, err := handler.Handle(ctx, child); err != nil {
+			return fmt.Errorf("fetch dm-verity referrer content %s: %w", child.Digest, err)
+		}
+		if err := verifyRetainedContent(ctx, store, child); err != nil {
+			return err
+		}
+	}
+	labelChildren := images.SetChildrenLabels(store, images.HandlerFunc(
+		func(context.Context, ocispec.Descriptor) ([]ocispec.Descriptor, error) {
+			return children, nil
+		},
+	))
+	if _, err := labelChildren.Handle(ctx, referrer.desc); err != nil {
+		return fmt.Errorf("retain dm-verity referrer children for %s: %w", referrer.desc.Digest, err)
+	}
+
+	_, err := store.Update(ctx, content.Info{
+		Digest: subject.Digest,
+		Labels: map[string]string{
+			DmverityReferrerLabel: referrer.desc.Digest.String(),
+		},
+	}, "labels."+DmverityReferrerLabel)
+	if err != nil {
+		return fmt.Errorf("retain dm-verity referrer %s for image manifest %s: %w", referrer.desc.Digest, subject.Digest, err)
+	}
+	return nil
+}
+
+func verifyRetainedContent(ctx context.Context, store content.Store, desc ocispec.Descriptor) error {
+	info, err := store.Info(ctx, desc.Digest)
+	if err != nil {
+		return fmt.Errorf("verify retained dm-verity content %s: %w", desc.Digest, err)
+	}
+	if info.Size != desc.Size {
+		return fmt.Errorf(
+			"verify retained dm-verity content %s: descriptor size %d does not match stored size %d",
+			desc.Digest,
+			desc.Size,
+			info.Size,
+		)
+	}
+	return nil
 }

@@ -19,6 +19,7 @@ package local
 import (
 	"context"
 	"fmt"
+	"slices"
 
 	"github.com/containerd/errdefs"
 	"github.com/containerd/log"
@@ -34,6 +35,7 @@ import (
 	"github.com/containerd/containerd/v2/core/unpack"
 	"github.com/containerd/containerd/v2/defaults"
 	snpkg "github.com/containerd/containerd/v2/pkg/snapshotters"
+	"github.com/containerd/containerd/v2/plugins"
 )
 
 func (ts *localTransferService) pull(ctx context.Context, ir transfer.ImageFetcher, is transfer.ImageStorer, tops *transfer.Config) error {
@@ -194,12 +196,16 @@ func (ts *localTransferService) pull(ctx context.Context, ir transfer.ImageFetch
 		if len(unpacks) > 0 {
 			uopts := []unpack.UnpackerOpt{}
 			enableRemoteSnapshotAnnotations := false
+			enableDmverityReferrers := false
 			// Only unpack if requested unpackconfig matches default/supported unpackconfigs
 			for _, u := range unpacks {
 				matched, mu := getSupportedPlatform(ctx, u, ts.config.UnpackPlatforms)
 				if matched {
 					if v, ok := mu.SnapshotterExports["enable_remote_snapshot_annotations"]; ok && v == "true" {
 						enableRemoteSnapshotAnnotations = true
+					}
+					if slices.Contains(mu.SnapshotterCapabilities, plugins.CapabilityDmverityReferrers) {
+						enableDmverityReferrers = true
 					}
 					if progressTracker != nil {
 						mu.ApplyOpts = append(mu.ApplyOpts, diff.WithProgress(progressTracker.ExtractProgress))
@@ -224,7 +230,7 @@ func (ts *localTransferService) pull(ctx context.Context, ir transfer.ImageFetch
 			if enableRemoteSnapshotAnnotations {
 				handler = snpkg.AppendInfoHandlerWrapper(name)(handler)
 			}
-			if ts.config.EnableDmverityReferrers {
+			if ts.config.EnableDmverityReferrers && enableDmverityReferrers {
 				handler = snpkg.AppendSignatureHandlerWrapper(fetcher)(handler)
 			}
 
@@ -234,6 +240,9 @@ func (ts *localTransferService) pull(ctx context.Context, ir transfer.ImageFetch
 			}
 			handler = unpacker.Unpack(handler)
 		}
+	}
+	if ts.config.EnableDmverityReferrers && unpacker == nil {
+		handler = snpkg.AppendRetainedSignatureHandlerWrapper(fetcher, ts.content)(handler)
 	}
 
 	if err := images.Dispatch(ctx, handler, nil, desc); err != nil {

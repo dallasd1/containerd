@@ -23,11 +23,15 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/containerd/containerd/v2/core/content"
 	"github.com/containerd/containerd/v2/core/images"
 	"github.com/containerd/containerd/v2/core/remotes"
+	"github.com/containerd/containerd/v2/plugins/content/local"
+	"github.com/containerd/platforms"
 	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/stretchr/testify/assert"
@@ -115,7 +119,7 @@ func TestSignatureHandlerPrecomputedBundle(t *testing.T) {
 			return nil, nil
 		}
 	})
-	children, err := signatureHandler(base, fetcher).Handle(context.Background(), sourceManifest)
+	children, err := signatureHandler(base, fetcher, nil, false).Handle(context.Background(), sourceManifest)
 	require.NoError(t, err)
 	require.Len(t, children, 3)
 	layer := children[1]
@@ -130,6 +134,197 @@ func TestSignatureHandlerPrecomputedBundle(t *testing.T) {
 	assert.Equal(t, treeDesc.Digest, gotTree.Digest)
 	assert.Equal(t, layer.Annotations, children[2].Annotations)
 	assert.ElementsMatch(t, []digest.Digest{erofsDesc.Digest, treeDesc.Digest}, fetched)
+}
+
+func TestSignatureHandlerPersistsBundleForDeferredUnpack(t *testing.T) {
+	ctx := context.Background()
+	configBytes := []byte(`{"architecture":"amd64","os":"linux","rootfs":{"type":"layers","diff_ids":[]}}`)
+	config := descriptorFor(configBytes, ocispec.MediaTypeImageConfig)
+	layerBytes := []byte("source layer")
+	sourceLayer := descriptorFor(layerBytes, ocispec.MediaTypeImageLayerGzip)
+	sourceManifestBytes, err := json.Marshal(ocispec.Manifest{
+		MediaType: ocispec.MediaTypeImageManifest,
+		Config:    config,
+		Layers:    []ocispec.Descriptor{sourceLayer},
+	})
+	require.NoError(t, err)
+	sourceManifest := descriptorFor(sourceManifestBytes, ocispec.MediaTypeImageManifest)
+	bundle := newPrecomputedBundle(t, sourceManifest, sourceLayer, "selected", "abcd", time.Now().UTC())
+
+	fetcher := &artifactFetcher{
+		blobs: mergeBlobMaps(bundle.blobs, map[digest.Digest][]byte{
+			sourceManifest.Digest: sourceManifestBytes,
+			config.Digest:         configBytes,
+			sourceLayer.Digest:    layerBytes,
+		}),
+		refs: map[digest.Digest][]ocispec.Descriptor{
+			sourceManifest.Digest: {bundle.descriptor},
+		},
+	}
+	cs, err := local.NewLabeledStore(t.TempDir(), newMemoryLabelStore())
+	require.NoError(t, err)
+	base := images.Handlers(
+		remotes.FetchHandler(cs, fetcher),
+		images.SetChildrenLabels(cs, images.ChildrenHandler(cs)),
+	)
+
+	children, err := signatureHandler(base, fetcher, cs, false).Handle(ctx, sourceManifest)
+	require.NoError(t, err)
+	require.Len(t, children, 2)
+	assert.Equal(t, "abcd", children[1].Annotations[TargetLayerRootHashLabel])
+
+	subjectInfo, err := cs.Info(ctx, sourceManifest.Digest)
+	require.NoError(t, err)
+	assert.Equal(t, bundle.descriptor.Digest.String(), subjectInfo.Labels[DmverityReferrerLabel])
+
+	referrerInfo, err := cs.Info(ctx, bundle.descriptor.Digest)
+	require.NoError(t, err)
+	var retained []string
+	for key, value := range referrerInfo.Labels {
+		if strings.HasPrefix(key, "containerd.io/gc.ref.content") {
+			retained = append(retained, value)
+		}
+	}
+	assert.Len(t, retained, 4)
+	for dgst := range bundle.blobs {
+		_, err := cs.Info(ctx, dgst)
+		require.NoError(t, err, "bundle content %s was not persisted", dgst)
+	}
+
+	deferred := AppendCachedSignatureHandlerWrapper(cs)(images.ChildrenHandler(cs))
+	deferredChildren, err := deferred.Handle(ctx, sourceManifest)
+	require.NoError(t, err)
+	require.Len(t, deferredChildren, 2)
+	assert.Equal(t, "abcd", deferredChildren[1].Annotations[TargetLayerRootHashLabel])
+	assert.NotEmpty(t, deferredChildren[1].Annotations[TargetLayerEROFSDescriptorLabel])
+
+	annotations, err := CachedSignatureAnnotations(ctx, cs, sourceManifest)
+	require.NoError(t, err)
+	require.Contains(t, annotations, sourceLayer.Digest)
+	assert.Equal(t, "abcd", annotations[sourceLayer.Digest][TargetLayerRootHashLabel])
+
+	require.NoError(t, content.WriteBlob(ctx, cs, "source config", bytes.NewReader(configBytes), config))
+	require.NoError(t, content.WriteBlob(ctx, cs, "source layer", bytes.NewReader(layerBytes), sourceLayer))
+	otherConfigBytes := []byte(`{"architecture":"arm64","os":"linux","rootfs":{"type":"layers","diff_ids":[]}}`)
+	otherConfig := descriptorFor(otherConfigBytes, ocispec.MediaTypeImageConfig)
+	otherLayerBytes := []byte("other source layer")
+	otherLayer := descriptorFor(otherLayerBytes, ocispec.MediaTypeImageLayerGzip)
+	otherManifestBytes, err := json.Marshal(ocispec.Manifest{
+		MediaType: ocispec.MediaTypeImageManifest,
+		Config:    otherConfig,
+		Layers:    []ocispec.Descriptor{otherLayer},
+	})
+	require.NoError(t, err)
+	otherManifest := descriptorFor(otherManifestBytes, ocispec.MediaTypeImageManifest)
+	require.NoError(t, content.WriteBlob(ctx, cs, "other config", bytes.NewReader(otherConfigBytes), otherConfig))
+	require.NoError(t, content.WriteBlob(ctx, cs, "other layer", bytes.NewReader(otherLayerBytes), otherLayer))
+	require.NoError(t, content.WriteBlob(ctx, cs, "other manifest", bytes.NewReader(otherManifestBytes), otherManifest))
+
+	sourceForIndex := sourceManifest
+	sourceForIndex.Platform = &ocispec.Platform{OS: "linux", Architecture: "amd64"}
+	indexBytes, err := json.Marshal(ocispec.Index{
+		MediaType: ocispec.MediaTypeImageIndex,
+		// A platform-less entry precedes the selected manifest. Deferred
+		// reconstruction must use the exact descriptor chosen for unpack.
+		Manifests: []ocispec.Descriptor{otherManifest, sourceForIndex},
+	})
+	require.NoError(t, err)
+	index := descriptorFor(indexBytes, ocispec.MediaTypeImageIndex)
+	require.NoError(t, content.WriteBlob(ctx, cs, "index", bytes.NewReader(indexBytes), index))
+	selected, _, err := images.ManifestWithDescriptor(ctx, cs, index, platforms.Only(ocispec.Platform{
+		OS:           "linux",
+		Architecture: "amd64",
+	}))
+	require.NoError(t, err)
+	assert.Equal(t, sourceManifest.Digest, selected.Digest)
+	indexAnnotations, err := CachedSignatureAnnotations(ctx, cs, selected)
+	require.NoError(t, err)
+	assert.Equal(t, "abcd", indexAnnotations[sourceLayer.Digest][TargetLayerRootHashLabel])
+
+	_, err = cs.Update(ctx, content.Info{
+		Digest: sourceManifest.Digest,
+		Labels: map[string]string{DmverityReferrerLabel: ""},
+	}, "labels."+DmverityReferrerLabel)
+	require.NoError(t, err)
+	unmarkedChildren, err := deferred.Handle(ctx, sourceManifest)
+	require.NoError(t, err)
+	require.Len(t, unmarkedChildren, 2)
+	assert.Empty(t, unmarkedChildren[1].Annotations[TargetLayerSignatureLabel])
+}
+
+func TestPersistSignatureReferrerAllowsOmittedConfig(t *testing.T) {
+	ctx := context.Background()
+	subjectBytes := []byte("subject manifest")
+	subject := descriptorFor(subjectBytes, ocispec.MediaTypeImageManifest)
+	layerBytes := []byte("artifact layer")
+	layer := descriptorFor(layerBytes, LayerSignatureMediaType)
+	manifest := ocispec.Manifest{
+		MediaType:    ocispec.MediaTypeImageManifest,
+		ArtifactType: SignatureArtifactType,
+		Subject:      &subject,
+		Layers:       []ocispec.Descriptor{layer},
+	}
+	manifestBytes, err := json.Marshal(manifest)
+	require.NoError(t, err)
+	referrer := descriptorFor(manifestBytes, ocispec.MediaTypeImageManifest)
+	referrer.ArtifactType = SignatureArtifactType
+
+	fetcher := &artifactFetcher{blobs: map[digest.Digest][]byte{
+		referrer.Digest: manifestBytes,
+		layer.Digest:    layerBytes,
+	}}
+	cs, err := local.NewLabeledStore(t.TempDir(), newMemoryLabelStore())
+	require.NoError(t, err)
+	require.NoError(t, content.WriteBlob(ctx, cs, "subject", bytes.NewReader(subjectBytes), subject))
+
+	err = persistSignatureReferrer(
+		ctx,
+		remotes.FetchHandler(cs, fetcher),
+		cs,
+		subject,
+		referrerWithManifest{desc: referrer, manifest: manifest},
+	)
+	require.NoError(t, err)
+	info, err := cs.Info(ctx, subject.Digest)
+	require.NoError(t, err)
+	assert.Equal(t, referrer.Digest.String(), info.Labels[DmverityReferrerLabel])
+}
+
+func TestPersistSignatureReferrerRejectsMissingArtifactContent(t *testing.T) {
+	ctx := context.Background()
+	subjectBytes := []byte("subject manifest")
+	subject := descriptorFor(subjectBytes, ocispec.MediaTypeImageManifest)
+	layer := descriptorFor([]byte("missing artifact layer"), EROFSArtifactMediaType)
+	manifest := ocispec.Manifest{
+		MediaType:    ocispec.MediaTypeImageManifest,
+		ArtifactType: SignatureArtifactType,
+		Subject:      &subject,
+		Layers:       []ocispec.Descriptor{layer},
+	}
+	manifestBytes, err := json.Marshal(manifest)
+	require.NoError(t, err)
+	referrer := descriptorFor(manifestBytes, ocispec.MediaTypeImageManifest)
+	referrer.ArtifactType = SignatureArtifactType
+
+	cs, err := local.NewLabeledStore(t.TempDir(), newMemoryLabelStore())
+	require.NoError(t, err)
+	require.NoError(t, content.WriteBlob(ctx, cs, "subject", bytes.NewReader(subjectBytes), subject))
+	require.NoError(t, content.WriteBlob(ctx, cs, "referrer", bytes.NewReader(manifestBytes), referrer))
+
+	err = persistSignatureReferrer(
+		ctx,
+		images.HandlerFunc(func(context.Context, ocispec.Descriptor) ([]ocispec.Descriptor, error) {
+			return nil, nil
+		}),
+		cs,
+		subject,
+		referrerWithManifest{desc: referrer, manifest: manifest},
+	)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "verify retained dm-verity content")
+	info, err := cs.Info(ctx, subject.Digest)
+	require.NoError(t, err)
+	assert.Empty(t, info.Labels[DmverityReferrerLabel])
 }
 
 func TestSignatureHandlerRejectsInvalidPrecomputedBundle(t *testing.T) {
@@ -158,7 +353,7 @@ func TestSignatureHandlerRejectsInvalidPrecomputedBundle(t *testing.T) {
 	base := images.HandlerFunc(func(context.Context, ocispec.Descriptor) ([]ocispec.Descriptor, error) {
 		return nil, nil
 	})
-	_, err = signatureHandler(base, fetcher).Handle(context.Background(), sourceManifest)
+	_, err = signatureHandler(base, fetcher, nil, false).Handle(context.Background(), sourceManifest)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "incomplete precomputed artifacts")
 }
@@ -176,11 +371,13 @@ func TestFetchSignaturesSelectsNewestPrecomputedBundle(t *testing.T) {
 		},
 	}
 
-	signatures, artifacts, err := fetchSignatures(context.Background(), fetcher, sourceManifest.Digest)
+	signatures, artifacts, selected, err := fetchSignatures(context.Background(), fetcher, sourceManifest.Digest)
 	require.NoError(t, err)
 	require.Contains(t, signatures, sourceLayer.Digest.String())
 	assert.Equal(t, "ef01", signatures[sourceLayer.Digest.String()].RootHash)
 	assert.ElementsMatch(t, []ocispec.Descriptor{newer.erofs, newer.tree}, artifacts)
+	require.NotNil(t, selected)
+	assert.Equal(t, newer.descriptor.Digest, selected.desc.Digest)
 }
 
 func TestFetchSignaturesFailsClosedOnInvalidNewestPrecomputedBundle(t *testing.T) {
@@ -213,7 +410,7 @@ func TestFetchSignaturesFailsClosedOnInvalidNewestPrecomputedBundle(t *testing.T
 		},
 	}
 
-	_, _, err = fetchSignatures(context.Background(), fetcher, sourceManifest.Digest)
+	_, _, _, err = fetchSignatures(context.Background(), fetcher, sourceManifest.Digest)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), invalidDescriptor.Digest.String())
 	assert.Contains(t, err.Error(), "incomplete precomputed artifacts")
@@ -249,11 +446,14 @@ func newPrecomputedBundle(
 	treeBytes := []byte("tree-" + name)
 	treeDesc := descriptorFor(treeBytes, MerkleTreeArtifactMediaType)
 	treeDesc.Annotations = precomputedAnnotations(sourceLayer.Digest.String())
+	configBytes := []byte("{}")
+	configDesc := descriptorFor(configBytes, ocispec.MediaTypeImageConfig)
 
 	manifest := ocispec.Manifest{
 		MediaType:    ocispec.MediaTypeImageManifest,
 		ArtifactType: SignatureArtifactType,
 		Subject:      &subject,
+		Config:       configDesc,
 		Layers:       []ocispec.Descriptor{signatureDesc, erofsDesc, treeDesc},
 		Annotations: map[string]string{
 			ociAnnotationCreated: createdAt.Format(time.RFC3339),
@@ -270,6 +470,7 @@ func newPrecomputedBundle(
 		tree:       treeDesc,
 		blobs: map[digest.Digest][]byte{
 			manifestDesc.Digest:  manifestBytes,
+			configDesc.Digest:    configBytes,
 			signatureDesc.Digest: signatureBytes,
 			erofsDesc.Digest:     erofsBytes,
 			treeDesc.Digest:      treeBytes,

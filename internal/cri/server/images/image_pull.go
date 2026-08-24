@@ -25,6 +25,7 @@ import (
 	"net/http"
 	"net/url"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -54,6 +55,7 @@ import (
 	"github.com/containerd/containerd/v2/internal/cri/util"
 	snpkg "github.com/containerd/containerd/v2/pkg/snapshotters"
 	"github.com/containerd/containerd/v2/pkg/tracing"
+	"github.com/containerd/containerd/v2/plugins"
 )
 
 // For image management:
@@ -276,7 +278,9 @@ func (c *CRIImageService) pullImageWithLocalPull(
 		handlerWrappers = append(handlerWrappers, snpkg.AppendInfoHandlerWrapper(ref))
 	}
 	if c.config.EnableDmverityReferrers {
-		handlerWrappers = append(handlerWrappers, snpkg.AppendSignatureHandlerWrapperFromResolver(resolver, ref))
+		if slices.Contains(c.snapshotterCapabilities[snapshotter], plugins.CapabilityDmverityReferrers) {
+			handlerWrappers = append(handlerWrappers, snpkg.AppendSignatureHandlerWrapperFromResolver(resolver, ref))
+		}
 	}
 	if len(handlerWrappers) > 0 {
 		pullOpts = append(pullOpts, containerd.WithImageHandlerWrapper(

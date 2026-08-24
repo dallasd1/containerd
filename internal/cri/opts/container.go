@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"slices"
 	"strings"
 
 	"github.com/containerd/continuity/fs"
@@ -37,6 +38,7 @@ import (
 	"github.com/containerd/containerd/v2/core/snapshots"
 	"github.com/containerd/containerd/v2/core/unpack"
 	snpkg "github.com/containerd/containerd/v2/pkg/snapshotters"
+	containerdplugins "github.com/containerd/containerd/v2/plugins"
 )
 
 // WithNewSnapshot wraps `containerd.WithNewSnapshot` so that if creating the
@@ -65,7 +67,10 @@ func unpackImage(ctx context.Context, client *containerd.Client, i containerd.Im
 	}
 	defer done(ctx)
 
-	matcher := platforms.Default()
+	matcher := i.Platform()
+	if matcher == nil {
+		matcher = platforms.Default()
+	}
 
 	capabilities, err := client.GetSnapshotterCapabilities(ctx, snapshotter)
 	if err != nil {
@@ -93,6 +98,9 @@ func unpackImage(ctx context.Context, client *containerd.Client, i containerd.Im
 	childrenHandler = images.LimitManifests(childrenHandler, matcher, 1)
 
 	var h images.Handler = childrenHandler
+	if slices.Contains(capabilities, containerdplugins.CapabilityDmverityReferrers) {
+		h = snpkg.AppendCachedSignatureHandlerWrapper(i.ContentStore())(h)
+	}
 	if appendSnapshotLabels {
 		h = snpkg.AppendInfoHandlerWrapper(i.Name())(h)
 	}

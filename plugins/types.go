@@ -109,9 +109,8 @@ const (
 )
 
 const (
-	// CapabilityDmverityReferrers is advertised by a diff plugin that consumes
-	// dm-verity referrer artifacts. Pull implementations use it to decide
-	// whether referrer discovery is needed, so operators do not have to state
-	// the same intent in both the differ and the pull configuration.
+	// CapabilityDmverityReferrers is advertised by a differ that consumes
+	// dm-verity referrer artifacts and by a snapshotter that can mount their
+	// signed result. Pull and deferred-unpack paths require both sides.
 	CapabilityDmverityReferrers = "dmverity-referrers"
 )

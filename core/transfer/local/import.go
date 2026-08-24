@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"slices"
 
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 
@@ -31,6 +32,7 @@ import (
 	"github.com/containerd/containerd/v2/core/transfer"
 	"github.com/containerd/containerd/v2/core/unpack"
 	snpkg "github.com/containerd/containerd/v2/pkg/snapshotters"
+	"github.com/containerd/containerd/v2/plugins"
 )
 
 func (ts *localTransferService) importStream(ctx context.Context, i transfer.ImageImporter, is transfer.ImageStorer, tops *transfer.Config) error {
@@ -95,9 +97,13 @@ func (ts *localTransferService) importStream(ctx context.Context, i transfer.Ima
 		unpacks := iu.UnpackPlatforms()
 		if len(unpacks) > 0 {
 			uopts := []unpack.UnpackerOpt{}
+			enableDmverityReferrers := false
 			for _, u := range unpacks {
 				matched, mu := getSupportedPlatform(ctx, u, ts.config.UnpackPlatforms)
 				if matched {
+					if slices.Contains(mu.SnapshotterCapabilities, plugins.CapabilityDmverityReferrers) {
+						enableDmverityReferrers = true
+					}
 					uopts = append(uopts, unpack.WithUnpackPlatform(mu))
 				}
 			}
@@ -106,7 +112,7 @@ func (ts *localTransferService) importStream(ctx context.Context, i transfer.Ima
 				uopts = append(uopts, unpack.WithDuplicationSuppressor(ts.config.DuplicationSuppressor))
 			}
 
-			if ts.config.EnableDmverityReferrers {
+			if ts.config.EnableDmverityReferrers && enableDmverityReferrers {
 				handler = snpkg.AppendSignatureHandlerWrapper(snpkg.NewContentStoreFetcher(ts.content))(handler)
 			}
 
@@ -116,6 +122,9 @@ func (ts *localTransferService) importStream(ctx context.Context, i transfer.Ima
 			}
 			handler = unpacker.Unpack(handler)
 		}
+	}
+	if ts.config.EnableDmverityReferrers && unpacker == nil {
+		handler = snpkg.AppendRetainedSignatureHandlerWrapper(snpkg.NewContentStoreFetcher(ts.content), ts.content)(handler)
 	}
 
 	if err := images.WalkNotEmpty(ctx, handler, index); err != nil {

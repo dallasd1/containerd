@@ -97,7 +97,14 @@ func init() {
 
 			ic.Meta.Exports[plugins.SnapshotterRootDir] = root
 			ic.Meta.Capabilities = append(ic.Meta.Capabilities, "rebase")
+			if dmverityReferrersEnabled(config.DmverityMode) {
+				ic.Meta.Capabilities = append(ic.Meta.Capabilities, plugins.CapabilityDmverityReferrers)
+			}
 			return erofs.NewSnapshotter(root, opts...)
 		},
 	})
+}
+
+func dmverityReferrersEnabled(mode string) bool {
+	return mode == "auto" || mode == "on"
 }
