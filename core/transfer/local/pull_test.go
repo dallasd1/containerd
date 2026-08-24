@@ -151,3 +151,40 @@ func TestGetSupportedPlatform(t *testing.T) {
 	}
 
 }
+
+func TestSelectDmverityReferrerMode(t *testing.T) {
+	for _, testCase := range []struct {
+		name          string
+		enabled       bool
+		unpackCapable bool
+		expected      dmverityReferrerMode
+	}{
+		{
+			name:     "disabled transfer leaves handlers unchanged",
+			expected: dmverityReferrersDisabled,
+		},
+		{
+			name:          "capable EROFS unpack uses transient annotations",
+			enabled:       true,
+			unpackCapable: true,
+			expected:      dmverityReferrersForImmediateUnpack,
+		},
+		{
+			name:     "fetch-only transfer retains referrers",
+			enabled:  true,
+			expected: dmverityReferrersRetained,
+		},
+		{
+			name:     "overlayfs unpack retains referrers",
+			enabled:  true,
+			expected: dmverityReferrersRetained,
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			actual := selectDmverityReferrerMode(testCase.enabled, testCase.unpackCapable)
+			if actual != testCase.expected {
+				t.Fatalf("expected mode %d, got %d", testCase.expected, actual)
+			}
+		})
+	}
+}
