@@ -230,9 +230,12 @@ func (ts *localTransferService) pull(ctx context.Context, ir transfer.ImageFetch
 			if enableRemoteSnapshotAnnotations {
 				handler = snpkg.AppendInfoHandlerWrapper(name)(handler)
 			}
-			if ts.config.EnableDmverityReferrers && enableDmverityReferrers {
-				handler = snpkg.AppendSignatureHandlerWrapper(fetcher)(handler)
-			}
+			handler = appendDmverityReferrerHandler(
+				handler,
+				fetcher,
+				ts.content,
+				selectDmverityReferrerMode(ts.config.EnableDmverityReferrers, enableDmverityReferrers),
+			)
 
 			unpacker, err = unpack.NewUnpacker(ctx, ts.content, uopts...)
 			if err != nil {
@@ -242,7 +245,7 @@ func (ts *localTransferService) pull(ctx context.Context, ir transfer.ImageFetch
 		}
 	}
 	if ts.config.EnableDmverityReferrers && unpacker == nil {
-		handler = snpkg.AppendRetainedSignatureHandlerWrapper(fetcher, ts.content)(handler)
+		handler = appendDmverityReferrerHandler(handler, fetcher, ts.content, dmverityReferrersRetained)
 	}
 
 	if err := images.Dispatch(ctx, handler, nil, desc); err != nil {

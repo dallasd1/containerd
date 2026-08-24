@@ -112,8 +112,14 @@ func (ts *localTransferService) importStream(ctx context.Context, i transfer.Ima
 				uopts = append(uopts, unpack.WithDuplicationSuppressor(ts.config.DuplicationSuppressor))
 			}
 
-			if ts.config.EnableDmverityReferrers && enableDmverityReferrers {
-				handler = snpkg.AppendSignatureHandlerWrapper(snpkg.NewContentStoreFetcher(ts.content))(handler)
+			if ts.config.EnableDmverityReferrers {
+				fetcher := snpkg.NewContentStoreFetcher(ts.content)
+				handler = appendDmverityReferrerHandler(
+					handler,
+					fetcher,
+					ts.content,
+					selectDmverityReferrerMode(true, enableDmverityReferrers),
+				)
 			}
 
 			unpacker, err = unpack.NewUnpacker(ctx, ts.content, uopts...)
@@ -124,7 +130,12 @@ func (ts *localTransferService) importStream(ctx context.Context, i transfer.Ima
 		}
 	}
 	if ts.config.EnableDmverityReferrers && unpacker == nil {
-		handler = snpkg.AppendRetainedSignatureHandlerWrapper(snpkg.NewContentStoreFetcher(ts.content), ts.content)(handler)
+		handler = appendDmverityReferrerHandler(
+			handler,
+			snpkg.NewContentStoreFetcher(ts.content),
+			ts.content,
+			dmverityReferrersRetained,
+		)
 	}
 
 	if err := images.WalkNotEmpty(ctx, handler, index); err != nil {
