@@ -170,6 +170,9 @@ func init() {
 				if dp := ic.Plugins().Get(plugins.DiffPlugin, applierID); dp != nil &&
 					slices.Contains(dp.Meta.Capabilities, plugins.CapabilityDmverityReferrers) &&
 					slices.Contains(snCapabilities, plugins.CapabilityDmverityReferrers) {
+					if !lc.EnableDmverityReferrers {
+						ic.Meta.Capabilities = append(ic.Meta.Capabilities, plugins.CapabilityDmverityReferrers)
+					}
 					lc.EnableDmverityReferrers = true
 					log.G(ic.Context).Debugf(
 						"enabling dm-verity referrer discovery for differ %q and snapshotter %q",
