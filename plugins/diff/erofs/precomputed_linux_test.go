@@ -41,7 +41,9 @@ import (
 func TestApplyPrecomputedArtifacts(t *testing.T) {
 	ctx := context.Background()
 	sourceDigest := digest.FromString("source layer")
-	data := testEROFSData(sourceDigest)
+	index := testEROFSData(sourceDigest)
+	tarData := bytes.Repeat([]byte("source tar payload\n"), 257)
+	data := combinedTarIndexData(index, tarData)
 	sourceDataPath := filepath.Join(t.TempDir(), "source.erofs")
 	sourceTreePath := filepath.Join(t.TempDir(), "source.hashtree")
 	require.NoError(t, os.WriteFile(sourceDataPath, data, 0600))
@@ -49,10 +51,7 @@ func TestApplyPrecomputedArtifacts(t *testing.T) {
 	require.NoError(t, err)
 	sourceTree.Close()
 
-	opts := dmverity.DefaultDmverityOptions()
-	opts.DataBlockSize = 512
-	opts.HashBlockSize = 512
-	opts.HashOffset = 512
+	opts := testPrecomputedVerityOptions()
 	opts.UUID = "11111111-1111-1111-1111-111111111111"
 	rootHash, err := dmverity.Format(sourceDataPath, sourceTreePath, opts)
 	require.NoError(t, err)
@@ -61,13 +60,13 @@ func TestApplyPrecomputedArtifacts(t *testing.T) {
 
 	cs, err := local.NewStore(t.TempDir())
 	require.NoError(t, err)
-	erofsDesc := writeTestBlob(t, ctx, cs, data, snapshotters.EROFSArtifactMediaType)
+	indexDesc := writeTestBlob(t, ctx, cs, index, snapshotters.TarIndexArtifactMediaType)
 	treeDesc := writeTestBlob(t, ctx, cs, tree, snapshotters.MerkleTreeArtifactMediaType)
-	sourceDesc := descriptorWithPrecomputedArtifacts(t, sourceDigest, erofsDesc, treeDesc, rootHash)
+	sourceDesc := descriptorWithPrecomputedArtifacts(t, sourceDigest, indexDesc, treeDesc, rootHash)
 
 	layerBlobPath := filepath.Join(t.TempDir(), "layer.erofs")
 	differ := erofsDiff{store: cs, enableDmverity: true}
-	used, err := differ.applyPrecomputedArtifacts(ctx, sourceDesc, layerBlobPath)
+	used, err := differ.applyPrecomputedArtifacts(ctx, sourceDesc, layerBlobPath, bytes.NewReader(tarData))
 	require.NoError(t, err)
 	assert.True(t, used)
 
@@ -81,6 +80,7 @@ func TestApplyPrecomputedArtifacts(t *testing.T) {
 		layerBlobPath,
 		dmverity.HashDevicePath(layerBlobPath),
 		rootHash,
+		uint32(verityBlockSize),
 	))
 
 	metadataBytes, err := os.ReadFile(dmverity.MetadataPath(layerBlobPath))
@@ -96,15 +96,14 @@ func TestApplyPrecomputedArtifacts(t *testing.T) {
 func TestApplyPrecomputedArtifactsRejectsWrongRootHash(t *testing.T) {
 	ctx := context.Background()
 	sourceDigest := digest.FromString("source layer")
-	data := testEROFSData(sourceDigest)
+	index := testEROFSData(sourceDigest)
+	tarData := []byte("source tar payload")
+	data := combinedTarIndexData(index, tarData)
 	sourceDataPath := filepath.Join(t.TempDir(), "source.erofs")
 	sourceTreePath := filepath.Join(t.TempDir(), "source.hashtree")
 	require.NoError(t, os.WriteFile(sourceDataPath, data, 0600))
 	require.NoError(t, os.WriteFile(sourceTreePath, nil, 0600))
-	opts := dmverity.DefaultDmverityOptions()
-	opts.DataBlockSize = 512
-	opts.HashBlockSize = 512
-	opts.HashOffset = 512
+	opts := testPrecomputedVerityOptions()
 	opts.UUID = "11111111-1111-1111-1111-111111111111"
 	_, err := dmverity.Format(sourceDataPath, sourceTreePath, opts)
 	require.NoError(t, err)
@@ -113,13 +112,13 @@ func TestApplyPrecomputedArtifactsRejectsWrongRootHash(t *testing.T) {
 
 	cs, err := local.NewStore(t.TempDir())
 	require.NoError(t, err)
-	erofsDesc := writeTestBlob(t, ctx, cs, data, snapshotters.EROFSArtifactMediaType)
+	indexDesc := writeTestBlob(t, ctx, cs, index, snapshotters.TarIndexArtifactMediaType)
 	treeDesc := writeTestBlob(t, ctx, cs, tree, snapshotters.MerkleTreeArtifactMediaType)
-	sourceDesc := descriptorWithPrecomputedArtifacts(t, sourceDigest, erofsDesc, treeDesc, digest.FromString("wrong root").Hex())
+	sourceDesc := descriptorWithPrecomputedArtifacts(t, sourceDigest, indexDesc, treeDesc, digest.FromString("wrong root").Hex())
 
 	layerBlobPath := filepath.Join(t.TempDir(), "layer.erofs")
 	differ := erofsDiff{store: cs, enableDmverity: true}
-	_, err = differ.applyPrecomputedArtifacts(ctx, sourceDesc, layerBlobPath)
+	_, err = differ.applyPrecomputedArtifacts(ctx, sourceDesc, layerBlobPath, bytes.NewReader(tarData))
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "failed dm-verity verification")
 	_, statErr := os.Stat(layerBlobPath)
@@ -128,19 +127,17 @@ func TestApplyPrecomputedArtifactsRejectsWrongRootHash(t *testing.T) {
 	assert.ErrorIs(t, statErr, os.ErrNotExist)
 }
 
-func TestApplyPrecomputedArtifactsRejectsSourceLayerSubstitution(t *testing.T) {
+func TestApplyPrecomputedArtifactsRejectsOverlongRootHash(t *testing.T) {
 	ctx := context.Background()
-	artifactSourceDigest := digest.FromString("artifact source layer")
-	requestedSourceDigest := digest.FromString("requested source layer")
-	data := testEROFSData(artifactSourceDigest)
+	sourceDigest := digest.FromString("source layer")
+	index := testEROFSData(sourceDigest)
+	tarData := []byte("source tar payload")
+	data := combinedTarIndexData(index, tarData)
 	sourceDataPath := filepath.Join(t.TempDir(), "source.erofs")
 	sourceTreePath := filepath.Join(t.TempDir(), "source.hashtree")
 	require.NoError(t, os.WriteFile(sourceDataPath, data, 0600))
 	require.NoError(t, os.WriteFile(sourceTreePath, nil, 0600))
-	opts := dmverity.DefaultDmverityOptions()
-	opts.DataBlockSize = 512
-	opts.HashBlockSize = 512
-	opts.HashOffset = 512
+	opts := testPrecomputedVerityOptions()
 	opts.UUID = "11111111-1111-1111-1111-111111111111"
 	rootHash, err := dmverity.Format(sourceDataPath, sourceTreePath, opts)
 	require.NoError(t, err)
@@ -149,13 +146,174 @@ func TestApplyPrecomputedArtifactsRejectsSourceLayerSubstitution(t *testing.T) {
 
 	cs, err := local.NewStore(t.TempDir())
 	require.NoError(t, err)
-	erofsDesc := writeTestBlob(t, ctx, cs, data, snapshotters.EROFSArtifactMediaType)
+	indexDesc := writeTestBlob(t, ctx, cs, index, snapshotters.TarIndexArtifactMediaType)
 	treeDesc := writeTestBlob(t, ctx, cs, tree, snapshotters.MerkleTreeArtifactMediaType)
-	sourceDesc := descriptorWithPrecomputedArtifacts(t, requestedSourceDigest, erofsDesc, treeDesc, rootHash)
+	sourceDesc := descriptorWithPrecomputedArtifacts(
+		t,
+		sourceDigest,
+		indexDesc,
+		treeDesc,
+		rootHash+"00",
+	)
+
+	layerBlobPath := filepath.Join(t.TempDir(), "layer.erofs")
+	differ := erofsDiff{store: cs, enableDmverity: true}
+	_, err = differ.applyPrecomputedArtifacts(
+		ctx,
+		sourceDesc,
+		layerBlobPath,
+		bytes.NewReader(tarData),
+	)
+	require.ErrorContains(t, err, "invalid root hash size")
+	for _, path := range []string{
+		layerBlobPath,
+		dmverity.HashDevicePath(layerBlobPath),
+		dmverity.MetadataPath(layerBlobPath),
+		dmverity.SignaturePath(layerBlobPath),
+	} {
+		_, statErr := os.Stat(path)
+		assert.ErrorIs(t, statErr, os.ErrNotExist)
+	}
+}
+
+func TestApplyPrecomputedArtifactsRejectsUnexpectedVerityBlockSize(t *testing.T) {
+	ctx := context.Background()
+	sourceDigest := digest.FromString("source layer")
+	index := testEROFSData(sourceDigest)
+	tarData := []byte("source tar payload")
+	data := combinedTarIndexData(index, tarData)
+	sourceDataPath := filepath.Join(t.TempDir(), "source.erofs")
+	sourceTreePath := filepath.Join(t.TempDir(), "source.hashtree")
+	require.NoError(t, os.WriteFile(sourceDataPath, data, 0600))
+	require.NoError(t, os.WriteFile(sourceTreePath, nil, 0600))
+	opts := dmverity.DefaultDmverityOptions()
+	opts.DataBlockSize = uint32(deviceAlignment)
+	opts.HashBlockSize = uint32(deviceAlignment)
+	opts.HashOffset = uint64(deviceAlignment)
+	opts.UUID = "11111111-1111-1111-1111-111111111111"
+	rootHash, err := dmverity.Format(sourceDataPath, sourceTreePath, opts)
+	require.NoError(t, err)
+	tree, err := os.ReadFile(sourceTreePath)
+	require.NoError(t, err)
+
+	cs, err := local.NewStore(t.TempDir())
+	require.NoError(t, err)
+	indexDesc := writeTestBlob(t, ctx, cs, index, snapshotters.TarIndexArtifactMediaType)
+	treeDesc := writeTestBlob(t, ctx, cs, tree, snapshotters.MerkleTreeArtifactMediaType)
+	sourceDesc := descriptorWithPrecomputedArtifacts(t, sourceDigest, indexDesc, treeDesc, rootHash)
 
 	differ := erofsDiff{store: cs, enableDmverity: true}
-	_, err = differ.applyPrecomputedArtifacts(ctx, sourceDesc, filepath.Join(t.TempDir(), "layer.erofs"))
+	_, err = differ.applyPrecomputedArtifacts(
+		ctx,
+		sourceDesc,
+		filepath.Join(t.TempDir(), "layer.erofs"),
+		bytes.NewReader(tarData),
+	)
+	require.ErrorContains(t, err, "data block size mismatch")
+}
+
+func TestApplyPrecomputedArtifactsRejectsTreeCoveringOnlyPrefix(t *testing.T) {
+	ctx := context.Background()
+	sourceDigest := digest.FromString("source layer")
+	index := testEROFSData(sourceDigest)
+	tarData := bytes.Repeat([]byte("source tar payload\n"), 300)
+	data := combinedTarIndexData(index, tarData)
+	require.Greater(t, len(data), int(verityBlockSize))
+	sourceDataPath := filepath.Join(t.TempDir(), "source.erofs")
+	sourceTreePath := filepath.Join(t.TempDir(), "source.hashtree")
+	require.NoError(t, os.WriteFile(sourceDataPath, data[:verityBlockSize], 0600))
+	require.NoError(t, os.WriteFile(sourceTreePath, nil, 0600))
+	opts := testPrecomputedVerityOptions()
+	opts.UUID = "11111111-1111-1111-1111-111111111111"
+	rootHash, err := dmverity.Format(sourceDataPath, sourceTreePath, opts)
+	require.NoError(t, err)
+	tree, err := os.ReadFile(sourceTreePath)
+	require.NoError(t, err)
+
+	cs, err := local.NewStore(t.TempDir())
+	require.NoError(t, err)
+	indexDesc := writeTestBlob(t, ctx, cs, index, snapshotters.TarIndexArtifactMediaType)
+	treeDesc := writeTestBlob(t, ctx, cs, tree, snapshotters.MerkleTreeArtifactMediaType)
+	sourceDesc := descriptorWithPrecomputedArtifacts(t, sourceDigest, indexDesc, treeDesc, rootHash)
+
+	differ := erofsDiff{store: cs, enableDmverity: true}
+	_, err = differ.applyPrecomputedArtifacts(
+		ctx,
+		sourceDesc,
+		filepath.Join(t.TempDir(), "layer.erofs"),
+		bytes.NewReader(tarData),
+	)
+	require.ErrorContains(t, err, "data blocks mismatch")
+}
+
+func TestApplyPrecomputedArtifactsRejectsSourceLayerSubstitution(t *testing.T) {
+	ctx := context.Background()
+	artifactSourceDigest := digest.FromString("artifact source layer")
+	requestedSourceDigest := digest.FromString("requested source layer")
+	index := testEROFSData(artifactSourceDigest)
+	tarData := []byte("source tar payload")
+	data := combinedTarIndexData(index, tarData)
+	sourceDataPath := filepath.Join(t.TempDir(), "source.erofs")
+	sourceTreePath := filepath.Join(t.TempDir(), "source.hashtree")
+	require.NoError(t, os.WriteFile(sourceDataPath, data, 0600))
+	require.NoError(t, os.WriteFile(sourceTreePath, nil, 0600))
+	opts := testPrecomputedVerityOptions()
+	opts.UUID = "11111111-1111-1111-1111-111111111111"
+	rootHash, err := dmverity.Format(sourceDataPath, sourceTreePath, opts)
+	require.NoError(t, err)
+	tree, err := os.ReadFile(sourceTreePath)
+	require.NoError(t, err)
+
+	cs, err := local.NewStore(t.TempDir())
+	require.NoError(t, err)
+	indexDesc := writeTestBlob(t, ctx, cs, index, snapshotters.TarIndexArtifactMediaType)
+	treeDesc := writeTestBlob(t, ctx, cs, tree, snapshotters.MerkleTreeArtifactMediaType)
+	sourceDesc := descriptorWithPrecomputedArtifacts(t, requestedSourceDigest, indexDesc, treeDesc, rootHash)
+
+	differ := erofsDiff{store: cs, enableDmverity: true}
+	_, err = differ.applyPrecomputedArtifacts(
+		ctx,
+		sourceDesc,
+		filepath.Join(t.TempDir(), "layer.erofs"),
+		bytes.NewReader(tarData),
+	)
 	require.ErrorContains(t, err, "does not match expected source-layer UUID")
+}
+
+func TestApplyPrecomputedArtifactsRejectsModifiedSourceTar(t *testing.T) {
+	ctx := context.Background()
+	sourceDigest := digest.FromString("source layer")
+	index := testEROFSData(sourceDigest)
+	tarData := []byte("expected source tar payload")
+	data := combinedTarIndexData(index, tarData)
+	sourceDataPath := filepath.Join(t.TempDir(), "source.erofs")
+	sourceTreePath := filepath.Join(t.TempDir(), "source.hashtree")
+	require.NoError(t, os.WriteFile(sourceDataPath, data, 0600))
+	require.NoError(t, os.WriteFile(sourceTreePath, nil, 0600))
+	opts := testPrecomputedVerityOptions()
+	opts.UUID = "11111111-1111-1111-1111-111111111111"
+	rootHash, err := dmverity.Format(sourceDataPath, sourceTreePath, opts)
+	require.NoError(t, err)
+	tree, err := os.ReadFile(sourceTreePath)
+	require.NoError(t, err)
+
+	cs, err := local.NewStore(t.TempDir())
+	require.NoError(t, err)
+	indexDesc := writeTestBlob(t, ctx, cs, index, snapshotters.TarIndexArtifactMediaType)
+	treeDesc := writeTestBlob(t, ctx, cs, tree, snapshotters.MerkleTreeArtifactMediaType)
+	sourceDesc := descriptorWithPrecomputedArtifacts(t, sourceDigest, indexDesc, treeDesc, rootHash)
+
+	layerBlobPath := filepath.Join(t.TempDir(), "layer.erofs")
+	differ := erofsDiff{store: cs, enableDmverity: true}
+	_, err = differ.applyPrecomputedArtifacts(
+		ctx,
+		sourceDesc,
+		layerBlobPath,
+		bytes.NewReader([]byte("modified source tar payload")),
+	)
+	require.ErrorContains(t, err, "failed dm-verity verification")
+	_, statErr := os.Stat(layerBlobPath)
+	assert.ErrorIs(t, statErr, os.ErrNotExist)
 }
 
 func writeTestBlob(t *testing.T, ctx context.Context, cs content.Store, data []byte, mediaType string) ocispec.Descriptor {
@@ -169,24 +327,43 @@ func writeTestBlob(t *testing.T, ctx context.Context, cs content.Store, data []b
 	return desc
 }
 
-func descriptorWithPrecomputedArtifacts(t *testing.T, sourceDigest digest.Digest, erofsDesc, treeDesc ocispec.Descriptor, rootHash string) ocispec.Descriptor {
+func descriptorWithPrecomputedArtifacts(t *testing.T, sourceDigest digest.Digest, indexDesc, treeDesc ocispec.Descriptor, rootHash string) ocispec.Descriptor {
 	t.Helper()
-	encodedEROFSBytes, err := json.Marshal(erofsDesc)
+	encodedIndexBytes, err := json.Marshal(indexDesc)
 	require.NoError(t, err)
 	encodedTreeBytes, err := json.Marshal(treeDesc)
 	require.NoError(t, err)
 	return ocispec.Descriptor{
 		Digest: sourceDigest,
 		Annotations: map[string]string{
-			snapshotters.TargetLayerEROFSDescriptorLabel:      string(encodedEROFSBytes),
+			snapshotters.TargetLayerTarIndexDescriptorLabel:   string(encodedIndexBytes),
 			snapshotters.TargetLayerMerkleTreeDescriptorLabel: string(encodedTreeBytes),
 			snapshotters.TargetLayerRootHashLabel:             rootHash,
 		},
 	}
 }
 
+func combinedTarIndexData(index, tarData []byte) []byte {
+	data := append([]byte(nil), index...)
+	data = append(data, tarData...)
+	if remainder := len(data) % int(deviceAlignment); remainder != 0 {
+		data = append(data, make([]byte, int(deviceAlignment)-remainder)...)
+	}
+	return data
+}
+
+func testPrecomputedVerityOptions() *dmverity.DmverityOptions {
+	opts := dmverity.DefaultDmverityOptions()
+	opts.DataBlockSize = uint32(verityBlockSize)
+	opts.HashBlockSize = uint32(verityBlockSize)
+	opts.HashOffset = uint64(verityBlockSize)
+	return opts
+}
+
 func testEROFSData(sourceDigest digest.Digest) []byte {
-	data := bytes.Repeat([]byte("precomputed-erofs-"), 4096)
+	// Real mkfs.erofs tar indexes are 512-byte aligned but are not
+	// necessarily aligned to the final 4096-byte device boundary.
+	data := make([]byte, int(3*tarIndexAlignment))
 	binary.LittleEndian.PutUint32(data[erofsSuperOffset:], erofsMagic)
 	expectedUUID := uuid.NewSHA1(uuid.NameSpaceURL, []byte("erofs:blobs/"+sourceDigest.String()))
 	copy(data[erofsSuperOffset+erofsUUIDOffset:erofsSuperOffset+erofsUUIDEnd], expectedUUID[:])

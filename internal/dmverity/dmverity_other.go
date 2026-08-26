@@ -44,7 +44,7 @@ func OpenWithSignature(_ string, _ string, _ string, _ string, _ uint64, _ *Dmve
 	return "", errUnsupported
 }
 
-func VerifyArtifacts(_ string, _ string, _ string) error {
+func VerifyArtifacts(_ string, _ string, _ string, _ uint32) error {
 	return errUnsupported
 }
 

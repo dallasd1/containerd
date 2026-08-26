@@ -172,7 +172,7 @@ func (l *local) Apply(ctx context.Context, er *diffapi.ApplyRequest, _ ...grpc.C
 func (l *local) validateDmverityApply(desc ocispec.Descriptor, mounts []mount.Mount) error {
 	if desc.Annotations[snapshotters.TargetLayerSignatureLabel] == "" &&
 		desc.Annotations[snapshotters.TargetLayerRootHashLabel] == "" &&
-		desc.Annotations[snapshotters.TargetLayerEROFSDescriptorLabel] == "" &&
+		desc.Annotations[snapshotters.TargetLayerTarIndexDescriptorLabel] == "" &&
 		desc.Annotations[snapshotters.TargetLayerMerkleTreeDescriptorLabel] == "" {
 		return nil
 	}

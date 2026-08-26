@@ -34,16 +34,19 @@ import (
 )
 
 const (
-	erofsSuperOffset = 1024
-	erofsMagic       = 0xE0F5E1E2
-	erofsUUIDOffset  = 48
-	erofsUUIDEnd     = erofsUUIDOffset + 16
+	erofsSuperOffset  = 1024
+	erofsMagic        = 0xE0F5E1E2
+	erofsUUIDOffset   = 48
+	erofsUUIDEnd      = erofsUUIDOffset + 16
+	tarIndexAlignment = int64(512)
+	deviceAlignment   = int64(4096)
+	verityBlockSize   = int64(512)
 )
 
-func (s erofsDiff) applyPrecomputedArtifacts(ctx context.Context, sourceDesc ocispec.Descriptor, layerBlobPath string) (bool, error) {
-	erofsValue := sourceDesc.Annotations[snpkg.TargetLayerEROFSDescriptorLabel]
+func (s erofsDiff) applyPrecomputedArtifacts(ctx context.Context, sourceDesc ocispec.Descriptor, layerBlobPath string, sourceTar io.Reader) (bool, error) {
+	indexValue := sourceDesc.Annotations[snpkg.TargetLayerTarIndexDescriptorLabel]
 	treeValue := sourceDesc.Annotations[snpkg.TargetLayerMerkleTreeDescriptorLabel]
-	if erofsValue == "" && treeValue == "" {
+	if indexValue == "" && treeValue == "" {
 		return false, nil
 	}
 	if !s.enableDmverity {
@@ -55,15 +58,22 @@ func (s erofsDiff) applyPrecomputedArtifacts(ctx context.Context, sourceDesc oci
 			Debug("ignoring precomputed dm-verity artifacts: dm-verity is disabled")
 		return false, nil
 	}
-	if erofsValue == "" || treeValue == "" {
+	if indexValue == "" || treeValue == "" {
 		return false, fmt.Errorf("incomplete precomputed artifact annotations for layer %s", sourceDesc.Digest)
 	}
-	erofsDesc, err := snpkg.ParseTargetDescriptor(erofsValue)
+	indexDesc, err := snpkg.ParseTargetDescriptor(indexValue)
 	if err != nil {
 		return false, err
 	}
-	if erofsDesc.MediaType != snpkg.EROFSArtifactMediaType {
-		return false, fmt.Errorf("unexpected precomputed EROFS media type %q", erofsDesc.MediaType)
+	if indexDesc.MediaType != snpkg.TarIndexArtifactMediaType {
+		return false, fmt.Errorf("unexpected precomputed EROFS tar-index media type %q", indexDesc.MediaType)
+	}
+	if indexDesc.Size%tarIndexAlignment != 0 {
+		return false, fmt.Errorf(
+			"precomputed EROFS tar index for layer %s has unaligned size %d",
+			sourceDesc.Digest,
+			indexDesc.Size,
+		)
 	}
 	treeDesc, err := snpkg.ParseTargetDescriptor(treeValue)
 	if err != nil {
@@ -89,17 +99,25 @@ func (s erofsDiff) applyPrecomputedArtifacts(ctx context.Context, sourceDesc oci
 		os.Remove(dmverity.SignaturePath(layerBlobPath))
 	}()
 
-	if err := copyContentDescriptor(ctx, s.store, erofsDesc, layerBlobPath); err != nil {
-		return false, fmt.Errorf("materialize precomputed EROFS for layer %s: %w", sourceDesc.Digest, err)
+	if err := copyContentDescriptor(ctx, s.store, indexDesc, layerBlobPath); err != nil {
+		return false, fmt.Errorf("materialize precomputed EROFS tar index for layer %s: %w", sourceDesc.Digest, err)
+	}
+	if err := appendTarPayload(layerBlobPath, sourceTar); err != nil {
+		return false, fmt.Errorf("append source tar for layer %s: %w", sourceDesc.Digest, err)
 	}
 	if err := verifyEROFSUUID(layerBlobPath, sourceDesc.Digest.String()); err != nil {
-		return false, fmt.Errorf("verify precomputed EROFS source binding for layer %s: %w", sourceDesc.Digest, err)
+		return false, fmt.Errorf("verify precomputed EROFS tar-index source binding for layer %s: %w", sourceDesc.Digest, err)
 	}
 	if err := copyContentDescriptor(ctx, s.store, treeDesc, hashDevicePath); err != nil {
 		return false, fmt.Errorf("materialize precomputed Merkle tree for layer %s: %w", sourceDesc.Digest, err)
 	}
 
-	if err := dmverity.VerifyArtifacts(layerBlobPath, hashDevicePath, rootHash); err != nil {
+	if err := dmverity.VerifyArtifacts(
+		layerBlobPath,
+		hashDevicePath,
+		rootHash,
+		uint32(verityBlockSize),
+	); err != nil {
 		return false, fmt.Errorf("precomputed artifacts failed dm-verity verification for layer %s: %w", sourceDesc.Digest, err)
 	}
 	if err := dmverity.WriteMetadata(layerBlobPath, dmverity.DmverityMetadata{
@@ -116,11 +134,40 @@ func (s erofsDiff) applyPrecomputedArtifacts(ctx context.Context, sourceDesc oci
 	cleanup = false
 	log.G(ctx).WithFields(log.Fields{
 		"layer":       sourceDesc.Digest,
-		"erofs":       erofsDesc.Digest,
+		"tar_index":   indexDesc.Digest,
 		"merkle_tree": treeDesc.Digest,
 		"root_hash":   rootHash,
-	}).Info("Materialized verified precomputed EROFS dm-verity artifacts")
+	}).Info("Materialized verified precomputed EROFS tar-index dm-verity artifacts")
 	return true, nil
+}
+
+func appendTarPayload(layerBlobPath string, sourceTar io.Reader) (retErr error) {
+	if sourceTar == nil {
+		return fmt.Errorf("source tar reader is nil")
+	}
+	file, err := os.OpenFile(layerBlobPath, os.O_WRONLY|os.O_APPEND, 0)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if closeErr := file.Close(); retErr == nil && closeErr != nil {
+			retErr = closeErr
+		}
+	}()
+
+	if _, err := io.Copy(file, sourceTar); err != nil {
+		return err
+	}
+	info, err := file.Stat()
+	if err != nil {
+		return err
+	}
+	if remainder := info.Size() % deviceAlignment; remainder != 0 {
+		if _, err := file.Write(make([]byte, deviceAlignment-remainder)); err != nil {
+			return err
+		}
+	}
+	return file.Sync()
 }
 
 func verifyEROFSUUID(path, sourceDigest string) error {

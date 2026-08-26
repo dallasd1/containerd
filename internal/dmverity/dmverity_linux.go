@@ -239,12 +239,34 @@ func OpenWithSignature(dataDevice string, name string, hashDevice string, rootHa
 
 // VerifyArtifacts verifies a precomputed EROFS data device and separate
 // dm-verity hash device against the expected root hash.
-func VerifyArtifacts(dataDevice, hashDevice, rootHash string) error {
+func VerifyArtifacts(dataDevice, hashDevice, rootHash string, blockSize uint32) error {
 	rootDigest, err := utils.ParseRootHash(rootHash)
 	if err != nil {
 		return fmt.Errorf("invalid root hash: %w", err)
 	}
+	if !utils.IsBlockSizeValid(blockSize) {
+		return fmt.Errorf("invalid expected dm-verity block size: %d", blockSize)
+	}
+	info, err := os.Stat(dataDevice)
+	if err != nil {
+		return fmt.Errorf("stat precomputed dm-verity data device: %w", err)
+	}
+	if info.Size() <= 0 || info.Size()%int64(blockSize) != 0 {
+		return fmt.Errorf(
+			"precomputed dm-verity data size %d is not a positive multiple of block size %d",
+			info.Size(),
+			blockSize,
+		)
+	}
 	params := verity.DefaultParams()
+	params.DataBlockSize = blockSize
+	params.HashBlockSize = blockSize
+	params.DataBlocks = uint64(info.Size() / int64(blockSize))
+	params.Salt = make([]byte, 32)
+	params.SaltSize = uint16(len(params.Salt))
+	if err := utils.ValidateRootHashSize(rootDigest, params.HashName); err != nil {
+		return fmt.Errorf("invalid root hash: %w", err)
+	}
 	if err := verity.Verify(&params, dataDevice, hashDevice, rootDigest); err != nil {
 		return fmt.Errorf("verify precomputed dm-verity artifacts: %w", err)
 	}

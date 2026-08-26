@@ -210,12 +210,9 @@ func (s erofsDiff) Apply(ctx context.Context, desc ocispec.Descriptor, mounts []
 		r: io.TeeReader(processor, digester.Hash()),
 	}
 
-	if used, err := s.applyPrecomputedArtifacts(ctx, desc, layerBlobPath); err != nil {
+	if used, err := s.applyPrecomputedArtifacts(ctx, desc, layerBlobPath, rc); err != nil {
 		return emptyDesc, err
 	} else if used {
-		if _, err := io.Copy(io.Discard, rc); err != nil {
-			return emptyDesc, fmt.Errorf("calculate diffID for precomputed EROFS layer: %w", err)
-		}
 		return ocispec.Descriptor{
 			MediaType: ocispec.MediaTypeImageLayer,
 			Size:      rc.c,

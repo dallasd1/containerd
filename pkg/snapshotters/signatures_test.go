@@ -43,6 +43,11 @@ type artifactFetcher struct {
 	refs  map[digest.Digest][]ocispec.Descriptor
 }
 
+var (
+	testRootHashA = digest.FromString("test root hash A").Encoded()
+	testRootHashB = digest.FromString("test root hash B").Encoded()
+)
+
 func (f *artifactFetcher) Fetch(_ context.Context, desc ocispec.Descriptor) (io.ReadCloser, error) {
 	data, ok := f.blobs[desc.Digest]
 	if !ok {
@@ -79,18 +84,20 @@ func TestSignatureHandlerPrecomputedBundle(t *testing.T) {
 	signatureDesc := descriptorFor(signatureBytes, LayerSignatureMediaType)
 	signatureDesc.Annotations = map[string]string{
 		sigLayerDigestAnnotation:    sourceLayer.Digest.String(),
-		sigLayerRootHashAnnotation:  "abcd",
+		sigLayerRootHashAnnotation:  testRootHashA,
 		sigLayerSignatureAnnotation: base64.StdEncoding.EncodeToString(signatureBytes),
 	}
-	erofsDesc := descriptorFor([]byte("precomputed erofs"), EROFSArtifactMediaType)
-	erofsDesc.Annotations = precomputedAnnotations(sourceLayer.Digest.String())
+	indexBytes := make([]byte, tarIndexAlignment)
+	copy(indexBytes, "precomputed tar index")
+	indexDesc := descriptorFor(indexBytes, TarIndexArtifactMediaType)
+	indexDesc.Annotations = precomputedAnnotations(sourceLayer.Digest.String())
 	treeDesc := descriptorFor([]byte("precomputed tree"), MerkleTreeArtifactMediaType)
 	treeDesc.Annotations = precomputedAnnotations(sourceLayer.Digest.String())
 	bundle := ocispec.Manifest{
 		MediaType:    ocispec.MediaTypeImageManifest,
 		ArtifactType: SignatureArtifactType,
 		Subject:      &sourceManifest,
-		Layers:       []ocispec.Descriptor{signatureDesc, erofsDesc, treeDesc},
+		Layers:       []ocispec.Descriptor{signatureDesc, indexDesc, treeDesc},
 	}
 	bundleBytes, err := json.Marshal(bundle)
 	require.NoError(t, err)
@@ -101,7 +108,7 @@ func TestSignatureHandlerPrecomputedBundle(t *testing.T) {
 		blobs: map[digest.Digest][]byte{
 			bundleDesc.Digest:    bundleBytes,
 			signatureDesc.Digest: signatureBytes,
-			erofsDesc.Digest:     []byte("precomputed erofs"),
+			indexDesc.Digest:     indexBytes,
 			treeDesc.Digest:      []byte("precomputed tree"),
 		},
 		refs: map[digest.Digest][]ocispec.Descriptor{
@@ -123,17 +130,17 @@ func TestSignatureHandlerPrecomputedBundle(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, children, 3)
 	layer := children[1]
-	assert.Equal(t, "abcd", layer.Annotations[TargetLayerRootHashLabel])
+	assert.Equal(t, testRootHashA, layer.Annotations[TargetLayerRootHashLabel])
 	assert.Equal(t, base64.StdEncoding.EncodeToString(signatureBytes), layer.Annotations[TargetLayerSignatureLabel])
 
-	gotEROFS, err := ParseTargetDescriptor(layer.Annotations[TargetLayerEROFSDescriptorLabel])
+	gotIndex, err := ParseTargetDescriptor(layer.Annotations[TargetLayerTarIndexDescriptorLabel])
 	require.NoError(t, err)
-	assert.Equal(t, erofsDesc.Digest, gotEROFS.Digest)
+	assert.Equal(t, indexDesc.Digest, gotIndex.Digest)
 	gotTree, err := ParseTargetDescriptor(layer.Annotations[TargetLayerMerkleTreeDescriptorLabel])
 	require.NoError(t, err)
 	assert.Equal(t, treeDesc.Digest, gotTree.Digest)
 	assert.Equal(t, layer.Annotations, children[2].Annotations)
-	assert.ElementsMatch(t, []digest.Digest{erofsDesc.Digest, treeDesc.Digest}, fetched)
+	assert.ElementsMatch(t, []digest.Digest{indexDesc.Digest, treeDesc.Digest}, fetched)
 }
 
 func TestSignatureHandlerPersistsBundleForDeferredUnpack(t *testing.T) {
@@ -149,7 +156,7 @@ func TestSignatureHandlerPersistsBundleForDeferredUnpack(t *testing.T) {
 	})
 	require.NoError(t, err)
 	sourceManifest := descriptorFor(sourceManifestBytes, ocispec.MediaTypeImageManifest)
-	bundle := newPrecomputedBundle(t, sourceManifest, sourceLayer, "selected", "abcd", time.Now().UTC())
+	bundle := newPrecomputedBundle(t, sourceManifest, sourceLayer, "selected", testRootHashA, time.Now().UTC())
 
 	fetcher := &artifactFetcher{
 		blobs: mergeBlobMaps(bundle.blobs, map[digest.Digest][]byte{
@@ -171,7 +178,7 @@ func TestSignatureHandlerPersistsBundleForDeferredUnpack(t *testing.T) {
 	children, err := signatureHandler(base, fetcher, cs, false).Handle(ctx, sourceManifest)
 	require.NoError(t, err)
 	require.Len(t, children, 2)
-	assert.Equal(t, "abcd", children[1].Annotations[TargetLayerRootHashLabel])
+	assert.Equal(t, testRootHashA, children[1].Annotations[TargetLayerRootHashLabel])
 
 	subjectInfo, err := cs.Info(ctx, sourceManifest.Digest)
 	require.NoError(t, err)
@@ -195,13 +202,13 @@ func TestSignatureHandlerPersistsBundleForDeferredUnpack(t *testing.T) {
 	deferredChildren, err := deferred.Handle(ctx, sourceManifest)
 	require.NoError(t, err)
 	require.Len(t, deferredChildren, 2)
-	assert.Equal(t, "abcd", deferredChildren[1].Annotations[TargetLayerRootHashLabel])
-	assert.NotEmpty(t, deferredChildren[1].Annotations[TargetLayerEROFSDescriptorLabel])
+	assert.Equal(t, testRootHashA, deferredChildren[1].Annotations[TargetLayerRootHashLabel])
+	assert.NotEmpty(t, deferredChildren[1].Annotations[TargetLayerTarIndexDescriptorLabel])
 
 	annotations, err := CachedSignatureAnnotations(ctx, cs, sourceManifest)
 	require.NoError(t, err)
 	require.Contains(t, annotations, sourceLayer.Digest)
-	assert.Equal(t, "abcd", annotations[sourceLayer.Digest][TargetLayerRootHashLabel])
+	assert.Equal(t, testRootHashA, annotations[sourceLayer.Digest][TargetLayerRootHashLabel])
 
 	require.NoError(t, content.WriteBlob(ctx, cs, "source config", bytes.NewReader(configBytes), config))
 	require.NoError(t, content.WriteBlob(ctx, cs, "source layer", bytes.NewReader(layerBytes), sourceLayer))
@@ -239,7 +246,7 @@ func TestSignatureHandlerPersistsBundleForDeferredUnpack(t *testing.T) {
 	assert.Equal(t, sourceManifest.Digest, selected.Digest)
 	indexAnnotations, err := CachedSignatureAnnotations(ctx, cs, selected)
 	require.NoError(t, err)
-	assert.Equal(t, "abcd", indexAnnotations[sourceLayer.Digest][TargetLayerRootHashLabel])
+	assert.Equal(t, testRootHashA, indexAnnotations[sourceLayer.Digest][TargetLayerRootHashLabel])
 
 	_, err = cs.Update(ctx, content.Info{
 		Digest: sourceManifest.Digest,
@@ -294,7 +301,7 @@ func TestPersistSignatureReferrerRejectsMissingArtifactContent(t *testing.T) {
 	ctx := context.Background()
 	subjectBytes := []byte("subject manifest")
 	subject := descriptorFor(subjectBytes, ocispec.MediaTypeImageManifest)
-	layer := descriptorFor([]byte("missing artifact layer"), EROFSArtifactMediaType)
+	layer := descriptorFor([]byte("missing artifact layer"), TarIndexArtifactMediaType)
 	manifest := ocispec.Manifest{
 		MediaType:    ocispec.MediaTypeImageManifest,
 		ArtifactType: SignatureArtifactType,
@@ -334,9 +341,9 @@ func TestSignatureHandlerRejectsInvalidPrecomputedBundle(t *testing.T) {
 		ArtifactType: SignatureArtifactType,
 		Subject:      &sourceManifest,
 		Layers: []ocispec.Descriptor{{
-			MediaType:   EROFSArtifactMediaType,
-			Digest:      digest.FromString("orphan erofs"),
-			Size:        12,
+			MediaType:   TarIndexArtifactMediaType,
+			Digest:      digest.FromString("orphan tar index"),
+			Size:        tarIndexAlignment,
 			Annotations: precomputedAnnotations(digest.FromString("source layer").String()),
 		}},
 	}
@@ -361,8 +368,8 @@ func TestSignatureHandlerRejectsInvalidPrecomputedBundle(t *testing.T) {
 func TestFetchSignaturesSelectsNewestPrecomputedBundle(t *testing.T) {
 	sourceManifest := descriptorFor([]byte("source manifest"), ocispec.MediaTypeImageManifest)
 	sourceLayer := descriptorFor([]byte("source layer"), ocispec.MediaTypeImageLayerGzip)
-	older := newPrecomputedBundle(t, sourceManifest, sourceLayer, "older", "abcd", time.Date(2026, 7, 20, 1, 0, 0, 0, time.UTC))
-	newer := newPrecomputedBundle(t, sourceManifest, sourceLayer, "newer", "ef01", time.Date(2026, 7, 20, 2, 0, 0, 0, time.UTC))
+	older := newPrecomputedBundle(t, sourceManifest, sourceLayer, "older", testRootHashA, time.Date(2026, 7, 20, 1, 0, 0, 0, time.UTC))
+	newer := newPrecomputedBundle(t, sourceManifest, sourceLayer, "newer", testRootHashB, time.Date(2026, 7, 20, 2, 0, 0, 0, time.UTC))
 
 	fetcher := &artifactFetcher{
 		blobs: mergeBlobMaps(older.blobs, newer.blobs),
@@ -371,11 +378,16 @@ func TestFetchSignaturesSelectsNewestPrecomputedBundle(t *testing.T) {
 		},
 	}
 
-	signatures, artifacts, selected, err := fetchSignatures(context.Background(), fetcher, sourceManifest.Digest)
+	signatures, artifacts, selected, err := fetchSignatures(
+		context.Background(),
+		fetcher,
+		sourceManifest.Digest,
+		layerDigestSet(sourceLayer),
+	)
 	require.NoError(t, err)
 	require.Contains(t, signatures, sourceLayer.Digest.String())
-	assert.Equal(t, "ef01", signatures[sourceLayer.Digest.String()].RootHash)
-	assert.ElementsMatch(t, []ocispec.Descriptor{newer.erofs, newer.tree}, artifacts)
+	assert.Equal(t, testRootHashB, signatures[sourceLayer.Digest.String()].RootHash)
+	assert.ElementsMatch(t, []ocispec.Descriptor{newer.tarIndex, newer.tree}, artifacts)
 	require.NotNil(t, selected)
 	assert.Equal(t, newer.descriptor.Digest, selected.desc.Digest)
 }
@@ -383,15 +395,20 @@ func TestFetchSignaturesSelectsNewestPrecomputedBundle(t *testing.T) {
 func TestFetchSignaturesFailsClosedOnInvalidNewestPrecomputedBundle(t *testing.T) {
 	sourceManifest := descriptorFor([]byte("source manifest"), ocispec.MediaTypeImageManifest)
 	sourceLayer := descriptorFor([]byte("source layer"), ocispec.MediaTypeImageLayerGzip)
-	older := newPrecomputedBundle(t, sourceManifest, sourceLayer, "older", "abcd", time.Date(2026, 7, 20, 1, 0, 0, 0, time.UTC))
+	older := newPrecomputedBundle(t, sourceManifest, sourceLayer, "older", testRootHashA, time.Date(2026, 7, 20, 1, 0, 0, 0, time.UTC))
 
-	orphanEROFS := descriptorFor([]byte("orphan erofs"), EROFSArtifactMediaType)
-	orphanEROFS.Annotations = precomputedAnnotations(sourceLayer.Digest.String())
+	signatureBytes := []byte("orphan signature")
+	orphanSignature := descriptorFor(signatureBytes, LayerSignatureMediaType)
+	orphanSignature.Annotations = map[string]string{
+		sigLayerDigestAnnotation:    sourceLayer.Digest.String(),
+		sigLayerRootHashAnnotation:  testRootHashB,
+		sigLayerSignatureAnnotation: base64.StdEncoding.EncodeToString(signatureBytes),
+	}
 	invalidManifest := ocispec.Manifest{
 		MediaType:    ocispec.MediaTypeImageManifest,
 		ArtifactType: SignatureArtifactType,
 		Subject:      &sourceManifest,
-		Layers:       []ocispec.Descriptor{orphanEROFS},
+		Layers:       []ocispec.Descriptor{orphanSignature},
 		Annotations: map[string]string{
 			ociAnnotationCreated: time.Date(2026, 7, 20, 2, 0, 0, 0, time.UTC).Format(time.RFC3339),
 		},
@@ -404,21 +421,117 @@ func TestFetchSignaturesFailsClosedOnInvalidNewestPrecomputedBundle(t *testing.T
 	fetcher := &artifactFetcher{
 		blobs: mergeBlobMaps(older.blobs, map[digest.Digest][]byte{
 			invalidDescriptor.Digest: invalidBytes,
+			orphanSignature.Digest:   signatureBytes,
 		}),
 		refs: map[digest.Digest][]ocispec.Descriptor{
 			sourceManifest.Digest: {older.descriptor, invalidDescriptor},
 		},
 	}
 
-	_, _, _, err = fetchSignatures(context.Background(), fetcher, sourceManifest.Digest)
+	_, _, _, err = fetchSignatures(
+		context.Background(),
+		fetcher,
+		sourceManifest.Digest,
+		layerDigestSet(sourceLayer),
+	)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), invalidDescriptor.Digest.String())
 	assert.Contains(t, err.Error(), "incomplete precomputed artifacts")
 }
 
+func TestFetchSignaturesRejectsUnexpectedManifestArtifactType(t *testing.T) {
+	sourceManifest := descriptorFor([]byte("source manifest"), ocispec.MediaTypeImageManifest)
+	bundle := ocispec.Manifest{
+		MediaType:    ocispec.MediaTypeImageManifest,
+		ArtifactType: "application/vnd.example.unexpected",
+		Subject:      &sourceManifest,
+	}
+	bundleBytes, err := json.Marshal(bundle)
+	require.NoError(t, err)
+	bundleDesc := descriptorFor(bundleBytes, ocispec.MediaTypeImageManifest)
+	// The registry descriptor passes the artifact-type filter, but the fetched
+	// manifest is authoritative and must agree.
+	bundleDesc.ArtifactType = SignatureArtifactType
+	fetcher := &artifactFetcher{
+		blobs: map[digest.Digest][]byte{bundleDesc.Digest: bundleBytes},
+		refs: map[digest.Digest][]ocispec.Descriptor{
+			sourceManifest.Digest: {bundleDesc},
+		},
+	}
+
+	_, _, _, err = fetchSignatures(
+		context.Background(),
+		fetcher,
+		sourceManifest.Digest,
+		map[string]struct{}{},
+	)
+	require.ErrorContains(t, err, "unexpected artifact type")
+}
+
+func TestFetchSignaturesRejectsMalformedOlderPrecomputedBundle(t *testing.T) {
+	sourceManifest := descriptorFor([]byte("source manifest"), ocispec.MediaTypeImageManifest)
+	sourceLayer := descriptorFor([]byte("source layer"), ocispec.MediaTypeImageLayerGzip)
+	older := newPrecomputedBundle(t, sourceManifest, sourceLayer, "older", testRootHashA, time.Date(2026, 7, 20, 1, 0, 0, 0, time.UTC))
+	newer := newPrecomputedBundle(t, sourceManifest, sourceLayer, "newer", testRootHashB, time.Date(2026, 7, 20, 2, 0, 0, 0, time.UTC))
+
+	var olderManifest ocispec.Manifest
+	require.NoError(t, json.Unmarshal(older.blobs[older.descriptor.Digest], &olderManifest))
+	for i := range olderManifest.Layers {
+		if olderManifest.Layers[i].MediaType == TarIndexArtifactMediaType {
+			olderManifest.Layers[i].Size++
+		}
+	}
+	olderManifestBytes, err := json.Marshal(olderManifest)
+	require.NoError(t, err)
+	older.descriptor = descriptorFor(olderManifestBytes, ocispec.MediaTypeImageManifest)
+	older.descriptor.ArtifactType = SignatureArtifactType
+	older.blobs[older.descriptor.Digest] = olderManifestBytes
+
+	fetcher := &artifactFetcher{
+		blobs: mergeBlobMaps(older.blobs, newer.blobs),
+		refs: map[digest.Digest][]ocispec.Descriptor{
+			sourceManifest.Digest: {older.descriptor, newer.descriptor},
+		},
+	}
+
+	_, _, _, err = fetchSignatures(
+		context.Background(),
+		fetcher,
+		sourceManifest.Digest,
+		layerDigestSet(sourceLayer),
+	)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), older.descriptor.Digest.String())
+	assert.Contains(t, err.Error(), "unaligned size")
+}
+
+func TestFetchSignaturesRejectsInvalidRootHashInOlderBundle(t *testing.T) {
+	sourceManifest := descriptorFor([]byte("source manifest"), ocispec.MediaTypeImageManifest)
+	sourceLayer := descriptorFor([]byte("source layer"), ocispec.MediaTypeImageLayerGzip)
+	older := newPrecomputedBundle(t, sourceManifest, sourceLayer, "older", "abcd", time.Date(2026, 7, 20, 1, 0, 0, 0, time.UTC))
+	newer := newPrecomputedBundle(t, sourceManifest, sourceLayer, "newer", testRootHashB, time.Date(2026, 7, 20, 2, 0, 0, 0, time.UTC))
+
+	fetcher := &artifactFetcher{
+		blobs: mergeBlobMaps(older.blobs, newer.blobs),
+		refs: map[digest.Digest][]ocispec.Descriptor{
+			sourceManifest.Digest: {older.descriptor, newer.descriptor},
+		},
+	}
+
+	_, _, _, err := fetchSignatures(
+		context.Background(),
+		fetcher,
+		sourceManifest.Digest,
+		layerDigestSet(sourceLayer),
+	)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), older.descriptor.Digest.String())
+	assert.Contains(t, err.Error(), "invalid SHA-256 root hash size")
+}
+
 type precomputedBundleFixture struct {
 	descriptor ocispec.Descriptor
-	erofs      ocispec.Descriptor
+	tarIndex   ocispec.Descriptor
 	tree       ocispec.Descriptor
 	blobs      map[digest.Digest][]byte
 }
@@ -440,9 +553,10 @@ func newPrecomputedBundle(
 		sigLayerRootHashAnnotation:  rootHash,
 		sigLayerSignatureAnnotation: base64.StdEncoding.EncodeToString(signatureBytes),
 	}
-	erofsBytes := []byte("erofs-" + name)
-	erofsDesc := descriptorFor(erofsBytes, EROFSArtifactMediaType)
-	erofsDesc.Annotations = precomputedAnnotations(sourceLayer.Digest.String())
+	indexBytes := make([]byte, tarIndexAlignment)
+	copy(indexBytes, "tar-index-"+name)
+	indexDesc := descriptorFor(indexBytes, TarIndexArtifactMediaType)
+	indexDesc.Annotations = precomputedAnnotations(sourceLayer.Digest.String())
 	treeBytes := []byte("tree-" + name)
 	treeDesc := descriptorFor(treeBytes, MerkleTreeArtifactMediaType)
 	treeDesc.Annotations = precomputedAnnotations(sourceLayer.Digest.String())
@@ -454,7 +568,7 @@ func newPrecomputedBundle(
 		ArtifactType: SignatureArtifactType,
 		Subject:      &subject,
 		Config:       configDesc,
-		Layers:       []ocispec.Descriptor{signatureDesc, erofsDesc, treeDesc},
+		Layers:       []ocispec.Descriptor{signatureDesc, indexDesc, treeDesc},
 		Annotations: map[string]string{
 			ociAnnotationCreated: createdAt.Format(time.RFC3339),
 		},
@@ -466,13 +580,13 @@ func newPrecomputedBundle(
 
 	return precomputedBundleFixture{
 		descriptor: manifestDesc,
-		erofs:      erofsDesc,
+		tarIndex:   indexDesc,
 		tree:       treeDesc,
 		blobs: map[digest.Digest][]byte{
 			manifestDesc.Digest:  manifestBytes,
 			configDesc.Digest:    configBytes,
 			signatureDesc.Digest: signatureBytes,
-			erofsDesc.Digest:     erofsBytes,
+			indexDesc.Digest:     indexBytes,
 			treeDesc.Digest:      treeBytes,
 		},
 	}
@@ -500,4 +614,12 @@ func precomputedAnnotations(sourceDigest string) map[string]string {
 	return map[string]string{
 		precomputedSourceLayerAnnotation: sourceDigest,
 	}
+}
+
+func layerDigestSet(layers ...ocispec.Descriptor) map[string]struct{} {
+	result := make(map[string]struct{}, len(layers))
+	for _, layer := range layers {
+		result[layer.Digest.String()] = struct{}{}
+	}
+	return result
 }
