@@ -31,19 +31,18 @@ import (
 	"github.com/containerd/containerd/v2/internal/cri/sputil"
 )
 
-func (c *criService) containerSpecOpts(config *runtime.ContainerConfig, imageConfig *imagespec.ImageConfig) ([]oci.SpecOpts, error) {
+func (c *criService) containerSpecOpts(config *runtime.ContainerConfig, imageConfig *imagespec.ImageConfig, imageChainID string) ([]oci.SpecOpts, error) {
 	var (
 		specOpts []oci.SpecOpts
 		err      error
 	)
 	securityContext := config.GetLinux().GetSecurityContext()
-	userstr := "0" // runtime default
-	if securityContext.GetRunAsUsername() != "" {
-		userstr = securityContext.GetRunAsUsername()
-	} else if securityContext.GetRunAsUser() != nil {
-		userstr = strconv.FormatInt(securityContext.GetRunAsUser().GetValue(), 10)
-	} else if imageConfig.User != "" {
-		userstr, _, _ = strings.Cut(imageConfig.User, ":")
+	lookupUsername := securityContext.GetRunAsUsername()
+	if lookupUsername == "" && securityContext.GetRunAsUser() == nil && imageConfig.User != "" {
+		imageUser, _, _ := strings.Cut(imageConfig.User, ":")
+		if _, err := strconv.ParseUint(imageUser, 10, 32); err != nil {
+			lookupUsername = imageUser
+		}
 	}
 
 	switch securityContext.GetSupplementalGroupsPolicy() {
@@ -51,7 +50,7 @@ func (c *criService) containerSpecOpts(config *runtime.ContainerConfig, imageCon
 		// merging group defined in /etc/passwd
 		// and SupplementalGroups defined in security context
 		specOpts = append(specOpts,
-			customopts.WithAdditionalGIDs(userstr),
+			customopts.WithCachedAdditionalGIDs(&c.supplementalGroupsCache, imageChainID, lookupUsername),
 			customopts.WithSupplementalGroups(securityContext.GetSupplementalGroups()),
 		)
 	case runtime.SupplementalGroupsPolicy_Strict:

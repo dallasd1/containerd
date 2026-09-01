@@ -190,6 +190,7 @@ func (c *criService) CreateContainer(ctx context.Context, r *runtime.CreateConta
 			sandbox:               &sandbox,
 			sandboxID:             sandboxID,
 			imageID:               image.ID,
+			imageChainID:          image.ChainID,
 			containerConfig:       config,
 			imageConfig:           &image.ImageSpec.Config,
 			podSandboxConfig:      sandboxConfig,
@@ -215,6 +216,7 @@ type createContainerRequest struct {
 	sandbox               *sandbox.Sandbox
 	sandboxID             string
 	imageID               string
+	imageChainID          string
 	containerConfig       *runtime.ContainerConfig
 	imageConfig           *imagespec.ImageConfig
 	podSandboxConfig      *runtime.PodSandboxConfig
@@ -399,7 +401,7 @@ func (c *criService) createContainer(r *createContainerRequest) (_ string, retEr
 		}
 	}()
 
-	specOpts, err := c.platformSpecOpts(platform, r.containerConfig, r.imageConfig)
+	specOpts, err := c.platformSpecOpts(platform, r.containerConfig, r.imageConfig, r.imageChainID)
 	if err != nil {
 		return "", fmt.Errorf("failed to get container spec opts: %w", err)
 	}
@@ -585,6 +587,7 @@ func (c *criService) platformSpecOpts(
 	platform imagespec.Platform,
 	config *runtime.ContainerConfig,
 	imageConfig *imagespec.ImageConfig,
+	imageChainID string,
 ) ([]oci.SpecOpts, error) {
 	var specOpts []oci.SpecOpts
 
@@ -618,7 +621,7 @@ func (c *criService) platformSpecOpts(
 
 	// Now grab the truly platform specific options (seccomp, apparmor etc. for linux
 	// for example).
-	ctrSpecOpts, err := c.containerSpecOpts(config, imageConfig)
+	ctrSpecOpts, err := c.containerSpecOpts(config, imageConfig, imageChainID)
 	if err != nil {
 		return nil, err
 	}

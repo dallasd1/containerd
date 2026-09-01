@@ -26,7 +26,7 @@ import (
 	"github.com/containerd/containerd/v2/pkg/oci"
 )
 
-func (c *criService) containerSpecOpts(config *runtime.ContainerConfig, imageConfig *imagespec.ImageConfig) ([]oci.SpecOpts, error) {
+func (c *criService) containerSpecOpts(config *runtime.ContainerConfig, imageConfig *imagespec.ImageConfig, imageChainID string) ([]oci.SpecOpts, error) {
 	return []oci.SpecOpts{}, nil
 }
 

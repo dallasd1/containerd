@@ -161,6 +161,9 @@ type criService struct {
 	runtimeHandlers map[string]*runtime.RuntimeHandler
 	// runtimeFeatures container runtime features info
 	runtimeFeatures *runtime.RuntimeFeatures
+	// supplementalGroupsCache avoids mounting an immutable image rootfs for
+	// every container that uses SupplementalGroupsPolicy=Merge.
+	supplementalGroupsCache supplementalGroupsCache
 }
 
 type CRIServiceOptions struct {

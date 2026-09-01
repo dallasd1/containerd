@@ -23,6 +23,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 
 	imagespec "github.com/opencontainers/image-spec/specs-go/v1"
@@ -30,6 +31,7 @@ import (
 	runtime "k8s.io/cri-api/pkg/apis/runtime/v1"
 
 	"github.com/containerd/containerd/v2/core/containers"
+	"github.com/containerd/containerd/v2/core/snapshots"
 	"github.com/containerd/containerd/v2/internal/cri/util"
 	"github.com/containerd/containerd/v2/pkg/oci"
 )
@@ -160,6 +162,111 @@ func WithAdditionalGIDs(userstr string) oci.SpecOpts {
 		s.Process.User.AdditionalGids = mergeGids(s.Process.User.AdditionalGids, gids)
 		return nil
 	}
+}
+
+type SupplementalGroupsCacheKey struct {
+	Snapshotter string
+	ChainID     string
+	User        string
+	PrimaryGID  uint32
+}
+
+type SupplementalGroupsCache interface {
+	Resolve(
+		ctx context.Context,
+		key SupplementalGroupsCacheKey,
+		resolver func(context.Context) ([]uint32, error),
+	) ([]uint32, error)
+}
+
+// WithCachedAdditionalGIDs resolves image-defined supplemental groups from the
+// immutable committed image snapshot. lookupUsername is set only when the user
+// was selected by name; otherwise the effective UID in the current spec is used.
+func WithCachedAdditionalGIDs(cache SupplementalGroupsCache, chainID, lookupUsername string) oci.SpecOpts {
+	return func(ctx context.Context, client oci.Client, c *containers.Container, s *runtimespec.Spec) error {
+		if s.Process == nil {
+			s.Process = &runtimespec.Process{}
+		}
+		lookupUser := lookupUsername
+		if lookupUser == "" {
+			lookupUser = strconv.FormatUint(uint64(s.Process.User.UID), 10)
+		}
+
+		resolveFrom := func(container *containers.Container, spec *runtimespec.Spec) error {
+			existing := append([]uint32(nil), s.Process.User.AdditionalGids...)
+			if err := oci.WithAdditionalGIDs(lookupUser)(ctx, client, container, spec); err != nil {
+				return err
+			}
+			resolved := append([]uint32(nil), spec.Process.User.AdditionalGids...)
+			s.Process.User.AdditionalGids = mergeGids(existing, []uint32{s.Process.User.GID})
+			s.Process.User.AdditionalGids = mergeGids(s.Process.User.AdditionalGids, withoutGID(resolved, spec.Process.User.GID))
+			return nil
+		}
+
+		if cache == nil || chainID == "" || c.Snapshotter == "" || c.SnapshotKey == "" || client == nil {
+			return resolveFrom(c, s)
+		}
+		snapshotter := client.SnapshotService(c.Snapshotter)
+		if snapshotter == nil {
+			return resolveFrom(c, s)
+		}
+		info, err := snapshotter.Stat(ctx, chainID)
+		if err != nil || info.Kind != snapshots.KindCommitted {
+			return resolveFrom(c, s)
+		}
+
+		key := SupplementalGroupsCacheKey{
+			Snapshotter: c.Snapshotter,
+			ChainID:     chainID,
+			User:        lookupUser,
+			PrimaryGID:  s.Process.User.GID,
+		}
+		imageGIDs, err := cache.Resolve(ctx, key, func(resolveCtx context.Context) (gids []uint32, retErr error) {
+			viewKey := "supplemental-groups-" + util.GenerateID()
+			if _, err := snapshotter.View(resolveCtx, viewKey, chainID); err != nil {
+				return nil, fmt.Errorf("create immutable image view for supplemental groups: %w", err)
+			}
+			defer func() {
+				if err := snapshotter.Remove(context.WithoutCancel(resolveCtx), viewKey); err != nil {
+					retErr = errors.Join(retErr, fmt.Errorf("remove supplemental groups image view %q: %w", viewKey, err))
+				}
+			}()
+
+			imageContainer := *c
+			imageContainer.SnapshotKey = viewKey
+			probe := &runtimespec.Spec{
+				Process: &runtimespec.Process{
+					User: runtimespec.User{
+						UID: s.Process.User.UID,
+						GID: s.Process.User.GID,
+					},
+				},
+				Linux:   s.Linux,
+				Windows: s.Windows,
+			}
+			if err := oci.WithAdditionalGIDs(lookupUser)(resolveCtx, client, &imageContainer, probe); err != nil {
+				return nil, err
+			}
+			return withoutGID(probe.Process.User.AdditionalGids, probe.Process.User.GID), nil
+		})
+		if err != nil {
+			return fmt.Errorf("resolve supplemental groups from image snapshot %s: %w", chainID, err)
+		}
+
+		s.Process.User.AdditionalGids = mergeGids(s.Process.User.AdditionalGids, []uint32{s.Process.User.GID})
+		s.Process.User.AdditionalGids = mergeGids(s.Process.User.AdditionalGids, imageGIDs)
+		return nil
+	}
+}
+
+func withoutGID(gids []uint32, excluded uint32) []uint32 {
+	filtered := make([]uint32, 0, len(gids))
+	for _, gid := range gids {
+		if gid != excluded {
+			filtered = append(filtered, gid)
+		}
+	}
+	return filtered
 }
 
 func mergeGids(gids1, gids2 []uint32) []uint32 {

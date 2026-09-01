@@ -1173,7 +1173,7 @@ additional-group-for-root:x:22222:root
 			require.NoError(t, err)
 
 			spec.Root.Path = tempRootDir // simulating /etc/{passwd, group}
-			opts, err := c.platformSpecOpts(platforms.DefaultSpec(), containerConfig, imageConfig)
+			opts, err := c.platformSpecOpts(platforms.DefaultSpec(), containerConfig, imageConfig, "")
 			require.NoError(t, err)
 			oci.ApplyOpts(ctx, nil, testContainer, spec, opts...)
 
