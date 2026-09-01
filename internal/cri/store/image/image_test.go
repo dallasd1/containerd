@@ -316,3 +316,55 @@ func TestImageStore(t *testing.T) {
 		})
 	}
 }
+
+func TestImageStoreRefreshesSnapshotters(t *testing.T) {
+	const (
+		id  = "sha256:1123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+		ref = "containerd.io/ref-1"
+	)
+
+	for _, test := range []struct {
+		name    string
+		pinned  bool
+		initial map[string]struct{}
+	}{
+		{
+			name:    "unpinned image",
+			initial: map[string]struct{}{"overlayfs": {}},
+		},
+		{
+			name:    "pinned image drops stale snapshotter",
+			pinned:  true,
+			initial: map[string]struct{}{"overlayfs": {}, "erofs": {}},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			assert := assertlib.New(t)
+			s, err := NewFakeStore([]Image{{
+				ID:           id,
+				ChainID:      "test-chain-id-1",
+				References:   []string{ref},
+				Size:         10,
+				Pinned:       test.pinned,
+				Snapshotters: test.initial,
+			}})
+			assert.NoError(err)
+
+			updated := Image{
+				ID:           id,
+				ChainID:      "test-chain-id-1",
+				References:   []string{ref},
+				Size:         10,
+				Pinned:       test.pinned,
+				Snapshotters: map[string]struct{}{"erofs": {}},
+			}
+			assert.NoError(s.update(ref, &updated))
+
+			got, err := s.Get(id)
+			assert.NoError(err)
+			assert.Equal(map[string]struct{}{"erofs": {}}, got.Snapshotters)
+			assert.Equal(test.pinned, got.Pinned)
+			assert.Equal(test.pinned, s.store.isPinned(id, ref))
+		})
+	}
+}

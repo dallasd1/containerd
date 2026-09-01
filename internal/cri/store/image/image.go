@@ -133,7 +133,14 @@ func (s *Store) update(ref string, img *Image) error {
 	}
 	if oldExist {
 		if oldID == img.ID {
-			if s.store.isPinned(img.ID, ref) == img.Pinned {
+			wasPinned := s.store.isPinned(img.ID, ref)
+			// Unpacking into another snapshotter updates the config labels
+			// without changing the image ID. Refresh that cached metadata
+			// before taking the pin-only fast path.
+			if err := s.store.add(*img); err != nil {
+				return err
+			}
+			if wasPinned == img.Pinned {
 				return nil
 			}
 			if img.Pinned {
@@ -274,6 +281,7 @@ func (s *store) add(img Image) error {
 	// Or else, merge and sort the references.
 	i.References = docker.Sort(util.MergeStringSlices(i.References, img.References))
 	i.Pinned = i.Pinned || img.Pinned
+	i.Snapshotters = img.Snapshotters
 	s.images[img.ID] = i
 	return nil
 }
