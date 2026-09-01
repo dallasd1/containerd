@@ -178,6 +178,11 @@ func sharedLayerMountOptions(opts []string, selinuxEnabled bool, sharedLayerCont
 // returned device has been mounted or rolled back. Returning while the device is
 // merely created is exactly the zero-open window described on the mutex.
 func openOrReuseDmverityDevice(ctx context.Context, source, deviceName string, metadata *dmverity.DmverityMetadata) (string, error) {
+	signatureFile, err := requiredDmveritySignature(source)
+	if err != nil {
+		return "", err
+	}
+
 	devicePath := dmverity.DevicePath(deviceName)
 	if _, err := os.Stat(devicePath); !os.IsNotExist(err) {
 		// Device-mapper names are host-global while snapshot IDs are only
@@ -191,13 +196,7 @@ func openOrReuseDmverityDevice(ctx context.Context, source, deviceName string, m
 		return devicePath, nil
 	}
 
-	// Use signature file if it exists (written by the differ during Apply)
-	signatureFile := dmverity.SignaturePath(source)
-	if _, err := os.Stat(signatureFile); err != nil {
-		signatureFile = ""
-	} else {
-		log.G(ctx).WithField("root_hash", metadata.RootHash).Info("Using signature for dm-verity")
-	}
+	log.G(ctx).WithField("root_hash", metadata.RootHash).Info("Using signature for dm-verity")
 
 	log.G(ctx).WithFields(log.Fields{
 		"source":      source,
@@ -206,7 +205,7 @@ func openOrReuseDmverityDevice(ctx context.Context, source, deviceName string, m
 	}).Debug("opening dm-verity device")
 
 	hashDevice := dmverity.ResolveHashDevice(source, metadata)
-	devicePath, err := dmverity.OpenWithSignature(source, deviceName, hashDevice, metadata.RootHash, metadata.HashOffset, nil, signatureFile)
+	devicePath, err = dmverity.OpenWithSignature(source, deviceName, hashDevice, metadata.RootHash, metadata.HashOffset, nil, signatureFile)
 	if err != nil {
 		return "", fmt.Errorf("failed to open dm-verity device: %w", err)
 	}
@@ -227,6 +226,18 @@ func openOrReuseDmverityDevice(ctx context.Context, source, deviceName string, m
 
 	log.G(ctx).WithField("device", devicePath).Info("dm-verity device created successfully")
 	return devicePath, nil
+}
+
+func requiredDmveritySignature(source string) (string, error) {
+	signatureFile := dmverity.SignaturePath(source)
+	info, err := os.Stat(signatureFile)
+	if err != nil {
+		return "", fmt.Errorf("layer %q has dm-verity metadata but no usable signature: %w", source, err)
+	}
+	if !info.Mode().IsRegular() || info.Size() == 0 {
+		return "", fmt.Errorf("layer %q has dm-verity metadata but signature %q is not a non-empty regular file", source, signatureFile)
+	}
+	return signatureFile, nil
 }
 
 func (h *erofsMountHandler) Mount(ctx context.Context, m mount.Mount, mp string, _ []mount.ActiveMount) (mount.ActiveMount, error) {

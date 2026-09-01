@@ -63,9 +63,16 @@ func MetadataPath(layerBlobPath string) string {
 }
 
 // SignaturePath returns the path to the dm-verity signature file for a layer.
-// The signature file contains the base64-encoded PKCS7 signature for root hash verification.
+// The signature file contains the decoded PKCS7 signature for root hash verification.
 func SignaturePath(layerBlobPath string) string {
 	return layerBlobPath + ".sig"
+}
+
+// SignatureRequiredPath returns the marker path used to distinguish protected
+// materializations from legacy unsigned layers that were formatted with
+// dm-verity metadata before signatures became the activation gate.
+func SignatureRequiredPath(layerBlobPath string) string {
+	return layerBlobPath + ".sig-required"
 }
 
 // HashDevicePath returns the path used for a separate precomputed Merkle tree.
@@ -73,7 +80,7 @@ func HashDevicePath(layerBlobPath string) string {
 	return layerBlobPath + ".hashtree"
 }
 
-// WriteSignature writes a base64-encoded signature to the signature file for a layer.
+// WriteSignature decodes and writes a base64-encoded signature for a layer.
 func WriteSignature(layerBlobPath string, base64Sig string) error {
 	sigPath := SignaturePath(layerBlobPath)
 	sigBytes, err := base64.StdEncoding.DecodeString(base64Sig)
@@ -82,6 +89,9 @@ func WriteSignature(layerBlobPath string, base64Sig string) error {
 	}
 	if err := os.WriteFile(sigPath, sigBytes, 0644); err != nil {
 		return fmt.Errorf("failed to write signature file: %w", err)
+	}
+	if err := os.WriteFile(SignatureRequiredPath(layerBlobPath), []byte("1\n"), 0644); err != nil {
+		return fmt.Errorf("failed to write signature-required marker: %w", err)
 	}
 	return nil
 }

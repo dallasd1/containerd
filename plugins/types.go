@@ -113,4 +113,11 @@ const (
 	// dm-verity referrer artifacts and by a snapshotter that can mount their
 	// signed result. Pull and deferred-unpack paths require both sides.
 	CapabilityDmverityReferrers = "dmverity-referrers"
+	// CapabilityErofsLayers is advertised by snapshotters whose snapshots are
+	// materialized as EROFS layers, independent of dm-verity mode.
+	CapabilityErofsLayers = "erofs-layers"
+	// CapabilityDmveritySignaturesRequired is advertised by a differ that
+	// rejects unsigned layers and by a snapshotter configured to reject
+	// unprotected EROFS mounts.
+	CapabilityDmveritySignaturesRequired = "dmverity-signatures-required"
 )

@@ -45,16 +45,26 @@ func TestValidateDmverityApply(t *testing.T) {
 		wantError bool
 	}{
 		{
-			name:      "no capable differ",
-			service:   local{orderedNames: []string{"walking"}},
+			name: "configured without capable ordered differ",
+			service: local{
+				orderedNames:       []string{"walking"},
+				dmverityConfigured: true,
+			},
 			mounts:    erofsMounts,
 			wantError: true,
 		},
 		{
+			name:      "feature disabled ignores annotations",
+			service:   local{orderedNames: []string{"walking"}},
+			mounts:    erofsMounts,
+			wantError: false,
+		},
+		{
 			name: "capable differ is not first",
 			service: local{
-				orderedNames:    []string{"walking", "erofs"},
-				dmverityCapable: []string{"erofs"},
+				orderedNames:       []string{"walking", "erofs"},
+				dmverityCapable:    []string{"erofs"},
+				dmverityConfigured: true,
 			},
 			mounts:    erofsMounts,
 			wantError: true,
@@ -62,8 +72,9 @@ func TestValidateDmverityApply(t *testing.T) {
 		{
 			name: "capable differ is first",
 			service: local{
-				orderedNames:    []string{"erofs", "walking"},
-				dmverityCapable: []string{"erofs"},
+				orderedNames:       []string{"erofs", "walking"},
+				dmverityCapable:    []string{"erofs"},
+				dmverityConfigured: true,
 			},
 			mounts: erofsMounts,
 		},

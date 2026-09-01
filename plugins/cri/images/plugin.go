@@ -112,46 +112,49 @@ func init() {
 				}
 				snapshotters[name] = struct{}{}
 			}
-			var dmveritySnapshotter string
+			var dmveritySnapshotters, requiredSnapshotters, erofsSnapshotters []string
 			for name := range snapshotters {
-				if p := ic.Plugins().Get(plugins.SnapshotPlugin, name); p != nil &&
-					slices.Contains(p.Meta.Capabilities, plugins.CapabilityDmverityReferrers) {
-					dmveritySnapshotter = name
-					break
+				p := ic.Plugins().Get(plugins.SnapshotPlugin, name)
+				if p == nil {
+					continue
+				}
+				if slices.Contains(p.Meta.Capabilities, plugins.CapabilityErofsLayers) {
+					erofsSnapshotters = append(erofsSnapshotters, name)
+				}
+				if slices.Contains(p.Meta.Capabilities, plugins.CapabilityDmverityReferrers) {
+					dmveritySnapshotters = append(dmveritySnapshotters, name)
+				}
+				if slices.Contains(p.Meta.Capabilities, plugins.CapabilityDmveritySignaturesRequired) {
+					requiredSnapshotters = append(requiredSnapshotters, name)
 				}
 			}
-			if dmveritySnapshotter != "" && !dmverityDifferAvailable {
-				return nil, fmt.Errorf(
-					"snapshotter %q enables dm-verity referrers but no capable differ is available",
-					dmveritySnapshotter,
-				)
-			}
-			if dmveritySnapshotter != "" {
-				config.EnableDmverityReferrers = true
-				log.G(ic.Context).Debugf(
-					"enabling dm-verity referrer discovery for snapshotter %q",
-					dmveritySnapshotter,
-				)
-			}
+			slices.Sort(dmveritySnapshotters)
+			slices.Sort(requiredSnapshotters)
+			slices.Sort(erofsSnapshotters)
 
-			// Local pulls and first-use unpack after a fetch-only transfer both
-			// apply layers through the diff service. Require its first applier
-			// to consume dm-verity artifacts; a merely loaded capable differ is
-			// insufficient because an earlier walking differ can consume the
-			// layer without verification.
-			if config.EnableDmverityReferrers {
+			if dmverityDifferAvailable || len(requiredSnapshotters) > 0 {
 				ds, err := ic.GetByID(plugins.ServicePlugin, services.DiffService)
 				if err != nil {
-					return nil, fmt.Errorf("dm-verity referrer discovery is enabled but the diff service is unavailable: %w", err)
+					return nil, fmt.Errorf("validate dm-verity diff service: %w", err)
 				}
 				reporter, ok := ds.(interface {
 					DmverityAppliers() (ordered []string, capable []string)
 				})
 				if !ok {
-					return nil, fmt.Errorf("dm-verity referrer discovery is enabled but the diff service cannot report applier capabilities")
+					return nil, fmt.Errorf("diff service cannot report dm-verity applier capabilities")
 				}
 				ordered, capable := reporter.DmverityAppliers()
-				if len(capable) == 0 {
+				selectedCapable := len(ordered) > 0 && len(capable) > 0 && ordered[0] == capable[0]
+
+				if len(requiredSnapshotters) > 0 && !selectedCapable {
+					return nil, fmt.Errorf(
+						"snapshotter(s) [%s] require dm-verity signatures but the diff service applier chain [%s] "+
+							"cannot materialize protected layers",
+						strings.Join(requiredSnapshotters, ", "),
+						strings.Join(ordered, ", "),
+					)
+				}
+				if dmverityDifferAvailable && len(dmveritySnapshotters) > 0 && !selectedCapable {
 					return nil, fmt.Errorf(
 						"dm-verity referrer discovery is enabled but the diff service applier chain [%s] "+
 							"cannot consume dm-verity artifacts during local or deferred unpack; add a "+
@@ -159,11 +162,30 @@ func init() {
 							"[plugins.\"io.containerd.service.v1.diff-service\"] default",
 						strings.Join(ordered, ", "))
 				}
-				if ordered[0] != capable[0] {
-					return nil, fmt.Errorf(
-						"dm-verity capable differ %q must be first in the diff service order [%s] "+
-							"so local and deferred unpack cannot bypass dm-verity verification",
-						capable[0], strings.Join(ordered, ", "))
+				if requiredReporter, ok := ds.(interface {
+					DmveritySignaturesRequired() bool
+				}); ok && requiredReporter.DmveritySignaturesRequired() {
+					var incompatible []string
+					for _, name := range erofsSnapshotters {
+						p := ic.Plugins().Get(plugins.SnapshotPlugin, name)
+						if p == nil || !slices.Contains(p.Meta.Capabilities, plugins.CapabilityDmveritySignaturesRequired) {
+							incompatible = append(incompatible, name)
+						}
+					}
+					if len(incompatible) > 0 {
+						return nil, fmt.Errorf(
+							"dm-verity signatures are required but EROFS snapshotter(s) [%s] permit plain mounts; "+
+								"set dmverity_mode = \"on\"",
+							strings.Join(incompatible, ", "),
+						)
+					}
+				}
+				if dmverityDifferAvailable && len(dmveritySnapshotters) > 0 {
+					config.EnableDmverityReferrers = true
+					log.G(ic.Context).Debugf(
+						"enabling dm-verity referrer discovery for snapshotter(s) [%s]",
+						strings.Join(dmveritySnapshotters, ", "),
+					)
 				}
 			}
 

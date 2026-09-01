@@ -23,7 +23,7 @@ func TestDmverityReferrersEnabled(t *testing.T) {
 		mode string
 		want bool
 	}{
-		{mode: "", want: false},
+		{mode: "", want: true},
 		{mode: "off", want: false},
 		{mode: "auto", want: true},
 		{mode: "on", want: true},

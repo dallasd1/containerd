@@ -323,9 +323,9 @@ func (i *image) Unpack(ctx context.Context, snapshotterName string, opts ...Unpa
 	if err != nil {
 		return err
 	}
-	capabilities, err := i.client.GetSnapshotterCapabilities(ctx, snapshotterName)
+	capabilities, err := i.client.GetUnpackSnapshotterCapabilities(ctx, snapshotterName)
 	if err != nil {
-		return err
+		return fmt.Errorf("validate dm-verity unpack configuration: %w", err)
 	}
 
 	manifestDesc, manifest, err := images.ManifestWithDescriptor(ctx, i.ContentStore(), i.i.Target, i.platform)
@@ -377,6 +377,16 @@ func (i *image) Unpack(ctx context.Context, snapshotterName string, opts ...Unpa
 			snapshotters.TargetManifestDigestLabel: i.Target().Digest.String(),
 			snapshotters.TargetRefLabel:            i.Name(),
 		}))
+		if slices.Contains(capabilities, plugins.CapabilityDmverityReferrers) {
+			materializationLabels, err := snapshotters.DmveritySnapshotLabels(
+				layer.Blob,
+				slices.Contains(capabilities, plugins.CapabilityDmveritySignaturesRequired),
+			)
+			if err != nil {
+				return fmt.Errorf("validate dm-verity policy for layer %s: %w", layer.Blob.Digest, err)
+			}
+			snOpts = append(snOpts, snapshots.WithLabels(materializationLabels))
+		}
 		unpacked, err = rootfs.ApplyLayerWithOpts(ctx, layer, chain, sn, a, snOpts, config.ApplyOpts)
 		if err != nil {
 			return fmt.Errorf("apply layer error for %q: %w", i.Name(), err)

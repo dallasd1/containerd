@@ -55,7 +55,7 @@ type erofsDiff struct {
 	// enableTarIndex enables generating tar index for tar content
 	// instead of fully converting the tar to EROFS format
 	enableTarIndex bool
-	// enableDmverity enables formatting layers with dm-verity after creation
+	// enableDmverity enables consuming signed dm-verity layer metadata.
 	enableDmverity bool
 	// requireSignatures requires dm-verity signatures to be present on layers
 	// when dm-verity is enabled. If true, Apply will fail if a layer lacks a signature.
@@ -79,7 +79,7 @@ func WithTarIndexMode() DifferOpt {
 	}
 }
 
-// WithDmverity enables dm-verity formatting for EROFS layers
+// WithDmverity enables dm-verity for layers carrying signed metadata.
 func WithDmverity() DifferOpt {
 	return func(d *erofsDiff) {
 		d.enableDmverity = true
@@ -168,6 +168,10 @@ func (s erofsDiff) Apply(ctx context.Context, desc ocispec.Descriptor, mounts []
 	defer ra.Close()
 
 	layerBlobPath := path.Join(layer, "layer.erofs")
+	useDmverity, err := s.dmverityForLayer(desc)
+	if err != nil {
+		return emptyDesc, err
+	}
 	if native {
 		f, err := os.Create(layerBlobPath)
 		if err != nil {
@@ -178,11 +182,10 @@ func (s erofsDiff) Apply(ctx context.Context, desc ocispec.Descriptor, mounts []
 		if err != nil {
 			return emptyDesc, err
 		}
-		// A native EROFS layer is written to disk verbatim, but it is still a
-		// layer the dm-verity policy applies to. Skipping the block below would
-		// let a registry opt out of integrity and signature enforcement purely
-		// by publishing its layers with an EROFS media type.
-		if s.enableDmverity {
+		// Native EROFS layers follow the same signed-metadata policy as tar
+		// layers. A valid signature still covers the root hash computed from
+		// the native blob; an unsigned layer remains ordinary EROFS.
+		if useDmverity {
 			rootHash, err := s.formatDmverityLayer(ctx, layerBlobPath)
 			if err != nil {
 				return emptyDesc, fmt.Errorf("failed to format dm-verity layer: %w", err)
@@ -210,14 +213,16 @@ func (s erofsDiff) Apply(ctx context.Context, desc ocispec.Descriptor, mounts []
 		r: io.TeeReader(processor, digester.Hash()),
 	}
 
-	if used, err := s.applyPrecomputedArtifacts(ctx, desc, layerBlobPath, rc); err != nil {
-		return emptyDesc, err
-	} else if used {
-		return ocispec.Descriptor{
-			MediaType: ocispec.MediaTypeImageLayer,
-			Size:      rc.c,
-			Digest:    digester.Digest(),
-		}, nil
+	if useDmverity {
+		if used, err := s.applyPrecomputedArtifacts(ctx, desc, layerBlobPath, rc); err != nil {
+			return emptyDesc, err
+		} else if used {
+			return ocispec.Descriptor{
+				MediaType: ocispec.MediaTypeImageLayer,
+				Size:      rc.c,
+				Digest:    digester.Digest(),
+			}, nil
+		}
 	}
 
 	// Choose between tar index or tar conversion mode
@@ -244,8 +249,10 @@ func (s erofsDiff) Apply(ctx context.Context, desc ocispec.Descriptor, mounts []
 		return emptyDesc, err
 	}
 
-	// Format with dm-verity if enabled
-	if s.enableDmverity {
+	// Locally format only a layer carrying signed dm-verity metadata. Merely
+	// enabling referrer support must not impose mapper overhead on unsigned
+	// images.
+	if useDmverity {
 		rootHash, err := s.formatDmverityLayer(ctx, layerBlobPath)
 		if err != nil {
 			return emptyDesc, fmt.Errorf("failed to format dm-verity layer: %w", err)
@@ -261,6 +268,17 @@ func (s erofsDiff) Apply(ctx context.Context, desc ocispec.Descriptor, mounts []
 		Size:      rc.c,
 		Digest:    digester.Digest(),
 	}, nil
+}
+
+func (s erofsDiff) dmverityForLayer(desc ocispec.Descriptor) (bool, error) {
+	if !s.enableDmverity {
+		return false, nil
+	}
+	labels, err := snpkg.DmveritySnapshotLabels(desc, s.requireSignatures)
+	if err != nil {
+		return false, err
+	}
+	return labels[snpkg.DmverityMaterializationStateLabel] == snpkg.DmverityMaterializationStateSigned, nil
 }
 
 func (s erofsDiff) writeLayerSignature(ctx context.Context, desc ocispec.Descriptor, layerBlobPath, actualRootHash string) error {

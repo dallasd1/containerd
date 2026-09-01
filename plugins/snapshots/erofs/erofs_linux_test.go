@@ -371,7 +371,12 @@ func createDmverityMetadata(t *testing.T, layerBlob string) {
 	metadataPath := layerBlob + ".dmverity"
 	err := os.WriteFile(metadataPath, []byte(testDmverityMetadata), 0644)
 	require.NoError(t, err)
-	t.Cleanup(func() { os.Remove(metadataPath) })
+	signaturePath := dmverity.SignaturePath(layerBlob)
+	require.NoError(t, os.WriteFile(signaturePath, []byte("signature"), 0644))
+	t.Cleanup(func() {
+		os.Remove(metadataPath)
+		os.Remove(signaturePath)
+	})
 }
 
 // Helper to create a test layer blob file
@@ -400,7 +405,7 @@ func TestCreateErofsMount(t *testing.T) {
 		assert.Equal(t, "erofs", m.Type)
 		assert.Equal(t, layerBlob, m.Source)
 		// No X-containerd.dmverity option needed since no .dmverity metadata exists
-		assert.Equal(t, []string{"ro", "loop"}, m.Options)
+		assert.Equal(t, []string{"ro", "loop", "X-containerd.dmverity=off"}, m.Options)
 	})
 
 	t.Run("always returns erofs mount type", func(t *testing.T) {
@@ -436,31 +441,26 @@ func TestCreateErofsMount(t *testing.T) {
 	})
 }
 
-// TestDmverityEndToEnd tests the full workflow: differ creates dm-verity layer,
-// snapshotter mounts it via mount manager, and cleanup on removal
-func TestDmverityEndToEnd(t *testing.T) {
+// TestOptionalDmverityUnsignedEndToEnd verifies that enabling dm-verity
+// discovery does not materialize or mount dm-verity for an unsigned image.
+func TestOptionalDmverityUnsignedEndToEnd(t *testing.T) {
 	testutil.RequiresRoot(t)
 
-	supported, err := dmverity.IsSupported()
-	if err != nil || !supported {
-		t.Skip("dm-verity is not supported on this system")
-	}
-
 	t.Run("with regular mode", func(t *testing.T) {
-		testDmverityEndToEndWithMode(t, false)
+		testOptionalDmverityUnsignedEndToEndWithMode(t, false)
 	})
 
 	tarSupported, err := erofsutils.SupportGenerateFromTar()
 	if err == nil && tarSupported {
 		t.Run("with tar index mode", func(t *testing.T) {
-			testDmverityEndToEndWithMode(t, true)
+			testOptionalDmverityUnsignedEndToEndWithMode(t, true)
 		})
 	} else {
 		t.Logf("Skipping tar index mode test: mkfs.erofs does not support tar mode")
 	}
 }
 
-func testDmverityEndToEndWithMode(t *testing.T, useTarIndex bool) {
+func testOptionalDmverityUnsignedEndToEndWithMode(t *testing.T, useTarIndex bool) {
 	ctx := context.Background()
 	ctx = namespaces.WithNamespace(ctx, "test")
 	tempDir := t.TempDir()
@@ -486,7 +486,7 @@ func testDmverityEndToEndWithMode(t *testing.T, useTarIndex bool) {
 	differ := erofsdiffer.NewErofsDiffer(contentStore, differOpts...)
 
 	snapshotRoot := filepath.Join(tempDir, "snapshots")
-	sn, err := NewSnapshotter(snapshotRoot, WithDmverityMode("on"))
+	sn, err := NewSnapshotter(snapshotRoot, WithDmverityMode("auto"))
 	require.NoError(t, err)
 	defer sn.Close()
 
@@ -536,19 +536,19 @@ func testDmverityEndToEndWithMode(t *testing.T, useTarIndex bool) {
 	})
 	require.NoError(t, err)
 
-	// Differ should create .dmverity metadata alongside layer
+	// The unsigned layer must remain ordinary EROFS even though discovery is
+	// enabled.
 	layerPath := s.layerBlobPath(snapshotID)
-	metadataPath := layerPath + ".dmverity"
-
-	metadataData, err := os.ReadFile(metadataPath)
-	require.NoError(t, err, ".dmverity file should exist")
-	require.NotEmpty(t, metadataData, "metadata should not be empty")
+	_, err = os.Stat(dmverity.MetadataPath(layerPath))
+	assert.ErrorIs(t, err, os.ErrNotExist)
+	_, err = os.Stat(dmverity.SignaturePath(layerPath))
+	assert.ErrorIs(t, err, os.ErrNotExist)
 
 	viewKey := "test-view"
 	viewMounts, err := sn.View(ctx, viewKey, commitKey)
 	require.NoError(t, err)
 
-	// Mount handler (not snapshotter) activates dm-verity
+	// The mount handler receives an ordinary EROFS layer.
 	require.Len(t, viewMounts, 1)
 	assert.Equal(t, "erofs", viewMounts[0].Type)
 	assert.Contains(t, viewMounts[0].Options, "ro")
@@ -567,7 +567,7 @@ func testDmverityEndToEndWithMode(t *testing.T, useTarIndex bool) {
 	require.NotEmpty(t, actualMountPoint, "mount point should be set by EROFS handler")
 
 	testData, err := os.ReadFile(filepath.Join(actualMountPoint, "test-file.txt"))
-	require.NoError(t, err, "should be able to read test file from dm-verity mount")
+	require.NoError(t, err, "should be able to read test file from EROFS mount")
 	assert.Equal(t, testFileContent, string(testData))
 
 	nestedData, err := os.ReadFile(filepath.Join(actualMountPoint, "testdir", "nested.txt"))
@@ -679,6 +679,16 @@ func TestApplyDmverityPolicy(t *testing.T) {
 		assert.Equal(t, "X-containerd.dmverity=off", opt)
 	})
 
+	t.Run("mode off ignores malformed metadata", func(t *testing.T) {
+		malformedLayer := filepath.Join(tmpDir, "malformed.erofs")
+		require.NoError(t, os.WriteFile(dmverity.MetadataPath(malformedLayer), []byte("{"), 0644))
+
+		s := &snapshotter{dmverityMode: "off"}
+		opt, err := s.applyDmverityPolicy(malformedLayer)
+		require.NoError(t, err)
+		assert.Equal(t, "X-containerd.dmverity=off", opt)
+	})
+
 	t.Run("mode on returns dmverity=on when metadata exists", func(t *testing.T) {
 		createDmverityMetadata(t, layerBlob)
 
@@ -701,5 +711,38 @@ func TestApplyDmverityPolicy(t *testing.T) {
 		opt, err := s.applyDmverityPolicy(layerBlob)
 		require.NoError(t, err)
 		assert.Empty(t, opt) // auto mode doesn't add explicit option
+	})
+
+	t.Run("protected metadata without signature fails closed", func(t *testing.T) {
+		metadataPath := dmverity.MetadataPath(layerBlob)
+		require.NoError(t, os.WriteFile(metadataPath, []byte(testDmverityMetadata), 0644))
+		t.Cleanup(func() { os.Remove(metadataPath) })
+		requiredPath := dmverity.SignatureRequiredPath(layerBlob)
+		require.NoError(t, os.WriteFile(requiredPath, []byte("1\n"), 0644))
+		t.Cleanup(func() { os.Remove(requiredPath) })
+
+		s := &snapshotter{dmverityMode: "auto"}
+		_, err := s.applyDmverityPolicy(layerBlob)
+		require.ErrorContains(t, err, "no usable signature")
+	})
+
+	t.Run("legacy unsigned metadata mounts plain in auto mode", func(t *testing.T) {
+		legacyLayer := filepath.Join(tmpDir, "legacy.erofs")
+		require.NoError(t, os.WriteFile(dmverity.MetadataPath(legacyLayer), []byte(testDmverityMetadata), 0644))
+
+		s := &snapshotter{dmverityMode: "auto"}
+		opt, err := s.applyDmverityPolicy(legacyLayer)
+		require.NoError(t, err)
+		assert.Equal(t, "X-containerd.dmverity=off", opt)
+	})
+
+	t.Run("signature without metadata fails closed", func(t *testing.T) {
+		signaturePath := dmverity.SignaturePath(layerBlob)
+		require.NoError(t, os.WriteFile(signaturePath, []byte("signature"), 0644))
+		t.Cleanup(func() { os.Remove(signaturePath) })
+
+		s := &snapshotter{dmverityMode: "auto"}
+		_, err := s.applyDmverityPolicy(layerBlob)
+		require.ErrorContains(t, err, "signature state but no metadata")
 	})
 }

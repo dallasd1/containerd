@@ -76,6 +76,7 @@ func init() {
 			orderedNames := ic.Config.(*config).Order
 			ordered := make([]differ, len(orderedNames))
 			var dmverityCapable []string
+			var dmverityConfigured, dmverityRequired bool
 			for i, n := range orderedNames {
 				d, ok := differs[n]
 				if !ok {
@@ -90,14 +91,26 @@ func init() {
 				if p := ic.Plugins().Get(plugins.DiffPlugin, n); p != nil &&
 					slices.Contains(p.Meta.Capabilities, plugins.CapabilityDmverityReferrers) {
 					dmverityCapable = append(dmverityCapable, n)
+					dmverityConfigured = true
+					if i == 0 && slices.Contains(p.Meta.Capabilities, plugins.CapabilityDmveritySignaturesRequired) {
+						dmverityRequired = true
+					}
+				}
+			}
+			if len(orderedNames) > 0 && len(dmverityCapable) > 0 && orderedNames[0] == dmverityCapable[0] {
+				ic.Meta.Capabilities = append(ic.Meta.Capabilities, plugins.CapabilityDmverityReferrers)
+				if dmverityRequired {
+					ic.Meta.Capabilities = append(ic.Meta.Capabilities, plugins.CapabilityDmveritySignaturesRequired)
 				}
 			}
 
 			return &local{
-				differs:         ordered,
-				orderedNames:    orderedNames,
-				dmverityCapable: dmverityCapable,
-				syncfs:          syncFs,
+				differs:            ordered,
+				orderedNames:       orderedNames,
+				dmverityCapable:    dmverityCapable,
+				dmverityConfigured: dmverityConfigured,
+				dmverityRequired:   dmverityRequired,
+				syncfs:             syncFs,
 			}, nil
 		},
 	})
@@ -111,7 +124,12 @@ type local struct {
 	// dmverityCapable lists the ordered differs that advertise
 	// plugins.CapabilityDmverityReferrers.
 	dmverityCapable []string
-	syncfs          bool
+	// dmverityConfigured distinguishes an opted-out service from an invalid
+	// ordered differ chain. Runtime-only annotations are ignored when the
+	// feature is not configured.
+	dmverityConfigured bool
+	dmverityRequired   bool
+	syncfs             bool
 }
 
 var _ diffapi.DiffClient = &local{}
@@ -126,6 +144,10 @@ var _ diffapi.DiffClient = &local{}
 // Callers use this to bind enforcement to the selected applier instead.
 func (l *local) DmverityAppliers() (ordered []string, capable []string) {
 	return l.orderedNames, l.dmverityCapable
+}
+
+func (l *local) DmveritySignaturesRequired() bool {
+	return l.dmverityRequired
 }
 
 func (l *local) Apply(ctx context.Context, er *diffapi.ApplyRequest, _ ...grpc.CallOption) (*diffapi.ApplyResponse, error) {
@@ -174,6 +196,9 @@ func (l *local) validateDmverityApply(desc ocispec.Descriptor, mounts []mount.Mo
 		desc.Annotations[snapshotters.TargetLayerRootHashLabel] == "" &&
 		desc.Annotations[snapshotters.TargetLayerTarIndexDescriptorLabel] == "" &&
 		desc.Annotations[snapshotters.TargetLayerMerkleTreeDescriptorLabel] == "" {
+		return nil
+	}
+	if !l.dmverityConfigured {
 		return nil
 	}
 	if len(mounts) == 0 {

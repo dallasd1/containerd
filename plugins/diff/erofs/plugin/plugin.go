@@ -39,13 +39,15 @@ type Config struct {
 	// for tar content without extracting the tar
 	EnableTarIndex bool `toml:"enable_tar_index"`
 
-	// EnableDmverity enables dm-verity formatting for EROFS layers
-	// Linux only
+	// EnableDmverity enables discovery and enforcement of signed dm-verity
+	// metadata for EROFS layers. Unsigned layers remain ordinary EROFS unless
+	// RequireSignatures rejects them.
 	EnableDmverity bool `toml:"enable_dmverity"`
 
 	// RequireSignatures requires dm-verity signatures to be present on all layers.
 	// When enabled, layer application will fail if a signature is not present.
-	// Only has effect when EnableDmverity is true.
+	// EnableDmverity must be true and the EROFS snapshotter must use
+	// dmverity_mode = "on", so pre-existing plain snapshots cannot be mounted.
 	RequireSignatures bool `toml:"require_signatures"`
 }
 
@@ -106,6 +108,7 @@ func init() {
 
 				if config.RequireSignatures {
 					opts = append(opts, erofs.WithRequireSignatures())
+					ic.Meta.Capabilities = append(ic.Meta.Capabilities, plugins.CapabilityDmveritySignaturesRequired)
 				}
 
 				// Advertise that this differ consumes dm-verity referrer

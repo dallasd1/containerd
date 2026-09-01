@@ -187,21 +187,38 @@ Go library, eliminating the need for external `veritysetup` command-line tools.
 This requires a Linux kernel with dm-verity support (CONFIG_DM_VERITY) and the
 device-mapper kernel module loaded.
 
-The differ must be configured to generate dm-verity metadata:
+The differ must be configured to discover and consume signed dm-verity
+metadata:
 
 ```toml
 [plugins."io.containerd.differ.v1.erofs"]
   enable_dmverity = true
 ```
 
-When dm-verity is enabled, the EROFS differ formats each layer with dm-verity
-by appending a Merkle hash tree to the EROFS blob and generating a root hash.
-The hash tree is stored inline within the layer blob itself.
-The root hash and hash offset are saved in a `.dmverity` metadata file alongside the
-layer blob in JSON format. All other dm-verity parameters (block sizes, salt, etc.)
-are stored in a superblock within the layer blob and are auto-detected when mounting.
-Regular mode uses 4096-byte blocks (standard page size), while tar-index mode uses
-512-byte blocks (dm-verity logical_block_size constraint).
+When dm-verity is enabled, layers carrying a valid signature and root-hash
+annotation are materialized with dm-verity metadata. A precomputed referrer
+supplies the EROFS tar index and Merkle tree; a signed layer without
+precomputed artifacts is formatted locally and its computed root hash must
+match the signed value. Unsigned layers remain ordinary EROFS unless
+`require_signatures` rejects them.
+
+Protected layers carry a `.dmverity` metadata sidecar, a non-empty `.sig`
+PKCS#7 sidecar, and an internal `.sig-required` marker. The marker lets `auto`
+mode distinguish newly protected materializations from unsigned snapshots
+created by older versions that formatted every layer with dm-verity metadata.
+Incomplete protected materializations fail closed; legacy metadata without a
+signature mounts as plain EROFS during upgrade. Committed snapshots also record
+compact materialization labels (version, root hash, and signature digest). If a
+ChainID was previously unpacked as plain EROFS, a later signed pull will refuse
+to reuse it silently; remove the stale snapshot and pull again.
+
+Locally formatted layers store the hash tree inline within the layer blob. The
+root hash and hash offset are saved in a `.dmverity` metadata file alongside
+the layer blob in JSON format. All other dm-verity parameters (block sizes,
+salt, etc.) are stored in a superblock within the layer blob and are
+auto-detected when mounting. Regular mode uses 4096-byte blocks (standard page
+size), while tar-index mode uses 512-byte blocks (dm-verity
+logical_block_size constraint).
 
 The snapshotter can be configured to control dm-verity behavior using `dmverity_mode`:
 
@@ -224,6 +241,11 @@ The available modes are:
   Layers are mounted as regular EROFS without integrity verification. Use this for
   compatibility or when dm-verity overhead is unacceptable.
 
+If the differ uses `require_signatures = true`, the snapshotter must use
+`dmverity_mode = "on"`. Containerd rejects a configuration that asks the differ
+to require signatures while allowing the snapshotter to mount pre-existing
+plain snapshots.
+
 Discovery of dm-verity referrers (per-layer signatures and precomputed EROFS
 artifacts) requires an extra registry lookup during pull and import, so it is
 performed only when a differ that consumes those artifacts is loaded. The EROFS
@@ -240,7 +262,7 @@ from that capability, so no additional configuration is needed. With
 performed and pull behaves exactly as it does without this feature.
 
 When mounting a layer with dm-verity enabled, the snapshotter reads the metadata
-from the `.dmverity` file and creates a dm-verity device. The dm-verity library
+from the `.dmverity` file, requires its `.sig` sidecar, and creates a dm-verity device. The dm-verity library
 automatically reads all parameters from the superblock, ensuring that any corruption
 or tampering will be detected at read time. The dm-verity device is then mounted as
 the backing layer in the OverlayFS stack
@@ -277,13 +299,15 @@ If dm-verity is enabled, a `.dmverity` metadata file will also be present:
   fs
   layer.erofs
   layer.erofs.dmverity
+  layer.erofs.sig
   work
 ```
 
 Then the EROFS snapshotter will check for the existence of `layer.erofs`: it
 will mount the EROFS layer blob to `fs/` and return a valid overlayfs mount
-with all parent layers. If dm-verity is enabled and the `.dmverity` file exists,
-the snapshotter will create a dm-verity device and mount that instead.
+with all parent layers. If dm-verity is enabled and both protected sidecars
+exist, the snapshotter will create a dm-verity device and mount that instead.
+Missing or malformed protected metadata never falls back to a plain mount.
 
 If other differs (not the EROFS differ) are used, the EROFS snapshotter will
 convert the flat directory into an EROFS layer blob on Commit instead.

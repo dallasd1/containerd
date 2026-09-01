@@ -18,6 +18,7 @@ package erofs
 
 import (
 	"context"
+	"os"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -26,6 +27,35 @@ import (
 
 	"github.com/containerd/containerd/v2/internal/dmverity"
 )
+
+func TestRequiredDmveritySignature(t *testing.T) {
+	layer := filepath.Join(t.TempDir(), "layer.erofs")
+
+	_, err := requiredDmveritySignature(layer)
+	if err == nil {
+		t.Fatal("expected a missing signature to fail")
+	}
+
+	signaturePath := dmverity.SignaturePath(layer)
+	if err := os.WriteFile(signaturePath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err = requiredDmveritySignature(layer)
+	if err == nil {
+		t.Fatal("expected an empty signature to fail")
+	}
+
+	if err := os.WriteFile(signaturePath, []byte("signature"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := requiredDmveritySignature(layer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != signaturePath {
+		t.Fatalf("requiredDmveritySignature() = %q, want %q", got, signaturePath)
+	}
+}
 
 func TestSharedLayerMountOptions(t *testing.T) {
 	const shared = `context="` + defaultSharedLayerContext + `"`

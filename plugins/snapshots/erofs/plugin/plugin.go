@@ -96,9 +96,12 @@ func init() {
 			}
 
 			ic.Meta.Exports[plugins.SnapshotterRootDir] = root
-			ic.Meta.Capabilities = append(ic.Meta.Capabilities, "rebase")
+			ic.Meta.Capabilities = append(ic.Meta.Capabilities, "rebase", plugins.CapabilityErofsLayers)
 			if dmverityReferrersEnabled(config.DmverityMode) {
 				ic.Meta.Capabilities = append(ic.Meta.Capabilities, plugins.CapabilityDmverityReferrers)
+			}
+			if config.DmverityMode == "on" {
+				ic.Meta.Capabilities = append(ic.Meta.Capabilities, plugins.CapabilityDmveritySignaturesRequired)
 			}
 			return erofs.NewSnapshotter(root, opts...)
 		},
@@ -106,5 +109,5 @@ func init() {
 }
 
 func dmverityReferrersEnabled(mode string) bool {
-	return mode == "auto" || mode == "on"
+	return mode == "" || mode == "auto" || mode == "on"
 }

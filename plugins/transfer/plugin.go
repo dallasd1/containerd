@@ -167,18 +167,46 @@ func init() {
 
 				// Referrer discovery requires both the differ that consumes the
 				// artifacts and a snapshotter that mounts the signed result.
-				if dp := ic.Plugins().Get(plugins.DiffPlugin, applierID); dp != nil &&
-					slices.Contains(dp.Meta.Capabilities, plugins.CapabilityDmverityReferrers) &&
-					slices.Contains(snCapabilities, plugins.CapabilityDmverityReferrers) {
-					if !lc.EnableDmverityReferrers {
-						ic.Meta.Capabilities = append(ic.Meta.Capabilities, plugins.CapabilityDmverityReferrers)
+				effectiveSnapshotterCapabilities := snCapabilities
+				if dp := ic.Plugins().Get(plugins.DiffPlugin, applierID); dp != nil {
+					differSupportsDmverity := slices.Contains(dp.Meta.Capabilities, plugins.CapabilityDmverityReferrers)
+					differRequiresDmverity := slices.Contains(dp.Meta.Capabilities, plugins.CapabilityDmveritySignaturesRequired)
+					snapshotterUsesErofs := slices.Contains(snCapabilities, plugins.CapabilityErofsLayers)
+					snapshotterSupportsDmverity := slices.Contains(snCapabilities, plugins.CapabilityDmverityReferrers)
+					snapshotterRequiresDmverity := slices.Contains(snCapabilities, plugins.CapabilityDmveritySignaturesRequired)
+					if differRequiresDmverity && snapshotterUsesErofs && !snapshotterRequiresDmverity {
+						return nil, fmt.Errorf(
+							"differ %q requires dm-verity signatures but snapshotter %q does not require protected mounts; set dmverity_mode = \"on\"",
+							applierID,
+							uc.Snapshotter,
+						)
 					}
-					lc.EnableDmverityReferrers = true
-					log.G(ic.Context).Debugf(
-						"enabling dm-verity referrer discovery for differ %q and snapshotter %q",
-						applierID,
-						uc.Snapshotter,
-					)
+					if snapshotterRequiresDmverity && !differSupportsDmverity {
+						return nil, fmt.Errorf(
+							"snapshotter %q requires dm-verity signatures but differ %q cannot materialize protected layers",
+							uc.Snapshotter,
+							applierID,
+						)
+					}
+					if differSupportsDmverity && snapshotterSupportsDmverity {
+						if !lc.EnableDmverityReferrers {
+							ic.Meta.Capabilities = append(ic.Meta.Capabilities, plugins.CapabilityDmverityReferrers)
+						}
+						lc.EnableDmverityReferrers = true
+						log.G(ic.Context).Debugf(
+							"enabling dm-verity referrer discovery for differ %q and snapshotter %q",
+							applierID,
+							uc.Snapshotter,
+						)
+					} else {
+						effectiveSnapshotterCapabilities = make([]string, 0, len(snCapabilities))
+						for _, capability := range snCapabilities {
+							if capability != plugins.CapabilityDmverityReferrers &&
+								capability != plugins.CapabilityDmveritySignaturesRequired {
+								effectiveSnapshotterCapabilities = append(effectiveSnapshotterCapabilities, capability)
+							}
+						}
+					}
 				}
 
 				// If CheckPlatformSupported is false, we will match all platforms
@@ -191,7 +219,7 @@ func init() {
 					SnapshotterKey:          uc.Snapshotter,
 					Snapshotter:             sn,
 					SnapshotterExports:      snExports,
-					SnapshotterCapabilities: snCapabilities,
+					SnapshotterCapabilities: effectiveSnapshotterCapabilities,
 					Applier:                 applier,
 					ConfigType:              uc.ConfigType,
 					LayerTypes:              uc.LayerTypes,

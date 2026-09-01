@@ -72,9 +72,9 @@ func unpackImage(ctx context.Context, client *containerd.Client, i containerd.Im
 		matcher = platforms.Default()
 	}
 
-	capabilities, err := client.GetSnapshotterCapabilities(ctx, snapshotter)
+	capabilities, err := client.GetUnpackSnapshotterCapabilities(ctx, snapshotter)
 	if err != nil {
-		return err
+		return fmt.Errorf("validate dm-verity unpack configuration: %w", err)
 	}
 
 	u, err := unpack.NewUnpacker(

@@ -239,32 +239,63 @@ func (s *snapshotter) prepareDirectory(ctx context.Context, snapshotDir string, 
 // applyDmverityPolicy validates and applies dm-verity policy for a layer.
 // Returns the X-containerd.dmverity option if needed, or empty string otherwise.
 func (s *snapshotter) applyDmverityPolicy(layerBlob string) (string, error) {
-	// Parse the sidecar rather than just stat'ing it. Existence alone says
-	// nothing about whether the metadata can actually drive a dm-verity
-	// device, so a truncated or malformed file would otherwise satisfy mode
-	// "on" here and then silently degrade to a plain mount in the mount
-	// handler.
-	metadataExists := false
-	if _, err := dmverity.ReadMetadata(layerBlob); err == nil {
-		metadataExists = true
-	} else if !errors.Is(err, os.ErrNotExist) && s.dmverityMode != "off" {
-		return "", fmt.Errorf("layer %s has unusable dm-verity metadata: %w", layerBlob, err)
+	if s.dmverityMode == "off" {
+		return "X-containerd.dmverity=off", nil
 	}
 
-	// Validate dmverityMode policy: mode "on" requires .dmverity metadata to exist
-	if s.dmverityMode == "on" && !metadataExists {
-		return "", fmt.Errorf("dm-verity mode is 'on' but .dmverity metadata not found for layer %s", layerBlob)
+	signaturePath := dmverity.SignaturePath(layerBlob)
+	signatureInfo, signatureErr := os.Stat(signaturePath)
+	switch {
+	case signatureErr == nil && (!signatureInfo.Mode().IsRegular() || signatureInfo.Size() == 0):
+		return "", fmt.Errorf("layer %s has dm-verity signature %s that is not a non-empty regular file", layerBlob, signaturePath)
+	case signatureErr != nil && !errors.Is(signatureErr, os.ErrNotExist):
+		return "", fmt.Errorf("failed to inspect dm-verity signature for layer %s: %w", layerBlob, signatureErr)
 	}
+	signatureExists := signatureErr == nil
 
-	// Only return option if metadata exists and we need to override the default "auto" behavior
-	// This keeps standard EROFS mounts (without dm-verity) unchanged
-	if metadataExists && s.dmverityMode != "auto" {
-		// Mode "off": disables dm-verity even though metadata exists
-		// Mode "on": explicitly enables dm-verity (though "auto" would do the same)
-		return fmt.Sprintf("X-containerd.dmverity=%s", s.dmverityMode), nil
+	requiredPath := dmverity.SignatureRequiredPath(layerBlob)
+	requiredInfo, requiredErr := os.Stat(requiredPath)
+	switch {
+	case requiredErr == nil && (!requiredInfo.Mode().IsRegular() || requiredInfo.Size() == 0):
+		return "", fmt.Errorf("layer %s has invalid signature-required marker %s", layerBlob, requiredPath)
+	case requiredErr != nil && !errors.Is(requiredErr, os.ErrNotExist):
+		return "", fmt.Errorf("failed to inspect signature-required marker for layer %s: %w", layerBlob, requiredErr)
 	}
+	signatureRequired := requiredErr == nil
 
-	return "", nil
+	_, metadataErr := dmverity.ReadMetadata(layerBlob)
+	switch {
+	case metadataErr == nil:
+		if signatureExists {
+			if s.dmverityMode == "on" {
+				return "X-containerd.dmverity=on", nil
+			}
+			return "", nil
+		}
+		if signatureRequired || s.dmverityMode == "on" {
+			return "", fmt.Errorf("layer %s has dm-verity metadata but no usable signature", layerBlob)
+		}
+		// Before signature-gated materialization, optional mode formatted every
+		// layer and left metadata without a signature. Mount those legacy
+		// unsigned layers as plain EROFS during upgrade.
+		return "X-containerd.dmverity=off", nil
+	case errors.Is(metadataErr, os.ErrNotExist):
+		if signatureExists || signatureRequired {
+			return "", fmt.Errorf("layer %s has dm-verity signature state but no metadata", layerBlob)
+		}
+		if s.dmverityMode == "on" {
+			return "", fmt.Errorf("dm-verity mode is 'on' but .dmverity metadata not found for layer %s", layerBlob)
+		}
+		return "", nil
+	default:
+		if signatureExists || signatureRequired || s.dmverityMode == "on" {
+			return "", fmt.Errorf("layer %s has unusable dm-verity metadata: %w", layerBlob, metadataErr)
+		}
+		// A malformed unsigned legacy sidecar cannot drive a mapper, but it is
+		// safe to ignore when optional policy explicitly falls back to plain
+		// EROFS.
+		return "X-containerd.dmverity=off", nil
+	}
 }
 
 // createErofsMount creates a mount specification for an EROFS layer.
