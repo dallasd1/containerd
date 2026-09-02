@@ -170,28 +170,24 @@ func fetchSignatures(ctx context.Context, fetcher remotes.Fetcher, manifestDiges
 		})
 	}
 
-	candidate := newestReferrer(parsed)
+	candidateIndex := newestReferrerIndex(parsed)
 	var selectedInfos map[string]*LayerSignatureInfo
 	var selectedArtifacts []ocispec.Descriptor
-	for _, parsedCandidate := range parsed {
-		infos, artifactDescs, err := parsePrecomputedBundle(
-			ctx,
-			fetcher,
-			parsedCandidate.manifest,
-			imageLayers,
-		)
+	for i := range parsed {
+		infos, artifactDescs, err := parsePrecomputedBundle(&parsed[i].manifest, imageLayers)
 		if err != nil {
 			return nil, nil, nil, fmt.Errorf(
 				"parse precomputed dm-verity bundle %s: %w",
-				parsedCandidate.desc.Digest,
+				parsed[i].desc.Digest,
 				err,
 			)
 		}
-		if parsedCandidate.desc.Digest == candidate.desc.Digest {
+		if i == candidateIndex {
 			selectedInfos = infos
 			selectedArtifacts = artifactDescs
 		}
 	}
+	candidate := parsed[candidateIndex]
 	if selectedInfos == nil {
 		return nil, nil, nil, fmt.Errorf("selected dm-verity bundle %s was not parsed", candidate.desc.Digest)
 	}
@@ -203,20 +199,21 @@ func fetchSignatures(ctx context.Context, fetcher remotes.Fetcher, manifestDiges
 	return selectedInfos, selectedArtifacts, &candidate, nil
 }
 
-func newestReferrer(candidates []referrerWithManifest) referrerWithManifest {
-	newest := candidates[0]
-	for _, candidate := range candidates[1:] {
-		if candidate.createdAt.After(newest.createdAt) {
-			newest = candidate
+func newestReferrerIndex(candidates []referrerWithManifest) int {
+	newest := 0
+	for i := 1; i < len(candidates); i++ {
+		if candidates[i].createdAt.After(candidates[newest].createdAt) {
+			newest = i
 		}
 	}
 	return newest
 }
 
-func parsePrecomputedBundle(ctx context.Context, fetcher remotes.Fetcher, manifest ocispec.Manifest, imageLayers map[string]struct{}) (map[string]*LayerSignatureInfo, []ocispec.Descriptor, error) {
+func parsePrecomputedBundle(manifest *ocispec.Manifest, imageLayers map[string]struct{}) (map[string]*LayerSignatureInfo, []ocispec.Descriptor, error) {
 	infos := make(map[string]*LayerSignatureInfo)
 	var artifactDescs []ocispec.Descriptor
-	for _, layer := range manifest.Layers {
+	for i := range manifest.Layers {
+		layer := &manifest.Layers[i]
 		if layer.Annotations == nil {
 			return nil, nil, fmt.Errorf("bundle layer %s has no annotations", layer.Digest)
 		}
@@ -248,12 +245,20 @@ func parsePrecomputedBundle(ctx context.Context, fetcher remotes.Fetcher, manife
 			if err != nil {
 				return nil, nil, fmt.Errorf("decode signature for layer %s: %w", sourceDigest, err)
 			}
-			blob, err := fetchDescriptor(ctx, fetcher, layer)
-			if err != nil {
-				return nil, nil, fmt.Errorf("fetch signature blob for layer %s: %w", sourceDigest, err)
-			}
-			if !bytes.Equal(blob, signatureBytes) {
-				return nil, nil, fmt.Errorf("signature blob does not match signed annotation for layer %s", sourceDigest)
+			if len(layer.Data) > 0 {
+				if err := verifyDescriptorPayload(*layer, layer.Data); err != nil {
+					return nil, nil, fmt.Errorf("validate embedded signature descriptor for layer %s: %w", sourceDigest, err)
+				}
+				if !bytes.Equal(layer.Data, signatureBytes) {
+					return nil, nil, fmt.Errorf("embedded signature data does not match signed annotation for layer %s", sourceDigest)
+				}
+			} else {
+				if err := verifyDescriptorPayload(*layer, signatureBytes); err != nil {
+					return nil, nil, fmt.Errorf("validate signature descriptor for layer %s: %w", sourceDigest, err)
+				}
+				// Route the verified inline signature through the normal content
+				// handler without another registry fetch.
+				layer.Data = signatureBytes
 			}
 			info := getLayerInfo(infos, sourceDigest)
 			if info.Signature != "" {
@@ -261,16 +266,17 @@ func parsePrecomputedBundle(ctx context.Context, fetcher remotes.Fetcher, manife
 			}
 			info.RootHash = rootHash
 			info.Signature = encodedSignature
+			artifactDescs = append(artifactDescs, *layer)
 		case TarIndexArtifactMediaType, MerkleTreeArtifactMediaType:
 			sourceDigest := layer.Annotations[precomputedSourceLayerAnnotation]
 			if sourceDigest == "" {
 				return nil, nil, fmt.Errorf("precomputed descriptor %s has invalid annotations", layer.Digest)
 			}
-			if err := validatePrecomputedDescriptor(layer); err != nil {
+			if err := validatePrecomputedDescriptor(*layer); err != nil {
 				return nil, nil, err
 			}
 			info := getLayerInfo(infos, sourceDigest)
-			desc := layer
+			desc := *layer
 			if layer.MediaType == TarIndexArtifactMediaType {
 				if info.TarIndex != nil {
 					return nil, nil, fmt.Errorf("duplicate EROFS tar-index descriptor for layer %s", sourceDigest)
@@ -282,7 +288,7 @@ func parsePrecomputedBundle(ctx context.Context, fetcher remotes.Fetcher, manife
 				}
 				info.MerkleTree = &desc
 			}
-			artifactDescs = append(artifactDescs, desc)
+			artifactDescs = append(artifactDescs, *layer)
 		default:
 			return nil, nil, fmt.Errorf("unexpected bundle layer media type %q", layer.MediaType)
 		}
@@ -367,6 +373,23 @@ func fetchDescriptor(ctx context.Context, fetcher remotes.Fetcher, desc ocispec.
 		return nil, fmt.Errorf("descriptor %s digest verification failed", desc.Digest)
 	}
 	return data, nil
+}
+
+func verifyDescriptorPayload(desc ocispec.Descriptor, payload []byte) error {
+	if err := desc.Digest.Validate(); err != nil {
+		return fmt.Errorf("invalid descriptor digest %q: %w", string(desc.Digest), err)
+	}
+	if int64(len(payload)) != desc.Size {
+		return fmt.Errorf("descriptor %s size mismatch: got %d, expected %d", desc.Digest, len(payload), desc.Size)
+	}
+	verifier := desc.Digest.Verifier()
+	if _, err := verifier.Write(payload); err != nil {
+		return fmt.Errorf("hash descriptor %s payload: %w", desc.Digest, err)
+	}
+	if !verifier.Verified() {
+		return fmt.Errorf("descriptor %s digest verification failed", desc.Digest)
+	}
+	return nil
 }
 
 // AppendSignatureHandlerWrapper creates a handler that fetches signatures and
