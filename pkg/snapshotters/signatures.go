@@ -80,6 +80,16 @@ const (
 
 	ociAnnotationCreated = "org.opencontainers.image.created"
 	tarIndexAlignment    = int64(512)
+
+	// Bound re-sign history before fetching manifests from an untrusted
+	// registry. A selected bundle is kept in memory; older valid bundles are
+	// validated and discarded as the scan advances.
+	maxSignatureReferrers     = 64
+	maxSignatureManifestBytes = 4 * maxManifestSize
+	// Tar indexes are normally small and Merkle trees are a fraction of their
+	// data device. Keep a generous finite ceiling so a referrer cannot request
+	// an effectively unbounded auxiliary blob.
+	maxPrecomputedArtifactSize = int64(16 << 30) // 16 GiB
 )
 
 // LayerSignatureInfo contains the signed tar-index artifacts for a layer.
@@ -130,9 +140,42 @@ func fetchSignatures(ctx context.Context, fetcher remotes.Fetcher, manifestDiges
 	if len(referrers) == 0 {
 		return signatures, nil, nil, nil
 	}
-
-	parsed := make([]referrerWithManifest, 0, len(referrers))
+	if len(referrers) > maxSignatureReferrers {
+		return nil, nil, nil, fmt.Errorf(
+			"too many dm-verity referrers for %s: got %d, max %d",
+			manifestDigest,
+			len(referrers),
+			maxSignatureReferrers,
+		)
+	}
+	var manifestBytes int64
 	for _, refDesc := range referrers {
+		if refDesc.Size < 0 || refDesc.Size > maxManifestSize {
+			return nil, nil, nil, fmt.Errorf(
+				"dm-verity manifest descriptor %s size %d out of range (max %d)",
+				refDesc.Digest,
+				refDesc.Size,
+				maxManifestSize,
+			)
+		}
+		if refDesc.Size > maxSignatureManifestBytes-manifestBytes {
+			return nil, nil, nil, fmt.Errorf(
+				"aggregate dm-verity manifest size for %s exceeds maximum %d",
+				manifestDigest,
+				maxSignatureManifestBytes,
+			)
+		}
+		manifestBytes += refDesc.Size
+	}
+
+	var (
+		selected          *referrerWithManifest
+		selectedInfos     map[string]*LayerSignatureInfo
+		selectedArtifacts []ocispec.Descriptor
+	)
+	for _, registryDesc := range referrers {
+		refDesc := withoutExternalURLs(registryDesc)
+
 		manifestData, err := fetchDescriptor(ctx, fetcher, refDesc)
 		if err != nil {
 			return nil, nil, nil, fmt.Errorf("fetch dm-verity manifest %s: %w", refDesc.Digest, err)
@@ -163,53 +206,48 @@ func fetchSignatures(ctx context.Context, fetcher remotes.Fetcher, manifestDiges
 				)
 			}
 		}
-		parsed = append(parsed, referrerWithManifest{
-			desc:      refDesc,
-			manifest:  manifest,
-			createdAt: createdAt,
-		})
-	}
+		manifest.Config = withoutExternalURLs(manifest.Config)
+		for i := range manifest.Layers {
+			manifest.Layers[i] = withoutExternalURLs(manifest.Layers[i])
+		}
 
-	candidateIndex := newestReferrerIndex(parsed)
-	var selectedInfos map[string]*LayerSignatureInfo
-	var selectedArtifacts []ocispec.Descriptor
-	for i := range parsed {
-		infos, artifactDescs, err := parsePrecomputedBundle(&parsed[i].manifest, imageLayers)
+		infos, artifactDescs, err := parsePrecomputedBundle(&manifest, imageLayers)
 		if err != nil {
 			return nil, nil, nil, fmt.Errorf(
 				"parse precomputed dm-verity bundle %s: %w",
-				parsed[i].desc.Digest,
+				refDesc.Digest,
 				err,
 			)
 		}
-		if i == candidateIndex {
+		candidate := referrerWithManifest{
+			desc:      refDesc,
+			manifest:  manifest,
+			createdAt: createdAt,
+		}
+		if selected == nil || candidate.createdAt.After(selected.createdAt) {
+			selected = &candidate
 			selectedInfos = infos
 			selectedArtifacts = artifactDescs
 		}
 	}
-	candidate := parsed[candidateIndex]
-	if selectedInfos == nil {
-		return nil, nil, nil, fmt.Errorf("selected dm-verity bundle %s was not parsed", candidate.desc.Digest)
+	if selected == nil || selectedInfos == nil {
+		return nil, nil, nil, fmt.Errorf("no dm-verity bundle was selected for %s", manifestDigest)
 	}
 	log.G(ctx).WithFields(log.Fields{
-		"bundle":   candidate.desc.Digest,
+		"bundle":   selected.desc.Digest,
 		"manifest": manifestDigest,
 		"layers":   len(selectedInfos),
 	}).Info("Using precomputed EROFS tar-index dm-verity bundle")
-	return selectedInfos, selectedArtifacts, &candidate, nil
-}
-
-func newestReferrerIndex(candidates []referrerWithManifest) int {
-	newest := 0
-	for i := 1; i < len(candidates); i++ {
-		if candidates[i].createdAt.After(candidates[newest].createdAt) {
-			newest = i
-		}
-	}
-	return newest
+	return selectedInfos, selectedArtifacts, selected, nil
 }
 
 func parsePrecomputedBundle(manifest *ocispec.Manifest, imageLayers map[string]struct{}) (map[string]*LayerSignatureInfo, []ocispec.Descriptor, error) {
+	if manifest.Config.Digest != "" {
+		if err := validateBoundedDescriptor(manifest.Config, "artifact config descriptor", maxManifestSize); err != nil {
+			return nil, nil, err
+		}
+	}
+
 	infos := make(map[string]*LayerSignatureInfo)
 	var artifactDescs []ocispec.Descriptor
 	for i := range manifest.Layers {
@@ -318,11 +356,8 @@ func parsePrecomputedBundle(manifest *ocispec.Manifest, imageLayers map[string]s
 }
 
 func validatePrecomputedDescriptor(desc ocispec.Descriptor) error {
-	if err := desc.Digest.Validate(); err != nil {
-		return fmt.Errorf("precomputed descriptor has invalid digest %q: %w", desc.Digest, err)
-	}
-	if desc.Size <= 0 {
-		return fmt.Errorf("precomputed descriptor %s has invalid size %d", desc.Digest, desc.Size)
+	if err := validateBoundedDescriptor(desc, "precomputed descriptor", maxPrecomputedArtifactSize); err != nil {
+		return err
 	}
 	if desc.MediaType == TarIndexArtifactMediaType && desc.Size%tarIndexAlignment != 0 {
 		return fmt.Errorf(
@@ -332,6 +367,30 @@ func validatePrecomputedDescriptor(desc ocispec.Descriptor) error {
 		)
 	}
 	return nil
+}
+
+func validateBoundedDescriptor(desc ocispec.Descriptor, label string, maxSize int64) error {
+	if err := desc.Digest.Validate(); err != nil {
+		return fmt.Errorf("%s has invalid digest %q: %w", label, desc.Digest, err)
+	}
+	if desc.Size <= 0 {
+		return fmt.Errorf("%s %s has invalid size %d", label, desc.Digest, desc.Size)
+	}
+	if desc.Size > maxSize {
+		return fmt.Errorf(
+			"%s %s size %d exceeds maximum %d",
+			label,
+			desc.Digest,
+			desc.Size,
+			maxSize,
+		)
+	}
+	return nil
+}
+
+func withoutExternalURLs(desc ocispec.Descriptor) ocispec.Descriptor {
+	desc.URLs = nil
+	return desc
 }
 
 func getLayerInfo(infos map[string]*LayerSignatureInfo, sourceDigest string) *LayerSignatureInfo {
@@ -563,22 +622,16 @@ func signatureHandler(f images.Handler, fetcher remotes.Fetcher, store content.S
 }
 
 func persistSignatureReferrer(ctx context.Context, handler images.Handler, store content.Store, subject ocispec.Descriptor, referrer referrerWithManifest) error {
-	if _, err := handler.Handle(ctx, referrer.desc); err != nil {
+	if err := persistReferrerContent(ctx, handler, store, referrer.desc); err != nil {
 		return fmt.Errorf("fetch dm-verity referrer manifest %s: %w", referrer.desc.Digest, err)
-	}
-	if err := verifyRetainedContent(ctx, store, referrer.desc); err != nil {
-		return err
 	}
 	children := append([]ocispec.Descriptor(nil), referrer.manifest.Layers...)
 	if referrer.manifest.Config.Digest != "" {
 		children = append([]ocispec.Descriptor{referrer.manifest.Config}, children...)
 	}
 	for _, child := range children {
-		if _, err := handler.Handle(ctx, child); err != nil {
+		if err := persistReferrerContent(ctx, handler, store, child); err != nil {
 			return fmt.Errorf("fetch dm-verity referrer content %s: %w", child.Digest, err)
-		}
-		if err := verifyRetainedContent(ctx, store, child); err != nil {
-			return err
 		}
 	}
 	labelChildren := images.SetChildrenLabels(store, images.HandlerFunc(
@@ -600,6 +653,26 @@ func persistSignatureReferrer(ctx context.Context, handler images.Handler, store
 		return fmt.Errorf("retain dm-verity referrer %s for image manifest %s: %w", referrer.desc.Digest, subject.Digest, err)
 	}
 	return nil
+}
+
+func persistReferrerContent(ctx context.Context, handler images.Handler, store content.Store, desc ocispec.Descriptor) error {
+	if len(desc.Data) > 0 {
+		if err := verifyDescriptorPayload(desc, desc.Data); err != nil {
+			return fmt.Errorf("validate embedded content %s: %w", desc.Digest, err)
+		}
+		if err := content.WriteBlob(
+			ctx,
+			store,
+			remotes.MakeRefKey(ctx, desc),
+			bytes.NewReader(desc.Data),
+			desc,
+		); err != nil {
+			return fmt.Errorf("persist embedded content %s: %w", desc.Digest, err)
+		}
+	} else if _, err := handler.Handle(ctx, desc); err != nil {
+		return err
+	}
+	return verifyRetainedContent(ctx, store, desc)
 }
 
 func verifyRetainedContent(ctx context.Context, store content.Store, desc ocispec.Descriptor) error {

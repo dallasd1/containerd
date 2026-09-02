@@ -39,8 +39,9 @@ import (
 )
 
 type artifactFetcher struct {
-	blobs map[digest.Digest][]byte
-	refs  map[digest.Digest][]ocispec.Descriptor
+	blobs              map[digest.Digest][]byte
+	refs               map[digest.Digest][]ocispec.Descriptor
+	rejectExternalURLs bool
 }
 
 var (
@@ -49,6 +50,9 @@ var (
 )
 
 func (f *artifactFetcher) Fetch(_ context.Context, desc ocispec.Descriptor) (io.ReadCloser, error) {
+	if f.rejectExternalURLs && len(desc.URLs) > 0 {
+		return nil, errors.New("external descriptor URL was not removed")
+	}
 	data, ok := f.blobs[desc.Digest]
 	if !ok {
 		return nil, errors.New("blob not found")
@@ -396,6 +400,46 @@ func TestPersistSignatureReferrerRejectsMissingArtifactContent(t *testing.T) {
 	assert.Empty(t, info.Labels[DmverityReferrerLabel])
 }
 
+func TestPersistSignatureReferrerMaterializesEmbeddedContent(t *testing.T) {
+	ctx := context.Background()
+	subjectBytes := []byte("subject manifest")
+	subject := descriptorFor(subjectBytes, ocispec.MediaTypeImageManifest)
+	layerBytes := []byte("embedded artifact layer")
+	layer := descriptorFor(layerBytes, LayerSignatureMediaType)
+	layer.Data = layerBytes
+	manifest := ocispec.Manifest{
+		MediaType:    ocispec.MediaTypeImageManifest,
+		ArtifactType: SignatureArtifactType,
+		Subject:      &subject,
+		Layers:       []ocispec.Descriptor{layer},
+	}
+	manifestBytes, err := json.Marshal(manifest)
+	require.NoError(t, err)
+	referrer := descriptorFor(manifestBytes, ocispec.MediaTypeImageManifest)
+	referrer.ArtifactType = SignatureArtifactType
+
+	cs, err := local.NewLabeledStore(t.TempDir(), newMemoryLabelStore())
+	require.NoError(t, err)
+	require.NoError(t, content.WriteBlob(ctx, cs, "subject", bytes.NewReader(subjectBytes), subject))
+	require.NoError(t, content.WriteBlob(ctx, cs, "referrer", bytes.NewReader(manifestBytes), referrer))
+
+	err = persistSignatureReferrer(
+		ctx,
+		images.HandlerFunc(func(context.Context, ocispec.Descriptor) ([]ocispec.Descriptor, error) {
+			return nil, nil
+		}),
+		cs,
+		subject,
+		referrerWithManifest{desc: referrer, manifest: manifest},
+	)
+	require.NoError(t, err)
+	_, err = cs.Info(ctx, layer.Digest)
+	require.NoError(t, err)
+	info, err := cs.Info(ctx, subject.Digest)
+	require.NoError(t, err)
+	assert.Equal(t, referrer.Digest.String(), info.Labels[DmverityReferrerLabel])
+}
+
 func TestSignatureHandlerRejectsInvalidPrecomputedBundle(t *testing.T) {
 	sourceManifest := descriptorFor([]byte("source manifest"), ocispec.MediaTypeImageManifest)
 	bundle := ocispec.Manifest{
@@ -454,6 +498,98 @@ func TestFetchSignaturesSelectsNewestPrecomputedBundle(t *testing.T) {
 	assert.ElementsMatch(t, []ocispec.Descriptor{expectedSignature, newer.tarIndex, newer.tree}, artifacts)
 	require.NotNil(t, selected)
 	assert.Equal(t, newer.descriptor.Digest, selected.desc.Digest)
+}
+
+func TestFetchSignaturesRejectsResourceAmplification(t *testing.T) {
+	sourceManifest := descriptorFor([]byte("source manifest"), ocispec.MediaTypeImageManifest)
+
+	t.Run("candidate count", func(t *testing.T) {
+		refs := make([]ocispec.Descriptor, maxSignatureReferrers+1)
+		for i := range refs {
+			refs[i] = descriptorFor([]byte{byte(i)}, ocispec.MediaTypeImageManifest)
+			refs[i].ArtifactType = SignatureArtifactType
+		}
+		fetcher := &artifactFetcher{
+			refs: map[digest.Digest][]ocispec.Descriptor{
+				sourceManifest.Digest: refs,
+			},
+		}
+
+		_, _, _, err := fetchSignatures(
+			context.Background(),
+			fetcher,
+			sourceManifest.Digest,
+			map[string]struct{}{},
+		)
+		require.ErrorContains(t, err, "too many dm-verity referrers")
+	})
+
+	t.Run("aggregate manifest size", func(t *testing.T) {
+		refs := make([]ocispec.Descriptor, maxSignatureManifestBytes/maxManifestSize+1)
+		for i := range refs {
+			refs[i] = ocispec.Descriptor{
+				MediaType:    ocispec.MediaTypeImageManifest,
+				Digest:       digest.FromString(string(rune('a' + i))),
+				Size:         maxManifestSize,
+				ArtifactType: SignatureArtifactType,
+			}
+		}
+		fetcher := &artifactFetcher{
+			refs: map[digest.Digest][]ocispec.Descriptor{
+				sourceManifest.Digest: refs,
+			},
+		}
+
+		_, _, _, err := fetchSignatures(
+			context.Background(),
+			fetcher,
+			sourceManifest.Digest,
+			map[string]struct{}{},
+		)
+		require.ErrorContains(t, err, "aggregate dm-verity manifest size")
+	})
+}
+
+func TestFetchSignaturesUsesRepositoryDescriptors(t *testing.T) {
+	sourceManifest := descriptorFor([]byte("source manifest"), ocispec.MediaTypeImageManifest)
+	sourceLayer := descriptorFor([]byte("source layer"), ocispec.MediaTypeImageLayerGzip)
+	bundle := newPrecomputedBundle(t, sourceManifest, sourceLayer, "urls", testRootHashA, time.Now().UTC())
+
+	var manifest ocispec.Manifest
+	require.NoError(t, json.Unmarshal(bundle.blobs[bundle.descriptor.Digest], &manifest))
+	manifest.Config.URLs = []string{"http://config.invalid/content"}
+	for i := range manifest.Layers {
+		manifest.Layers[i].URLs = []string{"http://artifact.invalid/content"}
+	}
+	manifestBytes, err := json.Marshal(manifest)
+	require.NoError(t, err)
+	bundle.descriptor = descriptorFor(manifestBytes, ocispec.MediaTypeImageManifest)
+	bundle.descriptor.ArtifactType = SignatureArtifactType
+	bundle.descriptor.URLs = []string{"http://manifest.invalid/content"}
+
+	fetcher := &artifactFetcher{
+		blobs: mergeBlobMaps(bundle.blobs, map[digest.Digest][]byte{
+			bundle.descriptor.Digest: manifestBytes,
+		}),
+		refs: map[digest.Digest][]ocispec.Descriptor{
+			sourceManifest.Digest: {bundle.descriptor},
+		},
+		rejectExternalURLs: true,
+	}
+
+	_, artifacts, selected, err := fetchSignatures(
+		context.Background(),
+		fetcher,
+		sourceManifest.Digest,
+		layerDigestSet(sourceLayer),
+	)
+	require.NoError(t, err)
+	require.NotNil(t, selected)
+	assert.Empty(t, selected.desc.URLs)
+	assert.Empty(t, selected.manifest.Config.URLs)
+	for _, artifact := range artifacts {
+		assert.Empty(t, artifact.URLs)
+	}
 }
 
 func TestFetchSignaturesFailsClosedOnInvalidNewestPrecomputedBundle(t *testing.T) {
@@ -730,6 +866,47 @@ func TestFetchSignaturesRejectsInvalidInlineSignatureDescriptor(t *testing.T) {
 			require.ErrorContains(t, err, tt.wantErr)
 		})
 	}
+}
+
+func TestValidatePrecomputedDescriptorRejectsOversizedArtifact(t *testing.T) {
+	desc := ocispec.Descriptor{
+		MediaType: MerkleTreeArtifactMediaType,
+		Digest:    digest.FromString("oversized artifact"),
+		Size:      maxPrecomputedArtifactSize + 1,
+	}
+	require.ErrorContains(t, validatePrecomputedDescriptor(desc), "exceeds maximum")
+}
+
+func TestFetchSignaturesRejectsOversizedArtifactConfig(t *testing.T) {
+	sourceManifest := descriptorFor([]byte("source manifest"), ocispec.MediaTypeImageManifest)
+	sourceLayer := descriptorFor([]byte("source layer"), ocispec.MediaTypeImageLayerGzip)
+	bundle := newPrecomputedBundle(t, sourceManifest, sourceLayer, "oversized-config", testRootHashA, time.Now().UTC())
+
+	var manifest ocispec.Manifest
+	require.NoError(t, json.Unmarshal(bundle.blobs[bundle.descriptor.Digest], &manifest))
+	manifest.Config.Size = maxManifestSize + 1
+	manifestBytes, err := json.Marshal(manifest)
+	require.NoError(t, err)
+	manifestDesc := descriptorFor(manifestBytes, ocispec.MediaTypeImageManifest)
+	manifestDesc.ArtifactType = SignatureArtifactType
+
+	blobs := mergeBlobMaps(bundle.blobs)
+	blobs[manifestDesc.Digest] = manifestBytes
+	fetcher := &artifactFetcher{
+		blobs: blobs,
+		refs: map[digest.Digest][]ocispec.Descriptor{
+			sourceManifest.Digest: {manifestDesc},
+		},
+	}
+
+	_, _, _, err = fetchSignatures(
+		context.Background(),
+		fetcher,
+		sourceManifest.Digest,
+		layerDigestSet(sourceLayer),
+	)
+	require.ErrorContains(t, err, "artifact config descriptor")
+	require.ErrorContains(t, err, "exceeds maximum")
 }
 
 type precomputedBundleFixture struct {
