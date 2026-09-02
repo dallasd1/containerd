@@ -184,8 +184,13 @@ The EROFS snapshotter supports device-mapper verity to provide block-level integ
 verification for each EROFS layer. This method creates a dm-verity device for each
 layer and mounts it read-only. The dm-verity implementation uses the `go-dmverity`
 Go library, eliminating the need for external `veritysetup` command-line tools.
-This requires a Linux kernel with dm-verity support (CONFIG_DM_VERITY) and the
-device-mapper kernel module loaded.
+Signed mappings require a Linux kernel with dm-verity support, a verity target
+version of at least 1.5, `CONFIG_DM_VERITY_VERIFY_ROOTHASH_SIG`, and kernel
+keyring support. Capability discovery requires the read-only
+`/sys/module/dm_verity/parameters/require_signatures` feature marker exposed by
+upstream Linux 5.13 and later (or an equivalent backport). The probe checks that
+the mechanism is available to containerd; signature activation still requires
+the signing certificate chain to be enrolled in a trusted kernel keyring.
 
 The differ must be configured to discover and consume signed dm-verity
 metadata:
@@ -231,11 +236,13 @@ The available modes are:
 
 - `"auto"` (default): Uses dm-verity if `.dmverity` metadata exists for a layer,
   otherwise mounts as regular EROFS. This allows mixing dm-verity and non-dm-verity
-  layers in the same system.
+  layers in the same system. If signed mappings are unavailable, the plugin
+  does not advertise referrer support and continues with plain EROFS.
 
 - `"on"`: Requires dm-verity for all layers. If a layer lacks `.dmverity` metadata,
-  mounting will fail with an error. Use this mode when you want to enforce integrity
-  verification for all layers.
+  mounting will fail with an error. Plugin initialization also fails if the host
+  cannot activate signed dm-verity mappings. Use this mode when you want to enforce
+  integrity verification for all layers.
 
 - `"off"`: Disables dm-verity completely, even if `.dmverity` metadata exists.
   Layers are mounted as regular EROFS without integrity verification. Use this for
@@ -272,8 +279,9 @@ overlayfs pull, unpack, mount, or task-creation paths.
 
 Discovery of dm-verity referrers (per-layer signatures and precomputed EROFS
 artifacts) requires an extra registry lookup during pull and import, so it is
-performed only when a differ that consumes those artifacts is loaded. The EROFS
-differ advertises this when `enable_dmverity` is set:
+performed only when a differ that can consume those artifacts is loaded. The
+EROFS differ advertises this when `enable_dmverity` is set and the signed
+dm-verity capability probe succeeds:
 
 ```toml
 [plugins."io.containerd.differ.v1.erofs"]
@@ -283,7 +291,10 @@ differ advertises this when `enable_dmverity` is set:
 Both the transfer service and the CRI image service derive referrer discovery
 from that capability, so no additional configuration is needed. With
 `enable_dmverity` disabled, which is the default, no referrer lookup is
-performed and pull behaves exactly as it does without this feature.
+performed and pull behaves exactly as it does without this feature. If
+`enable_dmverity` is optional and the host lacks signed mapping support, the
+differ remains available but applies layers as plain EROFS. Setting
+`require_signatures = true` instead makes plugin initialization fail.
 
 When mounting a layer with dm-verity enabled, the snapshotter reads the metadata
 from the `.dmverity` file, requires its `.sig` sidecar, and creates a dm-verity device. The dm-verity library

@@ -19,6 +19,7 @@ package plugin
 import (
 	"fmt"
 
+	"github.com/containerd/log"
 	"github.com/containerd/platforms"
 	"github.com/containerd/plugin"
 	"github.com/containerd/plugin/registry"
@@ -97,27 +98,37 @@ func init() {
 			}
 
 			if config.EnableDmverity {
-				supported, err := dmverity.IsSupported()
+				supportErr := dmverity.CheckSignatureSupport()
+				enableDmverity, err := dmverityEnabled(config.RequireSignatures, supportErr)
 				if err != nil {
-					return nil, fmt.Errorf("dm-verity support check failed: %w", err)
+					return nil, err
 				}
-				if !supported {
-					return nil, fmt.Errorf("dm-verity is not supported on this system (no dm_verity module loaded and no built-in verity target): %w", plugin.ErrSkipPlugin)
+				if supportErr != nil {
+					log.G(ic.Context).WithError(supportErr).Warn("signed dm-verity support is unavailable; applying layers as plain EROFS")
 				}
-				opts = append(opts, erofs.WithDmverity())
+				if enableDmverity {
+					opts = append(opts, erofs.WithDmverity())
 
-				if config.RequireSignatures {
-					opts = append(opts, erofs.WithRequireSignatures())
-					ic.Meta.Capabilities = append(ic.Meta.Capabilities, plugins.CapabilityDmveritySignaturesRequired)
-				}
+					if config.RequireSignatures {
+						opts = append(opts, erofs.WithRequireSignatures())
+						ic.Meta.Capabilities = append(ic.Meta.Capabilities, plugins.CapabilityDmveritySignaturesRequired)
+					}
 
-				// Advertise that this differ consumes dm-verity referrer
-				// artifacts so pull implementations enable referrer discovery
-				// without requiring separate configuration.
-				ic.Meta.Capabilities = append(ic.Meta.Capabilities, plugins.CapabilityDmverityReferrers)
+					// Advertise that this differ consumes dm-verity referrer
+					// artifacts so pull implementations enable referrer discovery
+					// without requiring separate configuration.
+					ic.Meta.Capabilities = append(ic.Meta.Capabilities, plugins.CapabilityDmverityReferrers)
+				}
 			}
 
 			return erofs.NewErofsDiffer(cs, opts...), nil
 		},
 	})
+}
+
+func dmverityEnabled(required bool, supportErr error) (bool, error) {
+	if required && supportErr != nil {
+		return false, fmt.Errorf("erofs differ: require_signatures is true but signed dm-verity mappings are unavailable: %w", supportErr)
+	}
+	return supportErr == nil, nil
 }

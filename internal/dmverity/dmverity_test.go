@@ -20,6 +20,7 @@ package dmverity
 
 import (
 	"encoding/base64"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -35,6 +36,57 @@ import (
 const (
 	testDeviceName = "test-verity-device"
 )
+
+func TestCheckSignatureSupport(t *testing.T) {
+	checkError := errors.New("probe failed")
+	tests := []struct {
+		name          string
+		dmverity      bool
+		dmverityError error
+		keyringError  error
+		targetError   error
+		wantError     string
+	}{
+		{name: "supported", dmverity: true},
+		{name: "dm-verity unavailable", wantError: "dm-verity is unavailable"},
+		{name: "dm-verity probe failed", dmverityError: checkError, wantError: "check dm-verity support"},
+		{name: "keyring unavailable", dmverity: true, keyringError: checkError, wantError: "check kernel keyring support"},
+		{name: "signature target unavailable", dmverity: true, targetError: checkError, wantError: "check dm-verity signature support"},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			keyringChecked := false
+			targetChecked := false
+			err := checkSignatureSupport(
+				func() (bool, error) {
+					return test.dmverity, test.dmverityError
+				},
+				func() error {
+					targetChecked = true
+					return test.targetError
+				},
+				func() error {
+					keyringChecked = true
+					return test.keyringError
+				},
+			)
+
+			if test.wantError == "" {
+				assert.NoError(t, err)
+			} else {
+				assert.ErrorContains(t, err, test.wantError)
+			}
+			if !test.dmverity || test.dmverityError != nil {
+				assert.False(t, keyringChecked)
+				assert.False(t, targetChecked)
+			}
+			if test.targetError != nil {
+				assert.False(t, keyringChecked)
+			}
+		})
+	}
+}
 
 func TestDMVerity(t *testing.T) {
 	testutil.RequiresRoot(t)

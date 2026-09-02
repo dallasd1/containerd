@@ -32,6 +32,12 @@ func IsSupported() (bool, error) {
 	return false, nil
 }
 
+// CheckSignatureSupport reports that signed dm-verity mappings are
+// unavailable on non-Linux platforms.
+func CheckSignatureSupport() error {
+	return errUnsupported
+}
+
 func Format(_ string, _ string, _ *DmverityOptions) (string, error) {
 	return "", errUnsupported
 }

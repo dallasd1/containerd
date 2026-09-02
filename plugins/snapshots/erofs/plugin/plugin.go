@@ -20,10 +20,12 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/containerd/log"
 	"github.com/containerd/platforms"
 	"github.com/containerd/plugin"
 	"github.com/containerd/plugin/registry"
 
+	"github.com/containerd/containerd/v2/internal/dmverity"
 	"github.com/containerd/containerd/v2/plugins"
 	"github.com/containerd/containerd/v2/plugins/snapshots/erofs"
 	"github.com/docker/go-units"
@@ -95,9 +97,26 @@ func init() {
 				opts = append(opts, erofs.WithDmverityMode(config.DmverityMode))
 			}
 
+			var signatureSupportErr error
+			if dmverityModeUsesSignatures(config.DmverityMode) {
+				signatureSupportErr = dmverity.CheckSignatureSupport()
+			}
+			enableDmverity, err := dmverityEnabled(config.DmverityMode, signatureSupportErr)
+			if err != nil {
+				return nil, err
+			}
+			if signatureSupportErr != nil {
+				entry := log.G(ic.Context).WithError(signatureSupportErr)
+				if config.DmverityMode == "" {
+					entry.Debug("signed dm-verity support is unavailable; disabling referrer discovery")
+				} else {
+					entry.Warn("signed dm-verity support is unavailable; disabling referrer discovery")
+				}
+			}
+
 			ic.Meta.Exports[plugins.SnapshotterRootDir] = root
 			ic.Meta.Capabilities = append(ic.Meta.Capabilities, "rebase", plugins.CapabilityErofsLayers)
-			if dmverityReferrersEnabled(config.DmverityMode) {
+			if enableDmverity {
 				ic.Meta.Capabilities = append(ic.Meta.Capabilities, plugins.CapabilityDmverityReferrers)
 			}
 			if config.DmverityMode == "on" {
@@ -108,6 +127,13 @@ func init() {
 	})
 }
 
-func dmverityReferrersEnabled(mode string) bool {
+func dmverityModeUsesSignatures(mode string) bool {
 	return mode == "" || mode == "auto" || mode == "on"
+}
+
+func dmverityEnabled(mode string, supportErr error) (bool, error) {
+	if mode == "on" && supportErr != nil {
+		return false, fmt.Errorf("erofs snapshotter: dmverity_mode is \"on\" but signed dm-verity mappings are unavailable: %w", supportErr)
+	}
+	return dmverityModeUsesSignatures(mode) && supportErr == nil, nil
 }

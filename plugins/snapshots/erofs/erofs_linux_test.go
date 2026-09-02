@@ -621,9 +621,8 @@ func TestDmverityModeValidation(t *testing.T) {
 	})
 
 	t.Run("accepts valid on mode when dm-verity is supported", func(t *testing.T) {
-		supported, err := dmverity.IsSupported()
-		if err != nil || !supported {
-			t.Skip("dm-verity not supported, skipping")
+		if err := dmverity.CheckSignatureSupport(); err != nil {
+			t.Skip("signed dm-verity mappings not supported, skipping")
 		}
 
 		root := filepath.Join(tmpDir, "on")

@@ -24,27 +24,26 @@ import (
 func TestDmverityEnabled(t *testing.T) {
 	probeError := errors.New("probe failed")
 	tests := []struct {
-		mode      string
+		name      string
+		required  bool
 		probeErr  error
 		want      bool
 		wantError bool
 	}{
-		{mode: "", want: true},
-		{mode: "off"},
-		{mode: "auto", want: true},
-		{mode: "auto", probeErr: probeError},
-		{mode: "on", want: true},
-		{mode: "on", probeErr: probeError, wantError: true},
-		{mode: "invalid"},
+		{name: "optional supported", want: true},
+		{name: "optional probe failure", probeErr: probeError},
+		{name: "required supported", required: true, want: true},
+		{name: "required probe failure", required: true, probeErr: probeError, wantError: true},
 	}
+
 	for _, test := range tests {
-		t.Run(test.mode, func(t *testing.T) {
-			got, err := dmverityEnabled(test.mode, test.probeErr)
+		t.Run(test.name, func(t *testing.T) {
+			got, err := dmverityEnabled(test.required, test.probeErr)
 			if got != test.want {
-				t.Fatalf("dmverityEnabled(%q) = %v, want %v", test.mode, got, test.want)
+				t.Fatalf("dmverityEnabled() = %v, want %v", got, test.want)
 			}
 			if (err != nil) != test.wantError {
-				t.Fatalf("dmverityEnabled(%q) error = %v, wantError %v", test.mode, err, test.wantError)
+				t.Fatalf("dmverityEnabled() error = %v, wantError %v", err, test.wantError)
 			}
 		})
 	}

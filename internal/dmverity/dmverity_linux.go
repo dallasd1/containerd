@@ -26,15 +26,22 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/containerd/containerd/v2/core/mount"
 	dm "github.com/containerd/go-dmverity/pkg/dm"
+	"github.com/containerd/go-dmverity/pkg/keyring"
 	"github.com/containerd/go-dmverity/pkg/utils"
 	"github.com/containerd/go-dmverity/pkg/verity"
 	"github.com/containerd/log"
 	"github.com/google/uuid"
 )
+
+var signatureSupportCache struct {
+	sync.Mutex
+	supported bool
+}
 
 // IsSupported reports whether the kernel can back a dm-verity device.
 //
@@ -67,6 +74,76 @@ func IsSupported() (bool, error) {
 	// Both probes succeeded and neither found dm-verity, so this is a
 	// determinate "not available" rather than a failed check.
 	return false, nil
+}
+
+// CheckSignatureSupport verifies that the kernel can activate dm-verity
+// mappings that require a root-hash signature from a kernel keyring.
+func CheckSignatureSupport() error {
+	signatureSupportCache.Lock()
+	defer signatureSupportCache.Unlock()
+
+	if signatureSupportCache.supported {
+		return nil
+	}
+	if err := checkSignatureSupport(IsSupported, checkVeritySignatureSupport, checkKeyringAccess); err != nil {
+		return err
+	}
+	signatureSupportCache.supported = true
+	return nil
+}
+
+func checkSignatureSupport(
+	checkDmverity func() (bool, error),
+	checkTarget func() error,
+	checkKeyring func() error,
+) error {
+	supported, err := checkDmverity()
+	if err != nil {
+		return fmt.Errorf("check dm-verity support: %w", err)
+	}
+	if !supported {
+		return fmt.Errorf("dm-verity is unavailable")
+	}
+	if err := checkTarget(); err != nil {
+		return fmt.Errorf("check dm-verity signature support: %w", err)
+	}
+	if err := checkKeyring(); err != nil {
+		return fmt.Errorf("check kernel keyring support: %w", err)
+	}
+	return nil
+}
+
+func checkKeyringAccess() error {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	keyID, err := keyring.AddKeyToThreadKeyring(
+		"user",
+		"containerd:dmverity-capability-probe",
+		[]byte{0},
+	)
+	if err != nil {
+		return err
+	}
+	if err := keyring.UnlinkKeyFromThreadKeyring(keyID); err != nil {
+		return err
+	}
+	return nil
+}
+
+func checkVeritySignatureSupport() error {
+	if err := dm.CheckVeritySignatureSupport(); err != nil {
+		return err
+	}
+	const signatureParameter = "/sys/module/dm_verity/parameters/require_signatures"
+	if _, err := os.Stat(signatureParameter); err != nil {
+		return fmt.Errorf(
+			"kernel does not expose %s; signed dm-verity discovery requires CONFIG_DM_VERITY_VERIFY_ROOTHASH_SIG and its read-only feature marker: %w",
+			signatureParameter,
+			err,
+		)
+	}
+	return nil
 }
 
 func convertToVerityParams(opts *DmverityOptions) (verity.Params, error) {

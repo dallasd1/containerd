@@ -125,12 +125,8 @@ func NewSnapshotter(root string, opts ...Opt) (snapshots.Snapshotter, error) {
 	}
 
 	if config.dmverityMode == "on" {
-		supported, err := dmverity.IsSupported()
-		if err != nil {
-			return nil, fmt.Errorf("failed to check dm-verity support: %w", err)
-		}
-		if !supported {
-			return nil, fmt.Errorf("dmverity_mode is 'on' but dm-verity is not supported on this system")
+		if err := dmverity.CheckSignatureSupport(); err != nil {
+			return nil, fmt.Errorf("dmverity_mode is 'on' but signed dm-verity mappings are unavailable: %w", err)
 		}
 	}
 
