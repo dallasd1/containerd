@@ -77,10 +77,6 @@ func (c *retainedDmverityDevices) enabled() bool {
 // prepare removes idle devices left by a previous containerd process. Busy
 // devices remain valid and are verified by the normal mount path before reuse.
 func (c *retainedDmverityDevices) prepare(ctx context.Context, source string) {
-	if !c.enabled() {
-		return
-	}
-
 	devicePrefix := dmverity.ErofsDevicePrefix(source)
 
 	c.prepareMu.Lock()

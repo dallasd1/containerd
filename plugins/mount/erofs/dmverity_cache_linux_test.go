@@ -64,15 +64,26 @@ func TestRetainedDmverityDevicesLRU(t *testing.T) {
 
 func TestRetainedDmverityDevicesDisabled(t *testing.T) {
 	cache := newRetainedDmverityDevices(0)
-	listed := false
+	source := "/root/snapshots/1/layer.erofs"
+	deviceName := dmverity.ErofsDeviceName(source)
+	listCalls := 0
 	cache.listDevices = func(string) ([]string, error) {
-		listed = true
-		return nil, nil
+		listCalls++
+		return []string{deviceName}, nil
+	}
+	var closed []string
+	cache.closeDevice = func(name string) error {
+		closed = append(closed, name)
+		return nil
 	}
 
-	cache.prepare(context.Background(), "/root/snapshots/1/layer.erofs")
-	if listed {
-		t.Fatal("disabled cache enumerated device-mapper devices")
+	cache.prepare(context.Background(), source)
+	cache.prepare(context.Background(), source)
+	if listCalls != 1 {
+		t.Fatalf("disabled cache listed devices %d times, want 1", listCalls)
+	}
+	if !slices.Equal(closed, []string{deviceName}) {
+		t.Fatalf("disabled cache startup cleanup closed %v, want [%s]", closed, deviceName)
 	}
 	if cache.take("a") {
 		t.Fatal("disabled cache retained a device")
