@@ -43,9 +43,9 @@ func selectDmverityReferrerMode(enabled, unpackCapable bool) dmverityReferrerMod
 
 func appendDmverityReferrerHandler(handler images.Handler, fetcher remotes.Fetcher, store content.Store, mode dmverityReferrerMode) images.Handler {
 	switch mode {
-	case dmverityReferrersForImmediateUnpack:
-		return snpkg.AppendSignatureHandlerWrapper(fetcher)(handler)
-	case dmverityReferrersRetained:
+	case dmverityReferrersForImmediateUnpack, dmverityReferrersRetained:
+		// Immediate unpack still retains the selected graph so a later
+		// Image.Unpack can reconstruct the same signed materialization.
 		return snpkg.AppendRetainedSignatureHandlerWrapper(fetcher, store)(handler)
 	default:
 		return handler

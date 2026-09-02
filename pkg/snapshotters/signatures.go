@@ -410,6 +410,16 @@ func AppendRetainedSignatureHandlerWrapper(fetcher remotes.Fetcher, store conten
 
 // AppendSignatureHandlerWrapperFromResolver lazily creates a fetcher from a resolver.
 func AppendSignatureHandlerWrapperFromResolver(resolver remotes.Resolver, ref string) func(f images.Handler) images.Handler {
+	return appendSignatureHandlerWrapperFromResolver(resolver, ref, nil)
+}
+
+// AppendRetainedSignatureHandlerWrapperFromResolver lazily creates a fetcher
+// and persists the selected referrer graph for later unpack operations.
+func AppendRetainedSignatureHandlerWrapperFromResolver(resolver remotes.Resolver, ref string, store content.Store) func(f images.Handler) images.Handler {
+	return appendSignatureHandlerWrapperFromResolver(resolver, ref, store)
+}
+
+func appendSignatureHandlerWrapperFromResolver(resolver remotes.Resolver, ref string, store content.Store) func(f images.Handler) images.Handler {
 	var (
 		fetcher     remotes.Fetcher
 		fetcherOnce sync.Once
@@ -423,7 +433,7 @@ func AppendSignatureHandlerWrapperFromResolver(resolver remotes.Resolver, ref st
 			if fetcherErr != nil {
 				return nil, fmt.Errorf("create fetcher for dm-verity artifact lookup: %w", fetcherErr)
 			}
-			return signatureHandler(f, fetcher, nil, false).Handle(ctx, desc)
+			return signatureHandler(f, fetcher, store, false).Handle(ctx, desc)
 		})
 	}
 }

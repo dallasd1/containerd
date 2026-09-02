@@ -164,7 +164,7 @@ func TestSelectDmverityReferrerMode(t *testing.T) {
 			expected: dmverityReferrersDisabled,
 		},
 		{
-			name:          "capable EROFS unpack uses transient annotations",
+			name:          "capable EROFS unpack retains signed referrers",
 			enabled:       true,
 			unpackCapable: true,
 			expected:      dmverityReferrersForImmediateUnpack,

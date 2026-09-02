@@ -58,6 +58,8 @@ type CRIImageService struct {
 	// images is the lower level image store used for raw storage,
 	// no event publishing should currently be assumed
 	images images.Store
+	// content is the content store used to retain auxiliary image artifacts.
+	content content.Store
 	// client is a subset of the containerd client
 	// and will be replaced by image store and transfer service
 	client imageClient
@@ -123,6 +125,7 @@ func NewService(config criconfig.ImageConfig, options *CRIImageServiceOptions) (
 	svc := CRIImageService{
 		config:                      config,
 		images:                      options.Images,
+		content:                     options.Content,
 		client:                      options.Client,
 		imageStore:                  imagestore.NewStore(options.Images, options.Content, platforms.Default()),
 		imageFSPaths:                options.ImageFSPaths,

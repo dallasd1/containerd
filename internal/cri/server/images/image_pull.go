@@ -279,7 +279,11 @@ func (c *CRIImageService) pullImageWithLocalPull(
 	}
 	if c.config.EnableDmverityReferrers {
 		if slices.Contains(c.snapshotterCapabilities[snapshotter], plugins.CapabilityDmverityReferrers) {
-			handlerWrappers = append(handlerWrappers, snpkg.AppendSignatureHandlerWrapperFromResolver(resolver, ref))
+			handlerWrappers = append(handlerWrappers, snpkg.AppendRetainedSignatureHandlerWrapperFromResolver(
+				resolver,
+				ref,
+				c.content,
+			))
 		}
 	}
 	if len(handlerWrappers) > 0 {
