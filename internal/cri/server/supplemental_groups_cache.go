@@ -19,6 +19,7 @@ package server
 import (
 	"container/list"
 	"context"
+	"errors"
 	"sync"
 
 	customopts "github.com/containerd/containerd/v2/internal/cri/opts"
@@ -32,9 +33,10 @@ type supplementalGroupsCacheEntry struct {
 }
 
 type supplementalGroupsCacheCall struct {
-	done chan struct{}
-	gids []uint32
-	err  error
+	done  chan struct{}
+	gids  []uint32
+	err   error
+	retry bool
 }
 
 type supplementalGroupsCache struct {
@@ -52,45 +54,52 @@ func (c *supplementalGroupsCache) Resolve(
 	key customopts.SupplementalGroupsCacheKey,
 	resolver func(context.Context) ([]uint32, error),
 ) ([]uint32, error) {
-	if gids, ok := c.get(key); ok {
-		return gids, nil
-	}
+	for {
+		if gids, ok := c.get(key); ok {
+			return gids, nil
+		}
 
-	c.callMu.Lock()
-	if call, ok := c.calls[key]; ok {
+		c.callMu.Lock()
+		if call, ok := c.calls[key]; ok {
+			c.callMu.Unlock()
+			select {
+			case <-call.done:
+				if call.retry && ctx.Err() == nil {
+					continue
+				}
+				return cloneGIDs(call.gids), call.err
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
+		if c.calls == nil {
+			c.calls = make(map[customopts.SupplementalGroupsCacheKey]*supplementalGroupsCacheCall)
+		}
+		call := &supplementalGroupsCacheCall{done: make(chan struct{})}
+		c.calls[key] = call
 		c.callMu.Unlock()
-		select {
-		case <-call.done:
-			return cloneGIDs(call.gids), call.err
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		}
-	}
-	if c.calls == nil {
-		c.calls = make(map[customopts.SupplementalGroupsCacheKey]*supplementalGroupsCacheCall)
-	}
-	call := &supplementalGroupsCacheCall{done: make(chan struct{})}
-	c.calls[key] = call
-	c.callMu.Unlock()
 
-	gids, ok := c.get(key)
-	if !ok {
-		gids, call.err = resolver(ctx)
+		gids, ok := c.get(key)
+		if !ok {
+			gids, call.err = resolver(ctx)
+			if call.err == nil {
+				c.add(key, gids)
+			} else if ctxErr := ctx.Err(); ctxErr != nil && errors.Is(call.err, ctxErr) {
+				call.retry = true
+			}
+		}
+
+		c.callMu.Lock()
+		call.gids = cloneGIDs(gids)
+		delete(c.calls, key)
+		close(call.done)
+		c.callMu.Unlock()
+
 		if call.err == nil {
-			c.add(key, gids)
+			return cloneGIDs(gids), nil
 		}
-	}
-
-	c.callMu.Lock()
-	call.gids = cloneGIDs(gids)
-	delete(c.calls, key)
-	close(call.done)
-	c.callMu.Unlock()
-
-	if call.err != nil {
 		return nil, call.err
 	}
-	return cloneGIDs(gids), nil
 }
 
 func (c *supplementalGroupsCache) get(key customopts.SupplementalGroupsCacheKey) ([]uint32, bool) {

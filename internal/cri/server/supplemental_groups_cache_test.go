@@ -162,6 +162,52 @@ func TestSupplementalGroupsCache(t *testing.T) {
 		close(release)
 		require.NoError(t, <-firstDone)
 	})
+
+	t.Run("healthy waiter retries canceled leader", func(t *testing.T) {
+		cache := supplementalGroupsCache{}
+		key := cacheKey("leader-cancel")
+		leaderStarted := make(chan struct{})
+		leaderCanReturn := make(chan struct{})
+		var calls atomic.Int32
+		resolver := func(ctx context.Context) ([]uint32, error) {
+			if calls.Add(1) == 1 {
+				close(leaderStarted)
+				<-ctx.Done()
+				<-leaderCanReturn
+				return nil, ctx.Err()
+			}
+			return []uint32{9}, nil
+		}
+
+		leaderCtx, cancelLeader := context.WithCancel(context.Background())
+		leaderDone := make(chan error, 1)
+		go func() {
+			_, err := cache.Resolve(leaderCtx, key, resolver)
+			leaderDone <- err
+		}()
+		<-leaderStarted
+
+		waiterDone := make(chan struct {
+			gids []uint32
+			err  error
+		}, 1)
+		go func() {
+			gids, err := cache.Resolve(context.Background(), key, resolver)
+			waiterDone <- struct {
+				gids []uint32
+				err  error
+			}{gids: gids, err: err}
+		}()
+
+		cancelLeader()
+		close(leaderCanReturn)
+		require.ErrorIs(t, <-leaderDone, context.Canceled)
+
+		result := <-waiterDone
+		require.NoError(t, result.err)
+		assert.Equal(t, []uint32{9}, result.gids)
+		assert.EqualValues(t, 2, calls.Load())
+	})
 }
 
 func cacheKey(chainID string) customopts.SupplementalGroupsCacheKey {
