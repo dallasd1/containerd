@@ -43,13 +43,17 @@ var signatureSupportCache struct {
 	supported bool
 }
 
-// IsSupported reports whether the kernel can back a dm-verity device.
+// IsSupported reports whether the dm-verity target is currently available.
 //
 // A false return with a nil error means the answer is determinate: dm-verity
 // is genuinely unavailable, and callers may skip cleanly. A non-nil error
 // means the answer is indeterminate — the check itself could not be
 // completed — and callers should treat that as a hard failure rather than
 // assume absence.
+//
+// This check does not load kernel modules. Hosts using a modular target must
+// load dm_verity before containerd starts, just as the EROFS snapshotter
+// requires erofs to be loaded before plugin initialization.
 func IsSupported() (bool, error) {
 	// dm-verity may be a loadable module or built into the kernel. Checking
 	// only /proc/modules reports unsupported on a CONFIG_DM_VERITY=y kernel and
@@ -71,8 +75,9 @@ func IsSupported() (bool, error) {
 		return false, fmt.Errorf("failed to stat /sys/module/dm_verity: %w", err)
 	}
 
-	// Both probes succeeded and neither found dm-verity, so this is a
-	// determinate "not available" rather than a failed check.
+	// Both probes succeeded and neither found a loaded or built-in dm-verity
+	// target, so this is a determinate "not available" rather than a failed
+	// check.
 	return false, nil
 }
 

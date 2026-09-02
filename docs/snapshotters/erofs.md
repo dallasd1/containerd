@@ -191,6 +191,9 @@ keyring support. Capability discovery requires the read-only
 upstream Linux 5.13 and later (or an equivalent backport). The probe checks that
 the mechanism is available to containerd; signature activation still requires
 the signing certificate chain to be enrolled in a trusted kernel keyring.
+When dm-verity is built as a module, load `dm_verity` before containerd starts
+(for example with a systemd `modprobe@dm_verity.service` dependency).
+Containerd does not invoke `modprobe` during plugin initialization.
 
 The differ must be configured to discover and consume signed dm-verity
 metadata:
