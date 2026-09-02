@@ -669,17 +669,19 @@ func (s *snapshotter) getCleanupDirectories(ctx context.Context) ([]string, erro
 func (s *snapshotter) Remove(ctx context.Context, key string) (err error) {
 	var removals []string
 	var id string
+	var kind snapshots.Kind
 	// Remove directories after the transaction is closed, failures must not
 	// return error since the transaction is committed with the removal
 	// key no longer available.
 	defer func() {
 		if err == nil {
+			if kind == snapshots.KindCommitted {
+				releaseDmverityDevice(ctx, s.layerBlobPath(id))
+			}
+
 			if err := cleanupUpper(s.upperPath(id)); err != nil {
 				log.G(ctx).WithError(err).WithField("id", id).Warnf("failed to cleanup upperdir")
 			}
-
-			// Note: dm-verity device cleanup is handled by the EROFS mount handler
-			// during Deactivate/Unmount, not here in Remove()
 
 			for _, dir := range removals {
 				if err := os.RemoveAll(dir); err != nil {
@@ -689,9 +691,7 @@ func (s *snapshotter) Remove(ctx context.Context, key string) (err error) {
 		}
 	}()
 	return s.ms.WithTransaction(ctx, true, func(ctx context.Context) error {
-		var k snapshots.Kind
-
-		id, k, err = storage.Remove(ctx, key)
+		id, kind, err = storage.Remove(ctx, key)
 		if err != nil {
 			return fmt.Errorf("failed to remove snapshot %s: %w", key, err)
 		}
@@ -701,7 +701,7 @@ func (s *snapshotter) Remove(ctx context.Context, key string) (err error) {
 			return fmt.Errorf("unable to get directories for removal: %w", err)
 		}
 		// The layer blob is only persisted for committed snapshots.
-		if k == snapshots.KindCommitted {
+		if kind == snapshots.KindCommitted {
 			// Clear IMMUTABLE_FL before removal, since this flag avoids it.
 			err = setImmutable(s.layerBlobPath(id), false)
 			if err != nil && !errdefs.IsNotImplemented(err) {

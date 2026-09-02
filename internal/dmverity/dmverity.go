@@ -100,6 +100,12 @@ func DevicePath(name string) string {
 	return fmt.Sprintf("/dev/mapper/%s", name)
 }
 
+// DeviceInfo describes the lifecycle state needed by dm-verity mount handlers.
+type DeviceInfo struct {
+	Exists    bool
+	OpenCount int32
+}
+
 type DmverityMetadata struct {
 	RootHash   string `json:"roothash"`
 	HashOffset uint64 `json:"hashoffset"`

@@ -19,12 +19,17 @@ package dmverity
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"runtime"
+	"slices"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/containerd/containerd/v2/core/mount"
+	dm "github.com/containerd/go-dmverity/pkg/dm"
 	"github.com/containerd/go-dmverity/pkg/utils"
 	"github.com/containerd/go-dmverity/pkg/verity"
 	"github.com/containerd/log"
@@ -428,17 +433,86 @@ func FormatLayerBlob(ctx context.Context, layerBlobPath string, blockSize uint32
 	return rootHash, nil
 }
 
-// VerifyDevice ensures an existing dm-verity device matches the expected metadata and is healthy.
-func VerifyDevice(name string, rootHash string) error {
+// InspectDevice returns the kernel open count for an active device.
+func InspectDevice(name string) (DeviceInfo, error) {
+	control, err := dm.Open()
+	if err != nil {
+		return DeviceInfo{}, fmt.Errorf("open device-mapper control: %w", err)
+	}
+	defer control.Close()
+
+	status, err := control.DeviceStatus(name)
+	if err != nil {
+		return DeviceInfo{}, fmt.Errorf("inspect dm-verity device %q: %w", name, err)
+	}
+	if !status.ActivePresent {
+		return DeviceInfo{Exists: true, OpenCount: status.OpenCount}, fmt.Errorf("dm-verity device %q has no active table", name)
+	}
+	return DeviceInfo{Exists: true, OpenCount: status.OpenCount}, nil
+}
+
+// VerifySignedDevice ensures an existing dm-verity device matches the expected
+// signed metadata and is healthy.
+func VerifySignedDevice(name string, rootHash string) (DeviceInfo, error) {
 	rootDigest, err := utils.ParseRootHash(rootHash)
 	if err != nil {
-		return fmt.Errorf("invalid root hash: %w", err)
+		return DeviceInfo{}, fmt.Errorf("invalid root hash: %w", err)
 	}
 
-	// Use library's Check to verify device status and root hash
-	if !verity.Check(name, rootDigest) {
-		return fmt.Errorf("dm-verity device %q verification failed", name)
+	control, err := dm.Open()
+	if err != nil {
+		return DeviceInfo{}, fmt.Errorf("open device-mapper control: %w", err)
+	}
+	defer control.Close()
+
+	status, err := control.DeviceStatus(name)
+	if err != nil {
+		return DeviceInfo{}, fmt.Errorf("inspect dm-verity device %q: %w", name, err)
+	}
+	info := DeviceInfo{Exists: true, OpenCount: status.OpenCount}
+	if !status.ActivePresent || status.TargetCount != 1 {
+		return info, fmt.Errorf("dm-verity device %q does not have one active target", name)
 	}
 
-	return nil
+	verityStatus, err := control.TableStatus(name, false)
+	if err != nil {
+		return info, fmt.Errorf("read dm-verity device %q status: %w", name, err)
+	}
+	if !slices.Contains(strings.Fields(verityStatus), "V") {
+		return info, fmt.Errorf("dm-verity device %q is not in the verified state", name)
+	}
+
+	table, err := control.TableStatus(name, true)
+	if err != nil {
+		return info, fmt.Errorf("read dm-verity device %q table: %w", name, err)
+	}
+	if err := verifySignedVerityTable(table, hex.EncodeToString(rootDigest)); err != nil {
+		return info, fmt.Errorf("verify dm-verity device %q table: %w", name, err)
+	}
+	return info, nil
+}
+
+func verifySignedVerityTable(table, expectedRootHash string) error {
+	fields := strings.Fields(table)
+	if len(fields) < 10 {
+		return fmt.Errorf("invalid verity table with %d fields", len(fields))
+	}
+	if !strings.EqualFold(fields[8], expectedRootHash) {
+		return fmt.Errorf("root hash is %q, expected %q", fields[8], expectedRootHash)
+	}
+	if len(fields) == 10 {
+		return fmt.Errorf("verity table does not require a root-hash signature")
+	}
+
+	optionCount, err := strconv.Atoi(fields[10])
+	if err != nil || optionCount < 0 || len(fields) != 11+optionCount {
+		return fmt.Errorf("invalid verity optional-argument count %q", fields[10])
+	}
+	options := fields[11:]
+	for i := 0; i+1 < len(options); i++ {
+		if options[i] == "root_hash_sig_key_desc" && options[i+1] != "" {
+			return nil
+		}
+	}
+	return fmt.Errorf("verity table does not require a root-hash signature")
 }

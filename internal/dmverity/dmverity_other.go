@@ -52,8 +52,12 @@ func Close(_ string) error {
 	return errUnsupported
 }
 
-func VerifyDevice(_ string, _ string) error {
-	return errUnsupported
+func InspectDevice(_ string) (DeviceInfo, error) {
+	return DeviceInfo{}, errUnsupported
+}
+
+func VerifySignedDevice(_ string, _ string) (DeviceInfo, error) {
+	return DeviceInfo{}, errUnsupported
 }
 
 // FormatLayerBlob appends a dm-verity hash tree to an EROFS layer blob. It is

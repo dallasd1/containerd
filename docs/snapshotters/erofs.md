@@ -246,6 +246,30 @@ If the differ uses `require_signatures = true`, the snapshotter must use
 to require signatures while allowing the snapshotter to mount pre-existing
 plain snapshots.
 
+Verified dm-verity devices can optionally be retained across sequential EROFS
+mounts:
+
+```toml
+[plugins."io.containerd.mount-handler.v1.erofs"]
+  dmverity_cache_size = 32
+```
+
+The value is the maximum number of idle devices kept in a least-recently-used
+cache. The default is `0`, which closes a device after its final mount as before.
+Every reuse still verifies the live device-mapper table against the layer's
+signed root hash, and active mounts remain protected by the kernel's device open
+count. Idle devices beyond the configured bound are closed without a timer.
+After a containerd restart, idle devices left by the previous process are
+discarded before the first protected EROFS mount; busy devices are adopted only
+after normal table verification. Mapper names include the snapshotter root, so
+separate containerd roots do not collide. Legacy unscoped mapper names are
+cleaned during this startup reconciliation. Removing a snapshot closes its idle
+mapper immediately; if a running container still holds it open, the final
+unmount closes it rather than returning it to the cache.
+
+This cache is entered only by protected EROFS mounts. It does not change
+overlayfs pull, unpack, mount, or task-creation paths.
+
 Discovery of dm-verity referrers (per-layer signatures and precomputed EROFS
 artifacts) requires an extra registry lookup during pull and import, so it is
 performed only when a differ that consumes those artifacts is loaded. The EROFS

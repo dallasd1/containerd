@@ -71,6 +71,11 @@ func TestDMVerity(t *testing.T) {
 
 			waitForDevice(t, devicePath)
 
+			info, err := VerifySignedDevice(deviceName, rootHash)
+			assert.ErrorContains(t, err, "does not require a root-hash signature")
+			assert.True(t, info.Exists)
+			assert.Zero(t, info.OpenCount)
+
 			// Close device
 			err = Close(deviceName)
 			assert.NoError(t, err)
@@ -260,6 +265,26 @@ func TestDevicePath(t *testing.T) {
 	assert.Equal(t, "/dev/mapper/containerd-erofs-abc123", DevicePath("containerd-erofs-abc123"))
 }
 
+func TestVerifySignedVerityTable(t *testing.T) {
+	rootHash := strings.Repeat("ab", 32)
+	salt := strings.Repeat("cd", 32)
+	base := "1 7:0 7:1 512 512 8 9 sha256 " + rootHash + " " + salt
+
+	assert.NoError(t, verifySignedVerityTable(
+		base+" 2 root_hash_sig_key_desc cryptsetup:test",
+		rootHash,
+	))
+	assert.ErrorContains(t, verifySignedVerityTable(base, rootHash), "does not require")
+	assert.ErrorContains(t, verifySignedVerityTable(
+		"1 7:0 7:1 512 512 8 9 sha256 "+salt+" "+rootHash+" 2 root_hash_sig_key_desc cryptsetup:test",
+		rootHash,
+	), "root hash is")
+	assert.ErrorContains(t, verifySignedVerityTable(
+		base+" 1 root_hash_sig_key_desc",
+		rootHash,
+	), "does not require")
+}
+
 func TestReadMetadata(t *testing.T) {
 	tmpDir := t.TempDir()
 
@@ -349,22 +374,21 @@ func TestErrorHandling(t *testing.T) {
 		assert.Error(t, err)
 	})
 
-	t.Run("VerifyDevice_EmptyRootHash", func(t *testing.T) {
-		err := VerifyDevice("test-device", "")
+	t.Run("VerifySignedDevice_EmptyRootHash", func(t *testing.T) {
+		_, err := VerifySignedDevice("test-device", "")
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "invalid root hash")
 	})
 
-	t.Run("VerifyDevice_InvalidRootHash", func(t *testing.T) {
-		err := VerifyDevice("test-device", "not-valid-hex")
+	t.Run("VerifySignedDevice_InvalidRootHash", func(t *testing.T) {
+		_, err := VerifySignedDevice("test-device", "not-valid-hex")
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "invalid root hash")
 	})
 
-	t.Run("VerifyDevice_NonexistentDevice", func(t *testing.T) {
-		err := VerifyDevice("nonexistent-device-12345", "abc123def456")
+	t.Run("VerifySignedDevice_NonexistentDevice", func(t *testing.T) {
+		_, err := VerifySignedDevice("nonexistent-device-12345", "abc123def456")
 		assert.Error(t, err)
-		assert.Contains(t, err.Error(), "verification failed")
 	})
 
 	t.Run("Format_InvalidSalt", func(t *testing.T) {
