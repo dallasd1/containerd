@@ -242,6 +242,43 @@ func OpenWithSignature(dataDevice string, name string, hashDevice string, rootHa
 	return devicePath, nil
 }
 
+// OpenWithSignatureData creates a signed dm-verity mapping from signature
+// bytes already validated by the caller.
+func OpenWithSignatureData(dataDevice string, name string, hashDevice string, rootHash string, hashOffset uint64, opts *DmverityOptions, signature []byte) (string, error) {
+	if len(signature) == 0 {
+		return "", fmt.Errorf("signature cannot be empty")
+	}
+	file, err := os.CreateTemp("", "containerd-dmverity-signature-")
+	if err != nil {
+		return "", fmt.Errorf("create temporary signature file: %w", err)
+	}
+	path := file.Name()
+	defer os.Remove(path)
+
+	if err := file.Chmod(0600); err != nil {
+		file.Close()
+		return "", fmt.Errorf("set temporary signature file mode: %w", err)
+	}
+	if _, err := file.Write(signature); err != nil {
+		file.Close()
+		return "", fmt.Errorf("write temporary signature file: %w", err)
+	}
+	if _, err := file.Seek(0, 0); err != nil {
+		file.Close()
+		return "", fmt.Errorf("rewind temporary signature file: %w", err)
+	}
+	if err := os.Remove(path); err != nil {
+		file.Close()
+		return "", fmt.Errorf("unlink temporary signature file: %w", err)
+	}
+	defer file.Close()
+
+	// Keep the validated inode open and let go-dmverity reopen it through procfs.
+	// The unlinked file has no replaceable pathname between validation and use.
+	fdPath := fmt.Sprintf("/proc/self/fd/%d", file.Fd())
+	return OpenWithSignature(dataDevice, name, hashDevice, rootHash, hashOffset, opts, fdPath)
+}
+
 // VerifyArtifacts verifies a precomputed EROFS data device and separate
 // dm-verity hash device against the expected root hash.
 func VerifyArtifacts(dataDevice, hashDevice, rootHash string, blockSize uint32) error {

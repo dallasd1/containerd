@@ -17,7 +17,9 @@
 package snapshotters
 
 import (
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"fmt"
 
 	"github.com/opencontainers/go-digest"
@@ -58,6 +60,10 @@ func DmveritySnapshotLabels(desc ocispec.Descriptor, requireSignature bool) (map
 	}
 	if rootHash == "" {
 		return nil, fmt.Errorf("dm-verity signature present but missing expected root hash for layer %s", desc.Digest)
+	}
+	rootHashBytes, err := hex.DecodeString(rootHash)
+	if err != nil || len(rootHashBytes) != sha256.Size {
+		return nil, fmt.Errorf("layer %s has invalid SHA-256 dm-verity root hash %q", desc.Digest, rootHash)
 	}
 	if (tarIndex == "") != (merkleTree == "") {
 		return nil, fmt.Errorf("layer %s has incomplete precomputed dm-verity artifacts", desc.Digest)

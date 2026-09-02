@@ -19,7 +19,9 @@
 package dmverity
 
 import (
+	"encoding/base64"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -258,6 +260,35 @@ func createTempFile(t *testing.T, data []byte) string {
 
 func TestMetadataPath(t *testing.T) {
 	assert.Equal(t, "/path/to/layer.erofs.dmverity", MetadataPath("/path/to/layer.erofs"))
+}
+
+func TestAtomicSidecarWrites(t *testing.T) {
+	layer := filepath.Join(t.TempDir(), "layer.erofs")
+	signature := []byte("signature")
+
+	assert.NoError(t, WriteMetadata(layer, DmverityMetadata{
+		RootHash:   "root-hash",
+		HashOffset: 4096,
+	}))
+	assert.NoError(t, WriteSignature(layer, base64.StdEncoding.EncodeToString(signature)))
+
+	metadata, err := ReadMetadata(layer)
+	assert.NoError(t, err)
+	assert.Equal(t, "root-hash", metadata.RootHash)
+	assert.Equal(t, uint64(4096), metadata.HashOffset)
+
+	storedSignature, err := os.ReadFile(SignaturePath(layer))
+	assert.NoError(t, err)
+	assert.Equal(t, signature, storedSignature)
+	required, err := os.ReadFile(SignatureRequiredPath(layer))
+	assert.NoError(t, err)
+	assert.Equal(t, []byte("1\n"), required)
+
+	entries, err := os.ReadDir(filepath.Dir(layer))
+	assert.NoError(t, err)
+	for _, entry := range entries {
+		assert.NotContains(t, entry.Name(), ".tmp-")
+	}
 }
 
 func TestDevicePath(t *testing.T) {

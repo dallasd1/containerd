@@ -26,12 +26,13 @@ import (
 	"time"
 
 	"github.com/containerd/containerd/v2/internal/dmverity"
+	"github.com/opencontainers/go-digest"
 )
 
 func TestRequiredDmveritySignature(t *testing.T) {
 	layer := filepath.Join(t.TempDir(), "layer.erofs")
 
-	_, err := requiredDmveritySignature(layer)
+	_, err := requiredDmveritySignature(layer, "")
 	if err == nil {
 		t.Fatal("expected a missing signature to fail")
 	}
@@ -40,7 +41,7 @@ func TestRequiredDmveritySignature(t *testing.T) {
 	if err := os.WriteFile(signaturePath, nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	_, err = requiredDmveritySignature(layer)
+	_, err = requiredDmveritySignature(layer, "")
 	if err == nil {
 		t.Fatal("expected an empty signature to fail")
 	}
@@ -48,12 +49,20 @@ func TestRequiredDmveritySignature(t *testing.T) {
 	if err := os.WriteFile(signaturePath, []byte("signature"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	got, err := requiredDmveritySignature(layer)
+	got, err := requiredDmveritySignature(layer, "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got != signaturePath {
-		t.Fatalf("requiredDmveritySignature() = %q, want %q", got, signaturePath)
+	if string(got) != "signature" {
+		t.Fatalf("requiredDmveritySignature() = %q, want %q", got, "signature")
+	}
+
+	expectedDigest := digest.FromBytes(got).String()
+	if _, err := requiredDmveritySignature(layer, expectedDigest); err != nil {
+		t.Fatalf("expected matching digest to pass: %v", err)
+	}
+	if _, err := requiredDmveritySignature(layer, digest.FromString("different").String()); err == nil {
+		t.Fatal("expected mismatched signature digest to fail")
 	}
 }
 
@@ -114,8 +123,14 @@ func TestSharedLayerMountOptions(t *testing.T) {
 		{
 			// Bookkeeping options consumed earlier in Mount must not reach the
 			// kernel.
-			name:           "loop and dmverity options are dropped",
-			opts:           []string{"ro", "loop", "X-containerd.dmverity=auto"},
+			name: "loop and dmverity options are dropped",
+			opts: []string{
+				"ro",
+				"loop",
+				dmverity.MountOptionModePrefix + "on",
+				dmverity.MountOptionRootHashPrefix + strings.Repeat("ab", 32),
+				dmverity.MountOptionSignatureDigestPrefix + digest.FromString("signature").String(),
+			},
 			selinuxEnabled: false,
 			expected:       []string{"ro"},
 		},
@@ -177,6 +192,7 @@ func TestOpenOrReuseDmverityDeviceDoesNotSelfLock(t *testing.T) {
 			filepath.Join(t.TempDir(), "layer.erofs"),
 			deviceName,
 			&dmverity.DmverityMetadata{RootHash: strings.Repeat("00", 32)},
+			"",
 		)
 	}()
 

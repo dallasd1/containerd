@@ -41,6 +41,7 @@ import (
 	"github.com/containerd/containerd/v2/internal/fsverity"
 	"github.com/containerd/containerd/v2/pkg/archive/tartest"
 	"github.com/containerd/containerd/v2/pkg/namespaces"
+	snpkg "github.com/containerd/containerd/v2/pkg/snapshotters"
 	"github.com/containerd/containerd/v2/pkg/testutil"
 	"github.com/containerd/containerd/v2/plugins/content/local"
 	erofsdiffer "github.com/containerd/containerd/v2/plugins/diff/erofs"
@@ -379,6 +380,15 @@ func createDmverityMetadata(t *testing.T, layerBlob string) {
 	})
 }
 
+func signedMaterializationLabels(rootHash string, signature []byte) map[string]string {
+	return map[string]string{
+		snpkg.DmverityMaterializationVersionLabel:         snpkg.DmverityMaterializationVersion,
+		snpkg.DmverityMaterializationStateLabel:           snpkg.DmverityMaterializationStateSigned,
+		snpkg.DmverityMaterializationRootHashLabel:        rootHash,
+		snpkg.DmverityMaterializationSignatureDigestLabel: digest.FromBytes(signature).String(),
+	}
+}
+
 // Helper to create a test layer blob file
 func createTestLayerBlob(t *testing.T, dir string) string {
 	t.Helper()
@@ -399,7 +409,7 @@ func TestCreateErofsMount(t *testing.T) {
 	}
 
 	t.Run("creates regular erofs mount", func(t *testing.T) {
-		m, err := s.createErofsMount(layerBlob)
+		m, err := s.createErofsMount(layerBlob, nil)
 		require.NoError(t, err)
 
 		assert.Equal(t, "erofs", m.Type)
@@ -412,7 +422,7 @@ func TestCreateErofsMount(t *testing.T) {
 		s.dmverityMode = "on"
 		createDmverityMetadata(t, layerBlob)
 
-		m, err := s.createErofsMount(layerBlob)
+		m, err := s.createErofsMount(layerBlob, nil)
 		require.NoError(t, err)
 		// Mount type is always "erofs" - dm-verity detection happens in mount handler
 		assert.Equal(t, "erofs", m.Type)
@@ -431,7 +441,7 @@ func TestCreateErofsMount(t *testing.T) {
 
 		s.dmverityMode = "off"
 
-		m, err := s.createErofsMount(layerBlob)
+		m, err := s.createErofsMount(layerBlob, nil)
 		require.NoError(t, err)
 
 		assert.Equal(t, "erofs", m.Type)
@@ -641,9 +651,49 @@ func TestDmverityModeValidation(t *testing.T) {
 	})
 }
 
+func TestParentSnapshotInfos(t *testing.T) {
+	ctx := context.Background()
+	sn, err := NewSnapshotter(t.TempDir())
+	require.NoError(t, err)
+	s := sn.(*snapshotter)
+	t.Cleanup(func() { require.NoError(t, s.Close()) })
+
+	var snap storage.Snapshot
+	var info snapshots.Info
+	err = s.ms.WithTransaction(ctx, true, func(ctx context.Context) error {
+		if _, err := storage.CreateSnapshot(ctx, snapshots.KindActive, "base-active", ""); err != nil {
+			return err
+		}
+		if _, err := storage.CommitActive(ctx, "base-active", "base", snapshots.Usage{},
+			snapshots.WithLabels(map[string]string{"layer": "base"})); err != nil {
+			return err
+		}
+		if _, err := storage.CreateSnapshot(ctx, snapshots.KindActive, "top-active", "base"); err != nil {
+			return err
+		}
+		if _, err := storage.CommitActive(ctx, "top-active", "top", snapshots.Usage{},
+			snapshots.WithLabels(map[string]string{"layer": "top"})); err != nil {
+			return err
+		}
+		var err error
+		snap, err = storage.CreateSnapshot(ctx, snapshots.KindView, "view", "top")
+		if err != nil {
+			return err
+		}
+		_, info, _, err = storage.GetInfo(ctx, "view")
+		return err
+	})
+	require.NoError(t, err)
+
+	infos, err := s.parentSnapshotInfos(ctx, info, snap.ParentIDs)
+	require.NoError(t, err)
+	require.Len(t, infos, 2)
+	assert.Equal(t, "top", infos[0].Labels["layer"])
+	assert.Equal(t, "base", infos[1].Labels["layer"])
+}
+
 // TestApplyDmverityPolicy tests the dm-verity policy application logic
 func TestApplyDmverityPolicy(t *testing.T) {
-	testutil.RequiresRoot(t)
 	tmpDir := t.TempDir()
 	layerBlob := createTestLayerBlob(t, tmpDir)
 
@@ -652,7 +702,7 @@ func TestApplyDmverityPolicy(t *testing.T) {
 			dmverityMode: "on",
 		}
 
-		_, err := s.applyDmverityPolicy(layerBlob)
+		_, err := s.applyDmverityPolicy(layerBlob, nil)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "dm-verity mode is 'on' but .dmverity metadata not found")
 	})
@@ -662,7 +712,7 @@ func TestApplyDmverityPolicy(t *testing.T) {
 			dmverityMode: "auto",
 		}
 
-		opt, err := s.applyDmverityPolicy(layerBlob)
+		opt, err := s.applyDmverityPolicy(layerBlob, nil)
 		require.NoError(t, err)
 		assert.Empty(t, opt)
 	})
@@ -674,7 +724,7 @@ func TestApplyDmverityPolicy(t *testing.T) {
 			dmverityMode: "off",
 		}
 
-		opt, err := s.applyDmverityPolicy(layerBlob)
+		opt, err := s.applyDmverityPolicy(layerBlob, nil)
 		require.NoError(t, err)
 		assert.Equal(t, "X-containerd.dmverity=off", opt)
 	})
@@ -684,7 +734,7 @@ func TestApplyDmverityPolicy(t *testing.T) {
 		require.NoError(t, os.WriteFile(dmverity.MetadataPath(malformedLayer), []byte("{"), 0644))
 
 		s := &snapshotter{dmverityMode: "off"}
-		opt, err := s.applyDmverityPolicy(malformedLayer)
+		opt, err := s.applyDmverityPolicy(malformedLayer, nil)
 		require.NoError(t, err)
 		assert.Equal(t, "X-containerd.dmverity=off", opt)
 	})
@@ -696,7 +746,7 @@ func TestApplyDmverityPolicy(t *testing.T) {
 			dmverityMode: "on",
 		}
 
-		opt, err := s.applyDmverityPolicy(layerBlob)
+		opt, err := s.applyDmverityPolicy(layerBlob, nil)
 		require.NoError(t, err)
 		assert.Equal(t, "X-containerd.dmverity=on", opt)
 	})
@@ -708,7 +758,7 @@ func TestApplyDmverityPolicy(t *testing.T) {
 			dmverityMode: "auto",
 		}
 
-		opt, err := s.applyDmverityPolicy(layerBlob)
+		opt, err := s.applyDmverityPolicy(layerBlob, nil)
 		require.NoError(t, err)
 		assert.Empty(t, opt) // auto mode doesn't add explicit option
 	})
@@ -722,7 +772,7 @@ func TestApplyDmverityPolicy(t *testing.T) {
 		t.Cleanup(func() { os.Remove(requiredPath) })
 
 		s := &snapshotter{dmverityMode: "auto"}
-		_, err := s.applyDmverityPolicy(layerBlob)
+		_, err := s.applyDmverityPolicy(layerBlob, nil)
 		require.ErrorContains(t, err, "no usable signature")
 	})
 
@@ -731,7 +781,7 @@ func TestApplyDmverityPolicy(t *testing.T) {
 		require.NoError(t, os.WriteFile(dmverity.MetadataPath(legacyLayer), []byte(testDmverityMetadata), 0644))
 
 		s := &snapshotter{dmverityMode: "auto"}
-		opt, err := s.applyDmverityPolicy(legacyLayer)
+		opt, err := s.applyDmverityPolicy(legacyLayer, nil)
 		require.NoError(t, err)
 		assert.Equal(t, "X-containerd.dmverity=off", opt)
 	})
@@ -742,7 +792,83 @@ func TestApplyDmverityPolicy(t *testing.T) {
 		t.Cleanup(func() { os.Remove(signaturePath) })
 
 		s := &snapshotter{dmverityMode: "auto"}
-		_, err := s.applyDmverityPolicy(layerBlob)
+		_, err := s.applyDmverityPolicy(layerBlob, nil)
 		require.ErrorContains(t, err, "signature state but no metadata")
+	})
+
+	t.Run("recorded signed materialization requires sidecars", func(t *testing.T) {
+		signedLayer := createTestLayerBlob(t, t.TempDir())
+		labels := signedMaterializationLabels("recorded-root", []byte("signature"))
+
+		s := &snapshotter{dmverityMode: "auto"}
+		_, err := s.applyDmverityPolicy(signedLayer, labels)
+		require.ErrorContains(t, err, "signature state but no metadata")
+	})
+
+	t.Run("recorded signed materialization requires signature", func(t *testing.T) {
+		signedLayer := createTestLayerBlob(t, t.TempDir())
+		require.NoError(t, os.WriteFile(dmverity.MetadataPath(signedLayer), []byte(testDmverityMetadata), 0644))
+		labels := signedMaterializationLabels(
+			"fedcba098765432109876543210987654321098765432109876543210987",
+			[]byte("signature"),
+		)
+
+		s := &snapshotter{dmverityMode: "auto"}
+		_, err := s.applyDmverityPolicy(signedLayer, labels)
+		require.ErrorContains(t, err, "no usable signature")
+	})
+
+	t.Run("recorded signed materialization binds root hash", func(t *testing.T) {
+		signedLayer := createTestLayerBlob(t, t.TempDir())
+		createDmverityMetadata(t, signedLayer)
+		labels := signedMaterializationLabels("different-root", []byte("signature"))
+
+		s := &snapshotter{dmverityMode: "auto"}
+		_, err := s.applyDmverityPolicy(signedLayer, labels)
+		require.ErrorContains(t, err, "does not match recorded root hash")
+	})
+
+	t.Run("recorded signed materialization binds signature", func(t *testing.T) {
+		signedLayer := createTestLayerBlob(t, t.TempDir())
+		createDmverityMetadata(t, signedLayer)
+		labels := signedMaterializationLabels(
+			"fedcba098765432109876543210987654321098765432109876543210987",
+			[]byte("different signature"),
+		)
+
+		s := &snapshotter{dmverityMode: "auto"}
+		_, err := s.applyDmverityPolicy(signedLayer, labels)
+		require.ErrorContains(t, err, "does not match recorded digest")
+	})
+
+	t.Run("recorded signed materialization accepts matching sidecars", func(t *testing.T) {
+		signedLayer := createTestLayerBlob(t, t.TempDir())
+		createDmverityMetadata(t, signedLayer)
+		labels := signedMaterializationLabels(
+			"fedcba098765432109876543210987654321098765432109876543210987",
+			[]byte("signature"),
+		)
+
+		s := &snapshotter{dmverityMode: "auto"}
+		opt, err := s.applyDmverityPolicy(signedLayer, labels)
+		require.NoError(t, err)
+		assert.Equal(t, dmverity.MountOptionModePrefix+"on", opt)
+
+		m, err := s.createErofsMount(signedLayer, labels)
+		require.NoError(t, err)
+		assert.Contains(t, m.Options, dmverity.MountOptionModePrefix+"on")
+		assert.Contains(t, m.Options, dmverity.MountOptionRootHashPrefix+labels[snpkg.DmverityMaterializationRootHashLabel])
+		assert.Contains(t, m.Options, dmverity.MountOptionSignatureDigestPrefix+labels[snpkg.DmverityMaterializationSignatureDigestLabel])
+	})
+
+	t.Run("partial materialization labels fail closed", func(t *testing.T) {
+		labels := map[string]string{
+			snpkg.DmverityMaterializationVersionLabel: snpkg.DmverityMaterializationVersion,
+			snpkg.DmverityMaterializationStateLabel:   snpkg.DmverityMaterializationStateSigned,
+		}
+
+		s := &snapshotter{dmverityMode: "auto"}
+		_, err := s.applyDmverityPolicy(layerBlob, labels)
+		require.ErrorContains(t, err, "missing its dm-verity root hash label")
 	})
 }

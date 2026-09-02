@@ -26,6 +26,12 @@ import (
 	"path/filepath"
 )
 
+const (
+	MountOptionModePrefix            = "X-containerd.dmverity="
+	MountOptionRootHashPrefix        = "X-containerd.dmverity.root-hash="
+	MountOptionSignatureDigestPrefix = "X-containerd.dmverity.signature-digest="
+)
+
 type DmverityOptions struct {
 	// Salt for hashing, represented as a hex string
 	Salt string
@@ -87,10 +93,10 @@ func WriteSignature(layerBlobPath string, base64Sig string) error {
 	if err != nil {
 		return fmt.Errorf("failed to decode signature: %w", err)
 	}
-	if err := os.WriteFile(sigPath, sigBytes, 0644); err != nil {
+	if err := writeFileAtomic(sigPath, sigBytes, 0644); err != nil {
 		return fmt.Errorf("failed to write signature file: %w", err)
 	}
-	if err := os.WriteFile(SignatureRequiredPath(layerBlobPath), []byte("1\n"), 0644); err != nil {
+	if err := writeFileAtomic(SignatureRequiredPath(layerBlobPath), []byte("1\n"), 0644); err != nil {
 		return fmt.Errorf("failed to write signature-required marker: %w", err)
 	}
 	return nil
@@ -121,7 +127,7 @@ func WriteMetadata(layerBlobPath string, metadata DmverityMetadata) error {
 	if err != nil {
 		return fmt.Errorf("failed to marshal dm-verity metadata: %w", err)
 	}
-	if err := os.WriteFile(MetadataPath(layerBlobPath), data, 0644); err != nil {
+	if err := writeFileAtomic(MetadataPath(layerBlobPath), data, 0644); err != nil {
 		return fmt.Errorf("failed to write dm-verity metadata: %w", err)
 	}
 	return nil

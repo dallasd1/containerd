@@ -60,6 +60,12 @@ func TestDmveritySnapshotLabels(t *testing.T) {
 		TargetLayerRootHashLabel:  digest.FromString("root").Hex(),
 	}), false)
 	require.ErrorContains(t, err, "invalid dm-verity signature encoding")
+
+	_, err = DmveritySnapshotLabels(layer(map[string]string{
+		TargetLayerSignatureLabel: base64.StdEncoding.EncodeToString(signature),
+		TargetLayerRootHashLabel:  "abcd",
+	}), false)
+	require.ErrorContains(t, err, "invalid SHA-256 dm-verity root hash")
 }
 
 func TestValidateDmveritySnapshot(t *testing.T) {
