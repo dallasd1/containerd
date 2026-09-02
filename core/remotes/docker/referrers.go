@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 
 	"github.com/containerd/containerd/v2/core/remotes"
@@ -32,53 +33,382 @@ import (
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
+const (
+	maxReferrerPages       = 64
+	maxReferrerDescriptors = 4096
+)
+
+type referrersPage struct {
+	response        *http.Response
+	request         *request
+	allowPagination bool
+	fixedQuery      url.Values
+}
+
 func (r dockerFetcher) FetchReferrers(ctx context.Context, dgst digest.Digest, opts ...remotes.FetchReferrersOpt) ([]ocispec.Descriptor, error) {
 	var config remotes.FetchReferrersConfig
 	for _, opt := range opts {
-		opt(ctx, &config)
+		if err := opt(ctx, &config); err != nil {
+			return nil, err
+		}
 	}
-	rc, size, err := r.openReferrers(ctx, dgst, config)
+
+	ctx, err := ContextWithRepositoryScope(ctx, r.refspec, false)
+	if err != nil {
+		return nil, err
+	}
+	page, err := r.openReferrers(ctx, dgst, config)
 	if err != nil {
 		if errdefs.IsNotFound(err) {
 			return []ocispec.Descriptor{}, nil
 		}
 		return nil, err
 	}
-	defer rc.Close()
-	if size < 0 {
-		size = MaxManifestSize
-	} else if size > MaxManifestSize {
-		return nil, fmt.Errorf("referrers index size %d exceeds maximum allowed %d: %w", size, MaxManifestSize, errdefs.ErrNotFound)
-	}
 
-	var index ocispec.Index
-	dec := json.NewDecoder(io.LimitReader(rc, size))
-	if err := dec.Decode(&index); err != nil {
-		return nil, fmt.Errorf("failed to decode referrers index: %w", err)
-	}
-	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
-		return nil, fmt.Errorf("unexpected data after JSON object")
-	}
-
-	if len(config.ArtifactTypes) == 0 {
-		return index.Manifests, nil
-	}
-
-	var referrers []ocispec.Descriptor
 	tFilter := map[string]struct{}{}
-	for _, t := range config.ArtifactTypes {
-		tFilter[t] = struct{}{}
+	for _, artifactType := range config.ArtifactTypes {
+		tFilter[artifactType] = struct{}{}
 	}
-	for _, desc := range index.Manifests {
-		if _, ok := tFilter[desc.ArtifactType]; ok {
-			referrers = append(referrers, desc)
+
+	var (
+		referrers       []ocispec.Descriptor
+		descriptorCount int
+		totalBytes      int64
+		seenPages       = map[string]struct{}{page.request.String(): {}}
+	)
+	for pageNumber := 1; ; pageNumber++ {
+		remaining := MaxManifestSize - totalBytes
+		manifests, readBytes, decodeErr := decodeReferrersIndex(
+			page.response.Body,
+			page.response.ContentLength,
+			remaining,
+			maxReferrerDescriptors-descriptorCount,
+		)
+		closeErr := page.response.Body.Close()
+		if decodeErr != nil {
+			return nil, decodeErr
 		}
+		if closeErr != nil {
+			return nil, fmt.Errorf("close referrers response: %w", closeErr)
+		}
+		totalBytes += readBytes
+
+		descriptorCount += len(manifests)
+		if len(tFilter) == 0 {
+			referrers = append(referrers, manifests...)
+		} else {
+			for _, desc := range manifests {
+				if _, ok := tFilter[desc.ArtifactType]; ok {
+					referrers = append(referrers, desc)
+				}
+			}
+		}
+
+		if !page.allowPagination {
+			break
+		}
+		next, err := nextLink(page.response.Header.Values("Link"))
+		if err != nil {
+			return nil, err
+		}
+		if next == "" {
+			break
+		}
+		if pageNumber == maxReferrerPages {
+			return nil, fmt.Errorf("referrers index exceeds maximum page count %d", maxReferrerPages)
+		}
+
+		nextRequest, canonicalURL, err := nextReferrersRequest(page.request, page.fixedQuery, next)
+		if err != nil {
+			return nil, err
+		}
+		if _, ok := seenPages[canonicalURL]; ok {
+			return nil, fmt.Errorf("referrers pagination loop detected at %q", canonicalURL)
+		}
+		seenPages[canonicalURL] = struct{}{}
+
+		// Pagination is tied to the selected host and cursor. No host fallback
+		// follows this request, so enable the request helper's terminal-host
+		// retry behavior for transient registry errors.
+		response, err := r.openReferrersRequest(ctx, nextRequest, true)
+		if err != nil {
+			return nil, fmt.Errorf("fetch next referrers page: %w", err)
+		}
+		page.response = response
+		page.request = nextRequest
+		// fixedQuery and allowPagination remain tied to the selected registry
+		// endpoint from the first page.
 	}
 	return referrers, nil
 }
 
-func (r dockerFetcher) openReferrers(ctx context.Context, dgst digest.Digest, config remotes.FetchReferrersConfig) (io.ReadCloser, int64, error) {
-	mediaType := ocispec.MediaTypeImageIndex
+func decodeReferrersIndex(body io.Reader, contentLength, byteLimit int64, descriptorLimit int) ([]ocispec.Descriptor, int64, error) {
+	if byteLimit <= 0 {
+		return nil, 0, fmt.Errorf("referrers index exceeds maximum total size %d", MaxManifestSize)
+	}
+	if contentLength > byteLimit {
+		return nil, 0, fmt.Errorf(
+			"referrers index size %d exceeds maximum allowed %d: %w",
+			contentLength,
+			byteLimit,
+			errdefs.ErrNotFound,
+		)
+	}
+
+	counter := &countingReader{reader: io.LimitReader(body, byteLimit+1)}
+	dec := json.NewDecoder(counter)
+	token, err := dec.Token()
+	if err != nil {
+		return nil, counter.bytesRead, fmt.Errorf("failed to decode referrers index: %w", err)
+	}
+	if token != json.Delim('{') {
+		return nil, counter.bytesRead, fmt.Errorf("referrers index is not a JSON object")
+	}
+
+	var manifests []ocispec.Descriptor
+	for dec.More() {
+		token, err := dec.Token()
+		if err != nil {
+			return nil, counter.bytesRead, fmt.Errorf("failed to decode referrers index field: %w", err)
+		}
+		field, ok := token.(string)
+		if !ok {
+			return nil, counter.bytesRead, fmt.Errorf("referrers index field name is not a string")
+		}
+		if field != "manifests" {
+			var ignored json.RawMessage
+			if err := dec.Decode(&ignored); err != nil {
+				return nil, counter.bytesRead, fmt.Errorf("failed to decode referrers index field %q: %w", field, err)
+			}
+			continue
+		}
+
+		token, err = dec.Token()
+		if err != nil {
+			return nil, counter.bytesRead, fmt.Errorf("failed to decode referrers manifests: %w", err)
+		}
+		if token != json.Delim('[') {
+			return nil, counter.bytesRead, fmt.Errorf("referrers index manifests is not a JSON array")
+		}
+		for dec.More() {
+			if len(manifests) >= descriptorLimit {
+				return nil, counter.bytesRead, fmt.Errorf(
+					"referrers index contains more than %d descriptors",
+					maxReferrerDescriptors,
+				)
+			}
+			var descriptor ocispec.Descriptor
+			if err := dec.Decode(&descriptor); err != nil {
+				return nil, counter.bytesRead, fmt.Errorf("failed to decode referrer descriptor: %w", err)
+			}
+			manifests = append(manifests, descriptor)
+		}
+		if _, err := dec.Token(); err != nil {
+			return nil, counter.bytesRead, fmt.Errorf("failed to close referrers manifests array: %w", err)
+		}
+	}
+	if _, err := dec.Token(); err != nil {
+		return nil, counter.bytesRead, fmt.Errorf("failed to close referrers index: %w", err)
+	}
+	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
+		return nil, counter.bytesRead, fmt.Errorf("unexpected data after JSON object")
+	}
+	if counter.bytesRead > byteLimit {
+		return nil, counter.bytesRead, fmt.Errorf("referrers index exceeds maximum total size %d", MaxManifestSize)
+	}
+	return manifests, counter.bytesRead, nil
+}
+
+func nextReferrersRequest(current *request, fixedQuery url.Values, link string) (*request, string, error) {
+	baseURL, err := url.Parse(current.String())
+	if err != nil {
+		return nil, "", fmt.Errorf("parse current referrers URL: %w", err)
+	}
+	linkURL, err := url.Parse(link)
+	if err != nil {
+		return nil, "", fmt.Errorf("parse referrers pagination link %q: %w", link, err)
+	}
+	if linkURL.User != nil || linkURL.Fragment != "" {
+		return nil, "", fmt.Errorf("referrers pagination link %q contains user information or a fragment", link)
+	}
+
+	nextURL := baseURL.ResolveReference(linkURL)
+	if !sameOrigin(nextURL, baseURL) {
+		return nil, "", fmt.Errorf("referrers pagination link %q changes registry origin", link)
+	}
+	if nextURL.EscapedPath() != baseURL.EscapedPath() {
+		return nil, "", fmt.Errorf("referrers pagination link %q changes the referrers endpoint", link)
+	}
+
+	query := nextURL.Query()
+	for key, values := range fixedQuery {
+		query.Del(key)
+		for _, value := range values {
+			query.Add(key, value)
+		}
+	}
+	nextURL.RawQuery = query.Encode()
+
+	nextRequest := current.clone()
+	nextRequest.path = nextURL.RequestURI()
+	return nextRequest, nextRequest.String(), nil
+}
+
+func sameOrigin(first, second *url.URL) bool {
+	return strings.EqualFold(first.Scheme, second.Scheme) &&
+		strings.EqualFold(first.Hostname(), second.Hostname()) &&
+		effectivePort(first) == effectivePort(second)
+}
+
+func effectivePort(value *url.URL) string {
+	if port := value.Port(); port != "" {
+		return port
+	}
+	switch strings.ToLower(value.Scheme) {
+	case "http":
+		return "80"
+	case "https":
+		return "443"
+	default:
+		return ""
+	}
+}
+
+func nextLink(values []string) (string, error) {
+	var next string
+	for _, value := range values {
+		links, err := splitLinkValue(value, ',')
+		if err != nil {
+			return "", fmt.Errorf("parse referrers Link header: %w", err)
+		}
+		for _, link := range links {
+			link = strings.TrimSpace(link)
+			if !strings.HasPrefix(link, "<") {
+				return "", fmt.Errorf("parse referrers Link header: link %q does not start with '<'", link)
+			}
+			end := strings.IndexByte(link, '>')
+			if end < 0 {
+				return "", fmt.Errorf("parse referrers Link header: link %q has no closing '>'", link)
+			}
+			target := link[1:end]
+			if target == "" {
+				return "", fmt.Errorf("parse referrers Link header: link target is empty")
+			}
+
+			parameters := strings.TrimSpace(link[end+1:])
+			if parameters == "" {
+				continue
+			}
+			if !strings.HasPrefix(parameters, ";") {
+				return "", fmt.Errorf("parse referrers Link header: link %q has malformed parameters", link)
+			}
+			parts, err := splitLinkValue(strings.TrimPrefix(parameters, ";"), ';')
+			if err != nil {
+				return "", fmt.Errorf("parse referrers Link header: %w", err)
+			}
+			for _, part := range parts {
+				key, value, ok := strings.Cut(strings.TrimSpace(part), "=")
+				if !ok || !strings.EqualFold(strings.TrimSpace(key), "rel") {
+					continue
+				}
+				value = strings.TrimSpace(value)
+				if strings.HasPrefix(value, `"`) {
+					if len(value) < 2 || !strings.HasSuffix(value, `"`) {
+						return "", fmt.Errorf("parse referrers Link header: malformed rel parameter %q", value)
+					}
+					value = value[1 : len(value)-1]
+				}
+				for _, relation := range strings.Fields(value) {
+					if !strings.EqualFold(relation, "next") {
+						continue
+					}
+					if next != "" {
+						return "", fmt.Errorf("referrers Link header contains multiple next links")
+					}
+					next = target
+				}
+			}
+		}
+	}
+	return next, nil
+}
+
+func splitLinkValue(value string, separator byte) ([]string, error) {
+	var (
+		parts   []string
+		start   int
+		inAngle bool
+		inQuote bool
+		escaped bool
+	)
+	for i := range len(value) {
+		char := value[i]
+		switch {
+		case escaped:
+			escaped = false
+		case inQuote && char == '\\':
+			escaped = true
+		case char == '"':
+			inQuote = !inQuote
+		case !inQuote && char == '<':
+			if inAngle {
+				return nil, fmt.Errorf("nested '<' in %q", value)
+			}
+			inAngle = true
+		case !inQuote && char == '>':
+			if !inAngle {
+				return nil, fmt.Errorf("unexpected '>' in %q", value)
+			}
+			inAngle = false
+		case !inQuote && !inAngle && char == separator:
+			parts = append(parts, strings.TrimSpace(value[start:i]))
+			start = i + 1
+		}
+	}
+	if escaped || inQuote || inAngle {
+		return nil, fmt.Errorf("unterminated Link header value %q", value)
+	}
+	parts = append(parts, strings.TrimSpace(value[start:]))
+	for _, part := range parts {
+		if part == "" {
+			return nil, fmt.Errorf("empty Link header value")
+		}
+	}
+	return parts, nil
+}
+
+func requestQuery(req *request) (url.Values, error) {
+	requestURL, err := url.Parse(req.String())
+	if err != nil {
+		return nil, err
+	}
+	return requestURL.Query(), nil
+}
+
+func (r dockerFetcher) openReferrersRequest(ctx context.Context, req *request, lastHost bool) (*http.Response, error) {
+	req.setMediaType(ocispec.MediaTypeImageIndex)
+	// Referrers indexes are small JSON responses. Let net/http negotiate and
+	// transparently decode gzip so ContentLength describes decoded data (or is
+	// unknown) and the aggregate byte limit remains unambiguous.
+	req.header.Del("Accept-Encoding")
+	if err := r.Acquire(ctx, 1); err != nil {
+		return nil, err
+	}
+	response, err := req.doWithRetries(ctx, lastHost, withErrorCheck)
+	if err != nil {
+		r.Release(1)
+		return nil, err
+	}
+	response.Body = &fnOnClose{
+		BeforeClose: func() {
+			r.Release(1)
+		},
+		ReadCloser: response.Body,
+	}
+	return response, nil
+}
+
+func (r dockerFetcher) openReferrers(ctx context.Context, dgst digest.Digest, config remotes.FetchReferrersConfig) (*referrersPage, error) {
 	ctx = log.WithLogger(ctx, log.G(ctx).WithField("digest", dgst))
 
 	hosts := r.filterHosts(HostCapabilityReferrers)
@@ -86,16 +416,11 @@ func (r dockerFetcher) openReferrers(ctx context.Context, dgst digest.Digest, co
 	if len(hosts) == 0 {
 		fallbackHosts = r.filterHosts(HostCapabilityResolve)
 		if len(fallbackHosts) == 0 {
-			return nil, 0, fmt.Errorf("no referrers hosts: %w", errdefs.ErrNotFound)
+			return nil, fmt.Errorf("no referrers hosts: %w", errdefs.ErrNotFound)
 		}
 	} else {
 		// If referrers are defined, use same hosts for fallback
 		fallbackHosts = hosts
-	}
-
-	ctx, err := ContextWithRepositoryScope(ctx, r.refspec, false)
-	if err != nil {
-		return nil, 0, err
 	}
 
 	var firstErr error
@@ -103,21 +428,25 @@ func (r dockerFetcher) openReferrers(ctx context.Context, dgst digest.Digest, co
 		req := r.request(host, http.MethodGet, "referrers", dgst.String())
 		for _, artifactType := range config.ArtifactTypes {
 			if err := req.addQuery("artifactType", artifactType); err != nil {
-				return nil, 0, err
+				return nil, err
 			}
 		}
 		for k, vs := range config.QueryFilters {
 			for _, v := range vs {
 				if err := req.addQuery(k, v); err != nil {
-					return nil, 0, err
+					return nil, err
 				}
 			}
 		}
 		if err := req.addNamespace(r.refspec.Hostname()); err != nil {
-			return nil, 0, err
+			return nil, err
 		}
 
-		rc, cl, err := r.open(ctx, req, mediaType, 0, i == len(hosts)-1)
+		fixedQuery, err := requestQuery(req)
+		if err != nil {
+			return nil, err
+		}
+		response, err := r.openReferrersRequest(ctx, req, i == len(hosts)-1)
 		if err != nil {
 			if !errdefs.IsNotFound(err) {
 				log.G(ctx).WithError(err).WithField("host", host.Host).Debug("error fetching referrers")
@@ -126,16 +455,21 @@ func (r dockerFetcher) openReferrers(ctx context.Context, dgst digest.Digest, co
 				}
 			}
 		} else {
-			return rc, cl, nil
+			return &referrersPage{
+				response:        response,
+				request:         req,
+				allowPagination: true,
+				fixedQuery:      fixedQuery,
+			}, nil
 		}
 	}
 
 	for i, host := range fallbackHosts {
 		req := r.request(host, http.MethodGet, "manifests", strings.Replace(dgst.String(), ":", "-", 1))
 		if err := req.addNamespace(r.refspec.Hostname()); err != nil {
-			return nil, 0, err
+			return nil, err
 		}
-		rc, cl, err := r.open(ctx, req, mediaType, 0, i == len(fallbackHosts)-1)
+		response, err := r.openReferrersRequest(ctx, req, i == len(fallbackHosts)-1)
 		if err != nil {
 			if errdefs.IsNotFound(err) {
 				// Equivalent to empty referrers list
@@ -147,12 +481,15 @@ func (r dockerFetcher) openReferrers(ctx context.Context, dgst digest.Digest, co
 				firstErr = err
 			}
 		} else {
-			return rc, cl, nil
+			return &referrersPage{
+				response: response,
+				request:  req,
+			}, nil
 		}
 	}
 	if firstErr == nil {
 		firstErr = fmt.Errorf("could not be found at any host: %w", errdefs.ErrNotFound)
 	}
 
-	return nil, 0, firstErr
+	return nil, firstErr
 }
