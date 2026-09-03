@@ -205,7 +205,7 @@ metadata:
 
 When dm-verity is enabled, layers carrying a valid signature and root-hash
 annotation are materialized with dm-verity metadata. A precomputed referrer
-supplies the EROFS tar index and Merkle tree; a signed layer without
+supplies EROFS metadata and a Merkle tree; a signed layer without
 precomputed artifacts is formatted locally and its computed root hash must
 match the signed value. Unsigned layers remain ordinary EROFS unless
 `require_signatures` rejects them.
@@ -363,7 +363,7 @@ Instead of extracting the entire tar archive to create an EROFS filesystem, the 
 2. Appends the original tar content to the index
 3. Creates a combined file: `[Tar index][Original tar content]`
 
-The tar index can be stored in a registry alongside image layers, allowing nodes to fetch it directly when needed. Typically, the tar index is much smaller than a full EROFS blob, making it more efficient to store and transfer. If the tar index is not available in the registry, it can be generated on the node as a fallback. When integrating with dm-verity, the registry can also store the dm-verity Merkle tree and root hash signature together with the tar index, enabling nodes to retrieve all necessary artifacts without redundant computation.
+The EROFS metadata produced by tar-index mode can be stored in a registry alongside image layers, allowing nodes to fetch it directly when needed. Typically, this metadata is much smaller than a full EROFS blob, making it more efficient to store and transfer. If the metadata is not available in the registry, it can be generated on the node as a fallback. When integrating with dm-verity, the registry can also store the dm-verity Merkle tree and root hash signature together with the EROFS metadata, enabling nodes to retrieve all necessary artifacts without redundant computation.
 
 In addition, we have a tar diffID for each layer according to the OCI image spec, so we don't need to reinvent a new way to verify the image layer content for confidential containers but just calculate the sha256 of the original tar data (because erofs could just reuse the tar data with 512-byte fs block size and build a minimal index for direct mounting of tar) out of the tar index mode in the guest and compare it with each diffID.
 

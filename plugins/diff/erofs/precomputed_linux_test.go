@@ -60,9 +60,9 @@ func TestApplyPrecomputedArtifacts(t *testing.T) {
 
 	cs, err := local.NewStore(t.TempDir())
 	require.NoError(t, err)
-	indexDesc := writeTestBlob(t, ctx, cs, index, snapshotters.TarIndexArtifactMediaType)
+	metadataDesc := writeTestBlob(t, ctx, cs, index, snapshotters.EROFSMetadataArtifactMediaType)
 	treeDesc := writeTestBlob(t, ctx, cs, tree, snapshotters.MerkleTreeArtifactMediaType)
-	sourceDesc := descriptorWithPrecomputedArtifacts(t, sourceDigest, indexDesc, treeDesc, rootHash)
+	sourceDesc := descriptorWithPrecomputedArtifacts(t, sourceDigest, metadataDesc, treeDesc, rootHash)
 
 	layerBlobPath := filepath.Join(t.TempDir(), "layer.erofs")
 	differ := erofsDiff{store: cs, enableDmverity: true}
@@ -112,9 +112,9 @@ func TestApplyPrecomputedArtifactsRejectsWrongRootHash(t *testing.T) {
 
 	cs, err := local.NewStore(t.TempDir())
 	require.NoError(t, err)
-	indexDesc := writeTestBlob(t, ctx, cs, index, snapshotters.TarIndexArtifactMediaType)
+	metadataDesc := writeTestBlob(t, ctx, cs, index, snapshotters.EROFSMetadataArtifactMediaType)
 	treeDesc := writeTestBlob(t, ctx, cs, tree, snapshotters.MerkleTreeArtifactMediaType)
-	sourceDesc := descriptorWithPrecomputedArtifacts(t, sourceDigest, indexDesc, treeDesc, digest.FromString("wrong root").Hex())
+	sourceDesc := descriptorWithPrecomputedArtifacts(t, sourceDigest, metadataDesc, treeDesc, digest.FromString("wrong root").Hex())
 
 	layerBlobPath := filepath.Join(t.TempDir(), "layer.erofs")
 	differ := erofsDiff{store: cs, enableDmverity: true}
@@ -146,12 +146,12 @@ func TestApplyPrecomputedArtifactsRejectsOverlongRootHash(t *testing.T) {
 
 	cs, err := local.NewStore(t.TempDir())
 	require.NoError(t, err)
-	indexDesc := writeTestBlob(t, ctx, cs, index, snapshotters.TarIndexArtifactMediaType)
+	metadataDesc := writeTestBlob(t, ctx, cs, index, snapshotters.EROFSMetadataArtifactMediaType)
 	treeDesc := writeTestBlob(t, ctx, cs, tree, snapshotters.MerkleTreeArtifactMediaType)
 	sourceDesc := descriptorWithPrecomputedArtifacts(
 		t,
 		sourceDigest,
-		indexDesc,
+		metadataDesc,
 		treeDesc,
 		rootHash+"00",
 	)
@@ -198,9 +198,9 @@ func TestApplyPrecomputedArtifactsRejectsUnexpectedVerityBlockSize(t *testing.T)
 
 	cs, err := local.NewStore(t.TempDir())
 	require.NoError(t, err)
-	indexDesc := writeTestBlob(t, ctx, cs, index, snapshotters.TarIndexArtifactMediaType)
+	metadataDesc := writeTestBlob(t, ctx, cs, index, snapshotters.EROFSMetadataArtifactMediaType)
 	treeDesc := writeTestBlob(t, ctx, cs, tree, snapshotters.MerkleTreeArtifactMediaType)
-	sourceDesc := descriptorWithPrecomputedArtifacts(t, sourceDigest, indexDesc, treeDesc, rootHash)
+	sourceDesc := descriptorWithPrecomputedArtifacts(t, sourceDigest, metadataDesc, treeDesc, rootHash)
 
 	differ := erofsDiff{store: cs, enableDmverity: true}
 	_, err = differ.applyPrecomputedArtifacts(
@@ -232,9 +232,9 @@ func TestApplyPrecomputedArtifactsRejectsTreeCoveringOnlyPrefix(t *testing.T) {
 
 	cs, err := local.NewStore(t.TempDir())
 	require.NoError(t, err)
-	indexDesc := writeTestBlob(t, ctx, cs, index, snapshotters.TarIndexArtifactMediaType)
+	metadataDesc := writeTestBlob(t, ctx, cs, index, snapshotters.EROFSMetadataArtifactMediaType)
 	treeDesc := writeTestBlob(t, ctx, cs, tree, snapshotters.MerkleTreeArtifactMediaType)
-	sourceDesc := descriptorWithPrecomputedArtifacts(t, sourceDigest, indexDesc, treeDesc, rootHash)
+	sourceDesc := descriptorWithPrecomputedArtifacts(t, sourceDigest, metadataDesc, treeDesc, rootHash)
 
 	differ := erofsDiff{store: cs, enableDmverity: true}
 	_, err = differ.applyPrecomputedArtifacts(
@@ -266,9 +266,9 @@ func TestApplyPrecomputedArtifactsRejectsSourceLayerSubstitution(t *testing.T) {
 
 	cs, err := local.NewStore(t.TempDir())
 	require.NoError(t, err)
-	indexDesc := writeTestBlob(t, ctx, cs, index, snapshotters.TarIndexArtifactMediaType)
+	metadataDesc := writeTestBlob(t, ctx, cs, index, snapshotters.EROFSMetadataArtifactMediaType)
 	treeDesc := writeTestBlob(t, ctx, cs, tree, snapshotters.MerkleTreeArtifactMediaType)
-	sourceDesc := descriptorWithPrecomputedArtifacts(t, requestedSourceDigest, indexDesc, treeDesc, rootHash)
+	sourceDesc := descriptorWithPrecomputedArtifacts(t, requestedSourceDigest, metadataDesc, treeDesc, rootHash)
 
 	differ := erofsDiff{store: cs, enableDmverity: true}
 	_, err = differ.applyPrecomputedArtifacts(
@@ -299,9 +299,9 @@ func TestApplyPrecomputedArtifactsRejectsModifiedSourceTar(t *testing.T) {
 
 	cs, err := local.NewStore(t.TempDir())
 	require.NoError(t, err)
-	indexDesc := writeTestBlob(t, ctx, cs, index, snapshotters.TarIndexArtifactMediaType)
+	metadataDesc := writeTestBlob(t, ctx, cs, index, snapshotters.EROFSMetadataArtifactMediaType)
 	treeDesc := writeTestBlob(t, ctx, cs, tree, snapshotters.MerkleTreeArtifactMediaType)
-	sourceDesc := descriptorWithPrecomputedArtifacts(t, sourceDigest, indexDesc, treeDesc, rootHash)
+	sourceDesc := descriptorWithPrecomputedArtifacts(t, sourceDigest, metadataDesc, treeDesc, rootHash)
 
 	layerBlobPath := filepath.Join(t.TempDir(), "layer.erofs")
 	differ := erofsDiff{store: cs, enableDmverity: true}
@@ -327,18 +327,18 @@ func writeTestBlob(t *testing.T, ctx context.Context, cs content.Store, data []b
 	return desc
 }
 
-func descriptorWithPrecomputedArtifacts(t *testing.T, sourceDigest digest.Digest, indexDesc, treeDesc ocispec.Descriptor, rootHash string) ocispec.Descriptor {
+func descriptorWithPrecomputedArtifacts(t *testing.T, sourceDigest digest.Digest, metadataDesc, treeDesc ocispec.Descriptor, rootHash string) ocispec.Descriptor {
 	t.Helper()
-	encodedIndexBytes, err := json.Marshal(indexDesc)
+	encodedMetadataBytes, err := json.Marshal(metadataDesc)
 	require.NoError(t, err)
 	encodedTreeBytes, err := json.Marshal(treeDesc)
 	require.NoError(t, err)
 	return ocispec.Descriptor{
 		Digest: sourceDigest,
 		Annotations: map[string]string{
-			snapshotters.TargetLayerTarIndexDescriptorLabel:   string(encodedIndexBytes),
-			snapshotters.TargetLayerMerkleTreeDescriptorLabel: string(encodedTreeBytes),
-			snapshotters.TargetLayerRootHashLabel:             rootHash,
+			snapshotters.TargetLayerEROFSMetadataDescriptorLabel: string(encodedMetadataBytes),
+			snapshotters.TargetLayerMerkleTreeDescriptorLabel:    string(encodedTreeBytes),
+			snapshotters.TargetLayerRootHashLabel:                rootHash,
 		},
 	}
 }

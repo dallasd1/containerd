@@ -49,6 +49,12 @@ var (
 	testRootHashB = digest.FromString("test root hash B").Encoded()
 )
 
+func TestDmverityArtifactSchema(t *testing.T) {
+	assert.Equal(t, "application/vnd.containerd.erofs.dmverity.v1", SignatureArtifactType)
+	assert.Equal(t, "application/vnd.containerd.erofs.metadata.v1", EROFSMetadataArtifactMediaType)
+	assert.Equal(t, "containerd.io/dmverity/erofs-metadata-descriptor", TargetLayerEROFSMetadataDescriptorLabel)
+}
+
 func (f *artifactFetcher) Fetch(_ context.Context, desc ocispec.Descriptor) (io.ReadCloser, error) {
 	if f.rejectExternalURLs && len(desc.URLs) > 0 {
 		return nil, errors.New("external descriptor URL was not removed")
@@ -91,17 +97,17 @@ func TestSignatureHandlerPrecomputedBundle(t *testing.T) {
 		sigLayerRootHashAnnotation:  testRootHashA,
 		sigLayerSignatureAnnotation: base64.StdEncoding.EncodeToString(signatureBytes),
 	}
-	indexBytes := make([]byte, tarIndexAlignment)
-	copy(indexBytes, "precomputed tar index")
-	indexDesc := descriptorFor(indexBytes, TarIndexArtifactMediaType)
-	indexDesc.Annotations = precomputedAnnotations(sourceLayer.Digest.String())
+	metadataBytes := make([]byte, tarIndexAlignment)
+	copy(metadataBytes, "precomputed EROFS metadata")
+	metadataDesc := descriptorFor(metadataBytes, EROFSMetadataArtifactMediaType)
+	metadataDesc.Annotations = precomputedAnnotations(sourceLayer.Digest.String())
 	treeDesc := descriptorFor([]byte("precomputed tree"), MerkleTreeArtifactMediaType)
 	treeDesc.Annotations = precomputedAnnotations(sourceLayer.Digest.String())
 	bundle := ocispec.Manifest{
 		MediaType:    ocispec.MediaTypeImageManifest,
 		ArtifactType: SignatureArtifactType,
 		Subject:      &sourceManifest,
-		Layers:       []ocispec.Descriptor{signatureDesc, indexDesc, treeDesc},
+		Layers:       []ocispec.Descriptor{signatureDesc, metadataDesc, treeDesc},
 	}
 	bundleBytes, err := json.Marshal(bundle)
 	require.NoError(t, err)
@@ -110,9 +116,9 @@ func TestSignatureHandlerPrecomputedBundle(t *testing.T) {
 
 	fetcher := &artifactFetcher{
 		blobs: map[digest.Digest][]byte{
-			bundleDesc.Digest: bundleBytes,
-			indexDesc.Digest:  indexBytes,
-			treeDesc.Digest:   []byte("precomputed tree"),
+			bundleDesc.Digest:   bundleBytes,
+			metadataDesc.Digest: metadataBytes,
+			treeDesc.Digest:     []byte("precomputed tree"),
 		},
 		refs: map[digest.Digest][]ocispec.Descriptor{
 			sourceManifest.Digest: {bundleDesc},
@@ -140,14 +146,14 @@ func TestSignatureHandlerPrecomputedBundle(t *testing.T) {
 	assert.Equal(t, testRootHashA, layer.Annotations[TargetLayerRootHashLabel])
 	assert.Equal(t, base64.StdEncoding.EncodeToString(signatureBytes), layer.Annotations[TargetLayerSignatureLabel])
 
-	gotIndex, err := ParseTargetDescriptor(layer.Annotations[TargetLayerTarIndexDescriptorLabel])
+	gotMetadata, err := ParseTargetDescriptor(layer.Annotations[TargetLayerEROFSMetadataDescriptorLabel])
 	require.NoError(t, err)
-	assert.Equal(t, indexDesc.Digest, gotIndex.Digest)
+	assert.Equal(t, metadataDesc.Digest, gotMetadata.Digest)
 	gotTree, err := ParseTargetDescriptor(layer.Annotations[TargetLayerMerkleTreeDescriptorLabel])
 	require.NoError(t, err)
 	assert.Equal(t, treeDesc.Digest, gotTree.Digest)
 	assert.Equal(t, layer.Annotations, children[2].Annotations)
-	assert.ElementsMatch(t, []digest.Digest{signatureDesc.Digest, indexDesc.Digest, treeDesc.Digest}, fetched)
+	assert.ElementsMatch(t, []digest.Digest{signatureDesc.Digest, metadataDesc.Digest, treeDesc.Digest}, fetched)
 	assert.Equal(t, signatureBytes, inlineSignature)
 }
 
@@ -269,7 +275,7 @@ func TestSignatureHandlerPersistsBundleForDeferredUnpack(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, deferredChildren, 2)
 	assert.Equal(t, testRootHashA, deferredChildren[1].Annotations[TargetLayerRootHashLabel])
-	assert.NotEmpty(t, deferredChildren[1].Annotations[TargetLayerTarIndexDescriptorLabel])
+	assert.NotEmpty(t, deferredChildren[1].Annotations[TargetLayerEROFSMetadataDescriptorLabel])
 
 	annotations, err := CachedSignatureAnnotations(ctx, cs, sourceManifest)
 	require.NoError(t, err)
@@ -367,7 +373,7 @@ func TestPersistSignatureReferrerRejectsMissingArtifactContent(t *testing.T) {
 	ctx := context.Background()
 	subjectBytes := []byte("subject manifest")
 	subject := descriptorFor(subjectBytes, ocispec.MediaTypeImageManifest)
-	layer := descriptorFor([]byte("missing artifact layer"), TarIndexArtifactMediaType)
+	layer := descriptorFor([]byte("missing artifact layer"), EROFSMetadataArtifactMediaType)
 	manifest := ocispec.Manifest{
 		MediaType:    ocispec.MediaTypeImageManifest,
 		ArtifactType: SignatureArtifactType,
@@ -447,8 +453,8 @@ func TestSignatureHandlerRejectsInvalidPrecomputedBundle(t *testing.T) {
 		ArtifactType: SignatureArtifactType,
 		Subject:      &sourceManifest,
 		Layers: []ocispec.Descriptor{{
-			MediaType:   TarIndexArtifactMediaType,
-			Digest:      digest.FromString("orphan tar index"),
+			MediaType:   EROFSMetadataArtifactMediaType,
+			Digest:      digest.FromString("orphan EROFS metadata"),
 			Size:        tarIndexAlignment,
 			Annotations: precomputedAnnotations(digest.FromString("source layer").String()),
 		}},
@@ -495,7 +501,7 @@ func TestFetchSignaturesSelectsNewestPrecomputedBundle(t *testing.T) {
 	assert.Equal(t, testRootHashB, signatures[sourceLayer.Digest.String()].RootHash)
 	expectedSignature := newer.signature
 	expectedSignature.Data = newer.blobs[newer.signature.Digest]
-	assert.ElementsMatch(t, []ocispec.Descriptor{expectedSignature, newer.tarIndex, newer.tree}, artifacts)
+	assert.ElementsMatch(t, []ocispec.Descriptor{expectedSignature, newer.erofsMetadata, newer.tree}, artifacts)
 	require.NotNil(t, selected)
 	assert.Equal(t, newer.descriptor.Digest, selected.desc.Digest)
 }
@@ -677,7 +683,7 @@ func TestFetchSignaturesRejectsMalformedOlderPrecomputedBundle(t *testing.T) {
 	var olderManifest ocispec.Manifest
 	require.NoError(t, json.Unmarshal(older.blobs[older.descriptor.Digest], &olderManifest))
 	for i := range olderManifest.Layers {
-		if olderManifest.Layers[i].MediaType == TarIndexArtifactMediaType {
+		if olderManifest.Layers[i].MediaType == EROFSMetadataArtifactMediaType {
 			olderManifest.Layers[i].Size++
 		}
 	}
@@ -910,11 +916,11 @@ func TestFetchSignaturesRejectsOversizedArtifactConfig(t *testing.T) {
 }
 
 type precomputedBundleFixture struct {
-	descriptor ocispec.Descriptor
-	signature  ocispec.Descriptor
-	tarIndex   ocispec.Descriptor
-	tree       ocispec.Descriptor
-	blobs      map[digest.Digest][]byte
+	descriptor    ocispec.Descriptor
+	signature     ocispec.Descriptor
+	erofsMetadata ocispec.Descriptor
+	tree          ocispec.Descriptor
+	blobs         map[digest.Digest][]byte
 }
 
 func newPrecomputedBundle(
@@ -934,10 +940,10 @@ func newPrecomputedBundle(
 		sigLayerRootHashAnnotation:  rootHash,
 		sigLayerSignatureAnnotation: base64.StdEncoding.EncodeToString(signatureBytes),
 	}
-	indexBytes := make([]byte, tarIndexAlignment)
-	copy(indexBytes, "tar-index-"+name)
-	indexDesc := descriptorFor(indexBytes, TarIndexArtifactMediaType)
-	indexDesc.Annotations = precomputedAnnotations(sourceLayer.Digest.String())
+	metadataBytes := make([]byte, tarIndexAlignment)
+	copy(metadataBytes, "erofs-metadata-"+name)
+	metadataDesc := descriptorFor(metadataBytes, EROFSMetadataArtifactMediaType)
+	metadataDesc.Annotations = precomputedAnnotations(sourceLayer.Digest.String())
 	treeBytes := []byte("tree-" + name)
 	treeDesc := descriptorFor(treeBytes, MerkleTreeArtifactMediaType)
 	treeDesc.Annotations = precomputedAnnotations(sourceLayer.Digest.String())
@@ -949,7 +955,7 @@ func newPrecomputedBundle(
 		ArtifactType: SignatureArtifactType,
 		Subject:      &subject,
 		Config:       configDesc,
-		Layers:       []ocispec.Descriptor{signatureDesc, indexDesc, treeDesc},
+		Layers:       []ocispec.Descriptor{signatureDesc, metadataDesc, treeDesc},
 		Annotations: map[string]string{
 			ociAnnotationCreated: createdAt.Format(time.RFC3339),
 		},
@@ -960,15 +966,15 @@ func newPrecomputedBundle(
 	manifestDesc.ArtifactType = SignatureArtifactType
 
 	return precomputedBundleFixture{
-		descriptor: manifestDesc,
-		signature:  signatureDesc,
-		tarIndex:   indexDesc,
-		tree:       treeDesc,
+		descriptor:    manifestDesc,
+		signature:     signatureDesc,
+		erofsMetadata: metadataDesc,
+		tree:          treeDesc,
 		blobs: map[digest.Digest][]byte{
 			manifestDesc.Digest:  manifestBytes,
 			configDesc.Digest:    configBytes,
 			signatureDesc.Digest: signatureBytes,
-			indexDesc.Digest:     indexBytes,
+			metadataDesc.Digest:  metadataBytes,
 			treeDesc.Digest:      treeBytes,
 		},
 	}

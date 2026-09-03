@@ -52,8 +52,9 @@ const (
 	// Kept under the same "containerd.io/dmverity/" prefix as the signature for symmetry,
 	// so neither value is auto-promoted into snapshot labels.
 	TargetLayerRootHashLabel = "containerd.io/dmverity/layer-roothash"
-	// TargetLayerTarIndexDescriptorLabel contains the JSON descriptor for a precomputed EROFS tar index.
-	TargetLayerTarIndexDescriptorLabel = "containerd.io/dmverity/tar-index-descriptor"
+	// TargetLayerEROFSMetadataDescriptorLabel contains the JSON descriptor for
+	// precomputed EROFS metadata.
+	TargetLayerEROFSMetadataDescriptorLabel = "containerd.io/dmverity/erofs-metadata-descriptor"
 	// TargetLayerMerkleTreeDescriptorLabel contains the JSON descriptor for a precomputed Merkle-tree blob.
 	TargetLayerMerkleTreeDescriptorLabel = "containerd.io/dmverity/merkle-tree-descriptor"
 
@@ -69,10 +70,10 @@ const (
 	precomputedSourceLayerAnnotation = "io.cncf.notary.dmverity.source-layer-digest"
 
 	// SignatureArtifactType is the artifact type for OCI referrers containing
-	// dm-verity signatures, EROFS tar indexes, and Merkle trees.
-	SignatureArtifactType = "application/vnd.cncf.notary.dmverity.tar-index.v1"
-	// TarIndexArtifactMediaType identifies a precomputed EROFS tar index.
-	TarIndexArtifactMediaType = "application/vnd.cncf.containerd.erofs.tar-index.v1"
+	// signed dm-verity materialization metadata for EROFS.
+	SignatureArtifactType = "application/vnd.containerd.erofs.dmverity.v1"
+	// EROFSMetadataArtifactMediaType identifies precomputed EROFS metadata.
+	EROFSMetadataArtifactMediaType = "application/vnd.containerd.erofs.metadata.v1"
 	// MerkleTreeArtifactMediaType identifies a separate dm-verity hash device.
 	MerkleTreeArtifactMediaType = "application/vnd.cncf.dmverity.merkle-tree.v1"
 	// LayerSignatureMediaType identifies a per-layer PKCS#7 root-hash signature.
@@ -86,18 +87,19 @@ const (
 	// validated and discarded as the scan advances.
 	maxSignatureReferrers     = 64
 	maxSignatureManifestBytes = 4 * maxManifestSize
-	// Tar indexes are normally small and Merkle trees are a fraction of their
-	// data device. Keep a generous finite ceiling so a referrer cannot request
-	// an effectively unbounded auxiliary blob.
+	// EROFS metadata blobs are normally small and Merkle trees are a fraction
+	// of their data device. Keep a generous finite ceiling so a referrer cannot
+	// request an effectively unbounded auxiliary blob.
 	maxPrecomputedArtifactSize = int64(16 << 30) // 16 GiB
 )
 
-// LayerSignatureInfo contains the signed tar-index artifacts for a layer.
+// LayerSignatureInfo contains signed dm-verity materialization metadata for an
+// EROFS layer.
 type LayerSignatureInfo struct {
-	RootHash   string
-	Signature  string
-	TarIndex   *ocispec.Descriptor
-	MerkleTree *ocispec.Descriptor
+	RootHash      string
+	Signature     string
+	EROFSMetadata *ocispec.Descriptor
+	MerkleTree    *ocispec.Descriptor
 }
 
 type referrerWithManifest struct {
@@ -237,7 +239,7 @@ func fetchSignatures(ctx context.Context, fetcher remotes.Fetcher, manifestDiges
 		"bundle":   selected.desc.Digest,
 		"manifest": manifestDigest,
 		"layers":   len(selectedInfos),
-	}).Info("Using precomputed EROFS tar-index dm-verity bundle")
+	}).Info("Using signed EROFS dm-verity metadata bundle")
 	return selectedInfos, selectedArtifacts, selected, nil
 }
 
@@ -305,7 +307,7 @@ func parsePrecomputedBundle(manifest *ocispec.Manifest, imageLayers map[string]s
 			info.RootHash = rootHash
 			info.Signature = encodedSignature
 			artifactDescs = append(artifactDescs, *layer)
-		case TarIndexArtifactMediaType, MerkleTreeArtifactMediaType:
+		case EROFSMetadataArtifactMediaType, MerkleTreeArtifactMediaType:
 			sourceDigest := layer.Annotations[precomputedSourceLayerAnnotation]
 			if sourceDigest == "" {
 				return nil, nil, fmt.Errorf("precomputed descriptor %s has invalid annotations", layer.Digest)
@@ -315,11 +317,11 @@ func parsePrecomputedBundle(manifest *ocispec.Manifest, imageLayers map[string]s
 			}
 			info := getLayerInfo(infos, sourceDigest)
 			desc := *layer
-			if layer.MediaType == TarIndexArtifactMediaType {
-				if info.TarIndex != nil {
-					return nil, nil, fmt.Errorf("duplicate EROFS tar-index descriptor for layer %s", sourceDigest)
+			if layer.MediaType == EROFSMetadataArtifactMediaType {
+				if info.EROFSMetadata != nil {
+					return nil, nil, fmt.Errorf("duplicate EROFS metadata descriptor for layer %s", sourceDigest)
 				}
-				info.TarIndex = &desc
+				info.EROFSMetadata = &desc
 			} else {
 				if info.MerkleTree != nil {
 					return nil, nil, fmt.Errorf("duplicate Merkle-tree descriptor for layer %s", sourceDigest)
@@ -335,7 +337,7 @@ func parsePrecomputedBundle(manifest *ocispec.Manifest, imageLayers map[string]s
 		if _, err := digest.Parse(sourceDigest); err != nil {
 			return nil, nil, fmt.Errorf("invalid source layer digest %q: %w", sourceDigest, err)
 		}
-		if info.Signature == "" || info.RootHash == "" || info.TarIndex == nil || info.MerkleTree == nil {
+		if info.Signature == "" || info.RootHash == "" || info.EROFSMetadata == nil || info.MerkleTree == nil {
 			return nil, nil, fmt.Errorf("incomplete precomputed artifacts for layer %s", sourceDigest)
 		}
 	}
@@ -359,9 +361,9 @@ func validatePrecomputedDescriptor(desc ocispec.Descriptor) error {
 	if err := validateBoundedDescriptor(desc, "precomputed descriptor", maxPrecomputedArtifactSize); err != nil {
 		return err
 	}
-	if desc.MediaType == TarIndexArtifactMediaType && desc.Size%tarIndexAlignment != 0 {
+	if desc.MediaType == EROFSMetadataArtifactMediaType && desc.Size%tarIndexAlignment != 0 {
 		return fmt.Errorf(
-			"EROFS tar-index descriptor %s has unaligned size %d",
+			"EROFS metadata descriptor %s has unaligned size %d",
 			desc.Digest,
 			desc.Size,
 		)
@@ -452,7 +454,7 @@ func verifyDescriptorPayload(desc ocispec.Descriptor, payload []byte) error {
 }
 
 // AppendSignatureHandlerWrapper creates a handler that fetches signatures and
-// precomputed EROFS tar-index artifacts when processing an image manifest.
+// precomputed EROFS metadata artifacts when processing an image manifest.
 func AppendSignatureHandlerWrapper(fetcher remotes.Fetcher) func(f images.Handler) images.Handler {
 	return func(f images.Handler) images.Handler {
 		return signatureHandler(f, fetcher, nil, false)
@@ -597,8 +599,8 @@ func signatureHandler(f images.Handler, fetcher remotes.Fetcher, store content.S
 			}
 			child.Annotations[TargetLayerSignatureLabel] = info.Signature
 			child.Annotations[TargetLayerRootHashLabel] = info.RootHash
-			if info.TarIndex != nil && info.MerkleTree != nil {
-				indexDesc, err := json.Marshal(info.TarIndex)
+			if info.EROFSMetadata != nil && info.MerkleTree != nil {
+				metadataDesc, err := json.Marshal(info.EROFSMetadata)
 				if err != nil {
 					return nil, err
 				}
@@ -606,7 +608,7 @@ func signatureHandler(f images.Handler, fetcher remotes.Fetcher, store content.S
 				if err != nil {
 					return nil, err
 				}
-				child.Annotations[TargetLayerTarIndexDescriptorLabel] = string(indexDesc)
+				child.Annotations[TargetLayerEROFSMetadataDescriptorLabel] = string(metadataDesc)
 				child.Annotations[TargetLayerMerkleTreeDescriptorLabel] = string(treeDesc)
 			}
 		}

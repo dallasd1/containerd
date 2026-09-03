@@ -42,7 +42,7 @@ const (
 func DmveritySnapshotLabels(desc ocispec.Descriptor, requireSignature bool) (map[string]string, error) {
 	signature := desc.Annotations[TargetLayerSignatureLabel]
 	rootHash := desc.Annotations[TargetLayerRootHashLabel]
-	tarIndex := desc.Annotations[TargetLayerTarIndexDescriptorLabel]
+	erofsMetadata := desc.Annotations[TargetLayerEROFSMetadataDescriptorLabel]
 	merkleTree := desc.Annotations[TargetLayerMerkleTreeDescriptorLabel]
 
 	labels := map[string]string{
@@ -50,7 +50,7 @@ func DmveritySnapshotLabels(desc ocispec.Descriptor, requireSignature bool) (map
 		DmverityMaterializationStateLabel:   DmverityMaterializationStatePlain,
 	}
 	if signature == "" {
-		if rootHash != "" || tarIndex != "" || merkleTree != "" {
+		if rootHash != "" || erofsMetadata != "" || merkleTree != "" {
 			return nil, fmt.Errorf("layer %s has dm-verity metadata without a signature", desc.Digest)
 		}
 		if requireSignature {
@@ -65,7 +65,7 @@ func DmveritySnapshotLabels(desc ocispec.Descriptor, requireSignature bool) (map
 	if err != nil || len(rootHashBytes) != sha256.Size {
 		return nil, fmt.Errorf("layer %s has invalid SHA-256 dm-verity root hash %q", desc.Digest, rootHash)
 	}
-	if (tarIndex == "") != (merkleTree == "") {
+	if (erofsMetadata == "") != (merkleTree == "") {
 		return nil, fmt.Errorf("layer %s has incomplete precomputed dm-verity artifacts", desc.Digest)
 	}
 	signatureBytes, err := base64.StdEncoding.DecodeString(signature)

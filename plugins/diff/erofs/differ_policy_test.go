@@ -83,9 +83,9 @@ func TestDmverityForLayer(t *testing.T) {
 
 	t.Run("precomputed artifacts must be paired", func(t *testing.T) {
 		_, err := (erofsDiff{enableDmverity: true}).dmverityForLayer(layer(map[string]string{
-			snpkg.TargetLayerSignatureLabel:          base64.StdEncoding.EncodeToString([]byte("signature")),
-			snpkg.TargetLayerRootHashLabel:           digest.FromString("root").Hex(),
-			snpkg.TargetLayerTarIndexDescriptorLabel: "{}",
+			snpkg.TargetLayerSignatureLabel:               base64.StdEncoding.EncodeToString([]byte("signature")),
+			snpkg.TargetLayerRootHashLabel:                digest.FromString("root").Hex(),
+			snpkg.TargetLayerEROFSMetadataDescriptorLabel: "{}",
 		}))
 		require.ErrorContains(t, err, "incomplete precomputed dm-verity artifacts")
 	})

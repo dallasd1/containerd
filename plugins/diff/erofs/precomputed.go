@@ -44,9 +44,9 @@ const (
 )
 
 func (s erofsDiff) applyPrecomputedArtifacts(ctx context.Context, sourceDesc ocispec.Descriptor, layerBlobPath string, sourceTar io.Reader) (bool, error) {
-	indexValue := sourceDesc.Annotations[snpkg.TargetLayerTarIndexDescriptorLabel]
+	metadataValue := sourceDesc.Annotations[snpkg.TargetLayerEROFSMetadataDescriptorLabel]
 	treeValue := sourceDesc.Annotations[snpkg.TargetLayerMerkleTreeDescriptorLabel]
-	if indexValue == "" && treeValue == "" {
+	if metadataValue == "" && treeValue == "" {
 		return false, nil
 	}
 	if !s.enableDmverity {
@@ -58,21 +58,21 @@ func (s erofsDiff) applyPrecomputedArtifacts(ctx context.Context, sourceDesc oci
 			Debug("ignoring precomputed dm-verity artifacts: dm-verity is disabled")
 		return false, nil
 	}
-	if indexValue == "" || treeValue == "" {
+	if metadataValue == "" || treeValue == "" {
 		return false, fmt.Errorf("incomplete precomputed artifact annotations for layer %s", sourceDesc.Digest)
 	}
-	indexDesc, err := snpkg.ParseTargetDescriptor(indexValue)
+	metadataDesc, err := snpkg.ParseTargetDescriptor(metadataValue)
 	if err != nil {
 		return false, err
 	}
-	if indexDesc.MediaType != snpkg.TarIndexArtifactMediaType {
-		return false, fmt.Errorf("unexpected precomputed EROFS tar-index media type %q", indexDesc.MediaType)
+	if metadataDesc.MediaType != snpkg.EROFSMetadataArtifactMediaType {
+		return false, fmt.Errorf("unexpected precomputed EROFS metadata media type %q", metadataDesc.MediaType)
 	}
-	if indexDesc.Size%tarIndexAlignment != 0 {
+	if metadataDesc.Size%tarIndexAlignment != 0 {
 		return false, fmt.Errorf(
-			"precomputed EROFS tar index for layer %s has unaligned size %d",
+			"precomputed EROFS metadata for layer %s has unaligned size %d",
 			sourceDesc.Digest,
-			indexDesc.Size,
+			metadataDesc.Size,
 		)
 	}
 	treeDesc, err := snpkg.ParseTargetDescriptor(treeValue)
@@ -99,14 +99,14 @@ func (s erofsDiff) applyPrecomputedArtifacts(ctx context.Context, sourceDesc oci
 		os.Remove(dmverity.SignaturePath(layerBlobPath))
 	}()
 
-	if err := copyContentDescriptor(ctx, s.store, indexDesc, layerBlobPath); err != nil {
-		return false, fmt.Errorf("materialize precomputed EROFS tar index for layer %s: %w", sourceDesc.Digest, err)
+	if err := copyContentDescriptor(ctx, s.store, metadataDesc, layerBlobPath); err != nil {
+		return false, fmt.Errorf("materialize precomputed EROFS metadata for layer %s: %w", sourceDesc.Digest, err)
 	}
 	if err := appendTarPayload(layerBlobPath, sourceTar); err != nil {
 		return false, fmt.Errorf("append source tar for layer %s: %w", sourceDesc.Digest, err)
 	}
 	if err := verifyEROFSUUID(layerBlobPath, sourceDesc.Digest.String()); err != nil {
-		return false, fmt.Errorf("verify precomputed EROFS tar-index source binding for layer %s: %w", sourceDesc.Digest, err)
+		return false, fmt.Errorf("verify precomputed EROFS metadata source binding for layer %s: %w", sourceDesc.Digest, err)
 	}
 	if err := copyContentDescriptor(ctx, s.store, treeDesc, hashDevicePath); err != nil {
 		return false, fmt.Errorf("materialize precomputed Merkle tree for layer %s: %w", sourceDesc.Digest, err)
@@ -133,11 +133,11 @@ func (s erofsDiff) applyPrecomputedArtifacts(ctx context.Context, sourceDesc oci
 
 	cleanup = false
 	log.G(ctx).WithFields(log.Fields{
-		"layer":       sourceDesc.Digest,
-		"tar_index":   indexDesc.Digest,
-		"merkle_tree": treeDesc.Digest,
-		"root_hash":   rootHash,
-	}).Info("Materialized verified precomputed EROFS tar-index dm-verity artifacts")
+		"layer":          sourceDesc.Digest,
+		"erofs_metadata": metadataDesc.Digest,
+		"merkle_tree":    treeDesc.Digest,
+		"root_hash":      rootHash,
+	}).Info("Materialized verified precomputed EROFS dm-verity artifacts")
 	return true, nil
 }
 
