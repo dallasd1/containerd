@@ -58,6 +58,8 @@ type CRIImageService struct {
 	// images is the lower level image store used for raw storage,
 	// no event publishing should currently be assumed
 	images images.Store
+	// content is the content store used to retain auxiliary image artifacts.
+	content content.Store
 	// client is a subset of the containerd client
 	// and will be replaced by image store and transfer service
 	client imageClient
@@ -65,6 +67,9 @@ type CRIImageService struct {
 	imageFSPaths map[string]string
 	// runtimePlatforms are the platforms configured for a runtime.
 	runtimePlatforms map[string]ImagePlatform
+	// snapshotterCapabilities are the capabilities advertised by each configured
+	// snapshotter plugin.
+	snapshotterCapabilities map[string][]string
 	// imageStore stores all resources associated with images.
 	imageStore *imagestore.Store
 	// snapshotStore stores information of all snapshots.
@@ -95,6 +100,8 @@ type CRIImageServiceOptions struct {
 
 	Snapshotters map[string]snapshots.Snapshotter
 
+	SnapshotterCapabilities map[string][]string
+
 	Client imageClient
 
 	Transferrer transfer.Transferrer
@@ -118,10 +125,12 @@ func NewService(config criconfig.ImageConfig, options *CRIImageServiceOptions) (
 	svc := CRIImageService{
 		config:                      config,
 		images:                      options.Images,
+		content:                     options.Content,
 		client:                      options.Client,
 		imageStore:                  imagestore.NewStore(options.Images, options.Content, platforms.Default()),
 		imageFSPaths:                options.ImageFSPaths,
 		runtimePlatforms:            options.RuntimePlatforms,
+		snapshotterCapabilities:     options.SnapshotterCapabilities,
 		snapshotStore:               snapshotstore.NewStore(),
 		transferrer:                 options.Transferrer,
 		unpackDuplicationSuppressor: kmutex.New(),

@@ -18,11 +18,6 @@
 
 package erofs
 
-import (
-	"context"
-	"fmt"
-)
+import "context"
 
-func (s *erofsDiff) formatDmverityLayer(_ context.Context, _, _ string) (string, error) {
-	return "", fmt.Errorf("dm-verity formatting is only supported on Linux systems")
-}
+func releaseDmverityDevice(context.Context, string) {}

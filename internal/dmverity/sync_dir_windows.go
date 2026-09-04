@@ -1,4 +1,4 @@
-//go:build !linux
+//go:build windows
 
 /*
    Copyright The containerd Authors.
@@ -16,13 +16,8 @@
    limitations under the License.
 */
 
-package erofs
+package dmverity
 
-import (
-	"context"
-	"fmt"
-)
-
-func (s *erofsDiff) formatDmverityLayer(_ context.Context, _, _ string) (string, error) {
-	return "", fmt.Errorf("dm-verity formatting is only supported on Linux systems")
+func syncDirectory(string) error {
+	return nil
 }

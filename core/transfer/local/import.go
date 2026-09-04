@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"slices"
 
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 
@@ -30,6 +31,8 @@ import (
 	"github.com/containerd/containerd/v2/core/images"
 	"github.com/containerd/containerd/v2/core/transfer"
 	"github.com/containerd/containerd/v2/core/unpack"
+	snpkg "github.com/containerd/containerd/v2/pkg/snapshotters"
+	"github.com/containerd/containerd/v2/plugins"
 )
 
 func (ts *localTransferService) importStream(ctx context.Context, i transfer.ImageImporter, is transfer.ImageStorer, tops *transfer.Config) error {
@@ -94,9 +97,13 @@ func (ts *localTransferService) importStream(ctx context.Context, i transfer.Ima
 		unpacks := iu.UnpackPlatforms()
 		if len(unpacks) > 0 {
 			uopts := []unpack.UnpackerOpt{}
+			enableDmverityReferrers := false
 			for _, u := range unpacks {
 				matched, mu := getSupportedPlatform(ctx, u, ts.config.UnpackPlatforms)
 				if matched {
+					if slices.Contains(mu.SnapshotterCapabilities, plugins.CapabilityDmverityReferrers) {
+						enableDmverityReferrers = true
+					}
 					uopts = append(uopts, unpack.WithUnpackPlatform(mu))
 				}
 			}
@@ -104,12 +111,31 @@ func (ts *localTransferService) importStream(ctx context.Context, i transfer.Ima
 			if ts.config.DuplicationSuppressor != nil {
 				uopts = append(uopts, unpack.WithDuplicationSuppressor(ts.config.DuplicationSuppressor))
 			}
+
+			if ts.config.EnableDmverityReferrers {
+				fetcher := snpkg.NewContentStoreFetcher(ts.content)
+				handler = appendDmverityReferrerHandler(
+					handler,
+					fetcher,
+					ts.content,
+					selectDmverityReferrerMode(true, enableDmverityReferrers),
+				)
+			}
+
 			unpacker, err = unpack.NewUnpacker(ctx, ts.content, uopts...)
 			if err != nil {
 				return fmt.Errorf("unable to initialize unpacker: %w", err)
 			}
 			handler = unpacker.Unpack(handler)
 		}
+	}
+	if ts.config.EnableDmverityReferrers && unpacker == nil {
+		handler = appendDmverityReferrerHandler(
+			handler,
+			snpkg.NewContentStoreFetcher(ts.content),
+			ts.content,
+			dmverityReferrersRetained,
+		)
 	}
 
 	if err := images.WalkNotEmpty(ctx, handler, index); err != nil {

@@ -45,7 +45,9 @@ import (
 	"github.com/containerd/containerd/v2/internal/cleanup"
 	"github.com/containerd/containerd/v2/internal/kmutex"
 	"github.com/containerd/containerd/v2/pkg/labels"
+	snpkg "github.com/containerd/containerd/v2/pkg/snapshotters"
 	"github.com/containerd/containerd/v2/pkg/tracing"
+	"github.com/containerd/containerd/v2/plugins"
 )
 
 const (
@@ -397,6 +399,19 @@ func (u *Unpacker) unpack(
 			snapshotLabels = make(map[string]string)
 		}
 		snapshotLabels[labelSnapshotRef] = chainID
+		var expectedDmverityLabels map[string]string
+		if slices.Contains(unpack.SnapshotterCapabilities, plugins.CapabilityDmverityReferrers) {
+			expectedDmverityLabels, err = snpkg.DmveritySnapshotLabels(
+				desc,
+				slices.Contains(unpack.SnapshotterCapabilities, plugins.CapabilityDmveritySignaturesRequired),
+			)
+			if err != nil {
+				return nil, fmt.Errorf("validate dm-verity policy for layer %s: %w", desc.Digest, err)
+			}
+			for key, value := range expectedDmverityLabels {
+				snapshotLabels[key] = value
+			}
+		}
 
 		var (
 			key    string
@@ -410,13 +425,16 @@ func (u *Unpacker) unpack(
 			mounts, err = sn.Prepare(ctx, key, parent, opts...)
 			if err != nil {
 				if errdefs.IsAlreadyExists(err) {
-					if _, err := sn.Stat(ctx, chainID); err != nil {
+					if info, err := sn.Stat(ctx, chainID); err != nil {
 						if !errdefs.IsNotFound(err) {
 							return nil, fmt.Errorf("failed to stat snapshot %s: %w", chainID, err)
 						}
 						// Try again, this should be rare, log it
 						log.G(ctx).WithField("key", key).WithField("chainid", chainID).Debug("extraction snapshot already exists, chain id not found")
 					} else {
+						if err := snpkg.ValidateDmveritySnapshot(info.Labels, expectedDmverityLabels); err != nil {
+							return nil, fmt.Errorf("existing snapshot %s does not satisfy dm-verity policy: %w", chainID, err)
+						}
 						// no need to handle, snapshot now found with chain id
 						return nil, nil
 					}
@@ -488,6 +506,13 @@ func (u *Unpacker) unpack(
 					if err = sn.Commit(ctx, chainID, key, opts...); err != nil {
 						cleanup.Do(ctx, abort)
 						if errdefs.IsAlreadyExists(err) {
+							info, statErr := sn.Stat(ctx, chainID)
+							if statErr != nil {
+								return fmt.Errorf("failed to stat concurrently committed snapshot %s: %w", chainID, statErr)
+							}
+							if policyErr := snpkg.ValidateDmveritySnapshot(info.Labels, expectedDmverityLabels); policyErr != nil {
+								return fmt.Errorf("concurrently committed snapshot %s does not satisfy dm-verity policy: %w", chainID, policyErr)
+							}
 							return nil
 						}
 						return fmt.Errorf("failed to commit snapshot %s: %w", key, err)

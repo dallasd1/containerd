@@ -26,6 +26,7 @@ import (
 	"github.com/containerd/containerd/v2/core/diff"
 	"github.com/containerd/containerd/v2/core/mount"
 	"github.com/containerd/containerd/v2/core/snapshots"
+	snpkg "github.com/containerd/containerd/v2/pkg/snapshotters"
 	"github.com/containerd/errdefs"
 	"github.com/containerd/log"
 	"github.com/opencontainers/go-digest"
@@ -93,7 +94,8 @@ func ApplyLayerWithOpts(ctx context.Context, layer Layer, chain []digest.Digest,
 		chainID = identity.ChainID(append(chain, layer.Diff.Digest)).String()
 		applied bool
 	)
-	if _, err := sn.Stat(ctx, chainID); err != nil {
+	info, err := sn.Stat(ctx, chainID)
+	if err != nil {
 		if !errdefs.IsNotFound(err) {
 			return false, fmt.Errorf("failed to stat snapshot %s: %w", chainID, err)
 		}
@@ -102,9 +104,18 @@ func ApplyLayerWithOpts(ctx context.Context, layer Layer, chain []digest.Digest,
 			if !errdefs.IsAlreadyExists(err) {
 				return false, err
 			}
+			info, err := sn.Stat(ctx, chainID)
+			if err != nil {
+				return false, fmt.Errorf("failed to stat concurrently committed snapshot %s: %w", chainID, err)
+			}
+			if err := validateDmveritySnapshot(info, opts); err != nil {
+				return false, fmt.Errorf("concurrently committed snapshot %s does not satisfy dm-verity policy: %w", chainID, err)
+			}
 		} else {
 			applied = true
 		}
+	} else if err := validateDmveritySnapshot(info, opts); err != nil {
+		return false, fmt.Errorf("existing snapshot %s does not satisfy dm-verity policy: %w", chainID, err)
 	}
 	return applied, nil
 
@@ -175,6 +186,16 @@ func applyLayers(ctx context.Context, layers []Layer, chain []digest.Digest, sn 
 	}
 
 	return nil
+}
+
+func validateDmveritySnapshot(info snapshots.Info, opts []snapshots.Opt) error {
+	var expected snapshots.Info
+	for _, opt := range opts {
+		if err := opt(&expected); err != nil {
+			return err
+		}
+	}
+	return snpkg.ValidateDmveritySnapshot(info.Labels, expected.Labels)
 }
 
 func uniquePart() string {

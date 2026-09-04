@@ -98,9 +98,9 @@ func (c *Client) Pull(ctx context.Context, ref string, opts ...RemoteOpt) (_ Ima
 		}
 		span.SetAttributes(tracing.Attribute("snapshotter.name", snapshotterName))
 
-		snCapabilities, err := c.GetSnapshotterCapabilities(ctx, snapshotterName)
+		snCapabilities, err := c.GetUnpackSnapshotterCapabilities(ctx, snapshotterName)
 		if err != nil {
-			return nil, fmt.Errorf("unable to get snapshotter capabilities: %w", err)
+			return nil, fmt.Errorf("validate dm-verity unpack configuration: %w", err)
 		}
 
 		var uconfig UnpackConfig

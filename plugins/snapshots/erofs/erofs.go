@@ -33,6 +33,8 @@ import (
 	"github.com/containerd/containerd/v2/core/snapshots/storage"
 	"github.com/containerd/containerd/v2/internal/dmverity"
 	"github.com/containerd/containerd/v2/internal/fsverity"
+	snpkg "github.com/containerd/containerd/v2/pkg/snapshotters"
+	"github.com/opencontainers/go-digest"
 )
 
 // SnapshotterConfig is used to configure the erofs snapshotter instance
@@ -123,12 +125,8 @@ func NewSnapshotter(root string, opts ...Opt) (snapshots.Snapshotter, error) {
 	}
 
 	if config.dmverityMode == "on" {
-		supported, err := dmverity.IsSupported()
-		if err != nil {
-			return nil, fmt.Errorf("failed to check dm-verity support: %w", err)
-		}
-		if !supported {
-			return nil, fmt.Errorf("dmverity_mode is 'on' but dm-verity is not supported on this system")
+		if err := dmverity.CheckSignatureSupport(); err != nil {
+			return nil, fmt.Errorf("dmverity_mode is 'on' but signed dm-verity mappings are unavailable: %w", err)
 		}
 	}
 
@@ -238,44 +236,147 @@ func (s *snapshotter) prepareDirectory(ctx context.Context, snapshotDir string, 
 
 // applyDmverityPolicy validates and applies dm-verity policy for a layer.
 // Returns the X-containerd.dmverity option if needed, or empty string otherwise.
-func (s *snapshotter) applyDmverityPolicy(layerBlob string) (string, error) {
-	// Parse the sidecar rather than just stat'ing it. Existence alone says
-	// nothing about whether the metadata can actually drive a dm-verity
-	// device, so a truncated or malformed file would otherwise satisfy mode
-	// "on" here and then silently degrade to a plain mount in the mount
-	// handler.
-	metadataExists := false
-	if _, err := dmverity.ReadMetadata(layerBlob); err == nil {
-		metadataExists = true
-	} else if !errors.Is(err, os.ErrNotExist) && s.dmverityMode != "off" {
-		return "", fmt.Errorf("layer %s has unusable dm-verity metadata: %w", layerBlob, err)
+func (s *snapshotter) applyDmverityPolicy(layerBlob string, labels map[string]string) (string, error) {
+	if s.dmverityMode == "off" {
+		return dmverity.MountOptionModePrefix + "off", nil
 	}
 
-	// Validate dmverityMode policy: mode "on" requires .dmverity metadata to exist
-	if s.dmverityMode == "on" && !metadataExists {
-		return "", fmt.Errorf("dm-verity mode is 'on' but .dmverity metadata not found for layer %s", layerBlob)
+	signedMaterialization, err := requiresSignedMaterialization(labels)
+	if err != nil {
+		return "", fmt.Errorf("invalid dm-verity materialization labels for layer %s: %w", layerBlob, err)
 	}
 
-	// Only return option if metadata exists and we need to override the default "auto" behavior
-	// This keeps standard EROFS mounts (without dm-verity) unchanged
-	if metadataExists && s.dmverityMode != "auto" {
-		// Mode "off": disables dm-verity even though metadata exists
-		// Mode "on": explicitly enables dm-verity (though "auto" would do the same)
-		return fmt.Sprintf("X-containerd.dmverity=%s", s.dmverityMode), nil
+	signaturePath := dmverity.SignaturePath(layerBlob)
+	signatureInfo, signatureErr := os.Stat(signaturePath)
+	switch {
+	case signatureErr == nil && (!signatureInfo.Mode().IsRegular() || signatureInfo.Size() == 0):
+		return "", fmt.Errorf("layer %s has dm-verity signature %s that is not a non-empty regular file", layerBlob, signaturePath)
+	case signatureErr != nil && !errors.Is(signatureErr, os.ErrNotExist):
+		return "", fmt.Errorf("failed to inspect dm-verity signature for layer %s: %w", layerBlob, signatureErr)
 	}
+	signatureExists := signatureErr == nil
 
-	return "", nil
+	requiredPath := dmverity.SignatureRequiredPath(layerBlob)
+	requiredInfo, requiredErr := os.Stat(requiredPath)
+	switch {
+	case requiredErr == nil && (!requiredInfo.Mode().IsRegular() || requiredInfo.Size() == 0):
+		return "", fmt.Errorf("layer %s has invalid signature-required marker %s", layerBlob, requiredPath)
+	case requiredErr != nil && !errors.Is(requiredErr, os.ErrNotExist):
+		return "", fmt.Errorf("failed to inspect signature-required marker for layer %s: %w", layerBlob, requiredErr)
+	}
+	signatureRequired := requiredErr == nil
+
+	metadata, metadataErr := dmverity.ReadMetadata(layerBlob)
+	switch {
+	case metadataErr == nil:
+		if signatureExists {
+			if signedMaterialization {
+				if err := validateSignedMaterialization(layerBlob, metadata, labels); err != nil {
+					return "", err
+				}
+				return dmverity.MountOptionModePrefix + "on", nil
+			}
+			if s.dmverityMode == "on" {
+				return dmverity.MountOptionModePrefix + "on", nil
+			}
+			return "", nil
+		}
+		if signedMaterialization || signatureRequired || s.dmverityMode == "on" {
+			return "", fmt.Errorf("layer %s has dm-verity metadata but no usable signature", layerBlob)
+		}
+		// Before signature-gated materialization, optional mode formatted every
+		// layer and left metadata without a signature. Mount those legacy
+		// unsigned layers as plain EROFS during upgrade.
+		return dmverity.MountOptionModePrefix + "off", nil
+	case errors.Is(metadataErr, os.ErrNotExist):
+		if signatureExists || signatureRequired || signedMaterialization {
+			return "", fmt.Errorf("layer %s has dm-verity signature state but no metadata", layerBlob)
+		}
+		if s.dmverityMode == "on" {
+			return "", fmt.Errorf("dm-verity mode is 'on' but .dmverity metadata not found for layer %s", layerBlob)
+		}
+		return "", nil
+	default:
+		if signatureExists || signatureRequired || signedMaterialization || s.dmverityMode == "on" {
+			return "", fmt.Errorf("layer %s has unusable dm-verity metadata: %w", layerBlob, metadataErr)
+		}
+		// A malformed unsigned legacy sidecar cannot drive a mapper, but it is
+		// safe to ignore when optional policy explicitly falls back to plain
+		// EROFS.
+		return dmverity.MountOptionModePrefix + "off", nil
+	}
+}
+
+func requiresSignedMaterialization(labels map[string]string) (bool, error) {
+	version := labels[snpkg.DmverityMaterializationVersionLabel]
+	state := labels[snpkg.DmverityMaterializationStateLabel]
+	rootHash := labels[snpkg.DmverityMaterializationRootHashLabel]
+	signatureDigest := labels[snpkg.DmverityMaterializationSignatureDigestLabel]
+	if version == "" && state == "" && rootHash == "" && signatureDigest == "" {
+		return false, nil
+	}
+	if version != snpkg.DmverityMaterializationVersion {
+		return false, fmt.Errorf("unsupported version %q", version)
+	}
+	switch state {
+	case snpkg.DmverityMaterializationStatePlain:
+		if rootHash != "" || signatureDigest != "" {
+			return false, fmt.Errorf("plain materialization carries signed metadata")
+		}
+		return false, nil
+	case snpkg.DmverityMaterializationStateSigned:
+		if err := snpkg.ValidateDmveritySnapshot(labels, labels); err != nil {
+			return false, err
+		}
+		return true, nil
+	default:
+		return false, fmt.Errorf("unknown state %q", state)
+	}
+}
+
+func validateSignedMaterialization(layerBlob string, metadata *dmverity.DmverityMetadata, labels map[string]string) error {
+	expectedRootHash := labels[snpkg.DmverityMaterializationRootHashLabel]
+	if metadata.RootHash != expectedRootHash {
+		return fmt.Errorf(
+			"layer %s dm-verity root hash %q does not match recorded root hash %q",
+			layerBlob,
+			metadata.RootHash,
+			expectedRootHash,
+		)
+	}
+	signature, err := os.ReadFile(dmverity.SignaturePath(layerBlob))
+	if err != nil {
+		return fmt.Errorf("failed to read dm-verity signature for layer %s: %w", layerBlob, err)
+	}
+	actualDigest := digest.FromBytes(signature).String()
+	expectedDigest := labels[snpkg.DmverityMaterializationSignatureDigestLabel]
+	if actualDigest != expectedDigest {
+		return fmt.Errorf(
+			"layer %s dm-verity signature digest %q does not match recorded digest %q",
+			layerBlob,
+			actualDigest,
+			expectedDigest,
+		)
+	}
+	return nil
 }
 
 // createErofsMount creates a mount specification for an EROFS layer.
 // Applies dmverityMode policy and passes it to the mount handler.
-func (s *snapshotter) createErofsMount(layerBlob string) (mount.Mount, error) {
+func (s *snapshotter) createErofsMount(layerBlob string, labels map[string]string) (mount.Mount, error) {
 	options := []string{"ro", "loop"}
 
-	if dmverityOpt, err := s.applyDmverityPolicy(layerBlob); err != nil {
+	if dmverityOpt, err := s.applyDmverityPolicy(layerBlob, labels); err != nil {
 		return mount.Mount{}, err
 	} else if dmverityOpt != "" {
 		options = append(options, dmverityOpt)
+		if dmverityOpt == dmverity.MountOptionModePrefix+"on" &&
+			labels[snpkg.DmverityMaterializationStateLabel] == snpkg.DmverityMaterializationStateSigned {
+			options = append(options,
+				dmverity.MountOptionRootHashPrefix+labels[snpkg.DmverityMaterializationRootHashLabel],
+				dmverity.MountOptionSignatureDigestPrefix+labels[snpkg.DmverityMaterializationSignatureDigestLabel],
+			)
+		}
 	}
 
 	return mount.Mount{
@@ -283,6 +384,32 @@ func (s *snapshotter) createErofsMount(layerBlob string) (mount.Mount, error) {
 		Type:    "erofs",
 		Options: options,
 	}, nil
+}
+
+func (s *snapshotter) parentSnapshotInfos(ctx context.Context, info snapshots.Info, parentIDs []string) ([]snapshots.Info, error) {
+	infos := make([]snapshots.Info, len(parentIDs))
+	err := s.ms.WithTransaction(ctx, false, func(ctx context.Context) error {
+		parent := info.Parent
+		for i, expectedID := range parentIDs {
+			if parent == "" {
+				return fmt.Errorf("snapshot parent chain ended before parent ID %s", expectedID)
+			}
+			id, parentInfo, _, err := storage.GetInfo(ctx, parent)
+			if err != nil {
+				return fmt.Errorf("get parent snapshot %q: %w", parent, err)
+			}
+			if id != expectedID {
+				return fmt.Errorf("snapshot parent %q has ID %s, expected %s", parent, id, expectedID)
+			}
+			infos[i] = parentInfo
+			parent = parentInfo.Parent
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return infos, nil
 }
 
 func (s *snapshotter) mounts(ctx context.Context, snap storage.Snapshot, info snapshots.Info) ([]mount.Mount, error) {
@@ -298,7 +425,7 @@ func (s *snapshotter) mounts(ctx context.Context, snap storage.Snapshot, info sn
 					return nil, err
 				}
 			}
-			m, err := s.createErofsMount(layerBlob)
+			m, err := s.createErofsMount(layerBlob, info.Labels)
 			if err != nil {
 				return nil, fmt.Errorf("failed to create erofs mount: %w", err)
 			}
@@ -348,6 +475,11 @@ func (s *snapshotter) mounts(ctx context.Context, snap storage.Snapshot, info sn
 		}
 	}
 
+	parentInfos, err := s.parentSnapshotInfos(ctx, info, snap.ParentIDs)
+	if err != nil {
+		return nil, fmt.Errorf("resolve parent snapshot materialization: %w", err)
+	}
+
 	var mounts []mount.Mount
 	if snap.Kind == snapshots.KindActive {
 		if s.blockMode {
@@ -381,7 +513,7 @@ func (s *snapshotter) mounts(ctx context.Context, snap storage.Snapshot, info sn
 			return nil, err
 		}
 
-		m, err := s.createErofsMount(layerBlob)
+		m, err := s.createErofsMount(layerBlob, parentInfos[0].Labels)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create erofs mount: %w", err)
 		}
@@ -395,7 +527,7 @@ func (s *snapshotter) mounts(ctx context.Context, snap storage.Snapshot, info sn
 			return nil, err
 		}
 
-		m, err := s.createErofsMount(layerBlob)
+		m, err := s.createErofsMount(layerBlob, parentInfos[i].Labels)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create erofs mount for parent %s: %w", snap.ParentIDs[i], err)
 		}
@@ -572,7 +704,20 @@ func (s *snapshotter) Commit(ctx context.Context, name, key string, opts ...snap
 			return fmt.Errorf("failed to get the converted erofs blob: %w", err)
 		}
 
-		usage, err := fs.DiskUsage(ctx, layerBlob)
+		usagePaths := []string{layerBlob}
+		for _, candidate := range []string{
+			dmverity.HashDevicePath(layerBlob),
+			dmverity.MetadataPath(layerBlob),
+			dmverity.SignaturePath(layerBlob),
+			dmverity.SignatureRequiredPath(layerBlob),
+		} {
+			if _, err := os.Stat(candidate); err == nil {
+				usagePaths = append(usagePaths, candidate)
+			} else if !os.IsNotExist(err) {
+				return fmt.Errorf("inspect EROFS materialization artifact %q: %w", candidate, err)
+			}
+		}
+		usage, err := fs.DiskUsage(ctx, usagePaths...)
 		if err != nil {
 			return err
 		}
@@ -638,17 +783,19 @@ func (s *snapshotter) getCleanupDirectories(ctx context.Context) ([]string, erro
 func (s *snapshotter) Remove(ctx context.Context, key string) (err error) {
 	var removals []string
 	var id string
+	var kind snapshots.Kind
 	// Remove directories after the transaction is closed, failures must not
 	// return error since the transaction is committed with the removal
 	// key no longer available.
 	defer func() {
 		if err == nil {
+			if kind == snapshots.KindCommitted {
+				releaseDmverityDevice(ctx, s.layerBlobPath(id))
+			}
+
 			if err := cleanupUpper(s.upperPath(id)); err != nil {
 				log.G(ctx).WithError(err).WithField("id", id).Warnf("failed to cleanup upperdir")
 			}
-
-			// Note: dm-verity device cleanup is handled by the EROFS mount handler
-			// during Deactivate/Unmount, not here in Remove()
 
 			for _, dir := range removals {
 				if err := os.RemoveAll(dir); err != nil {
@@ -658,9 +805,7 @@ func (s *snapshotter) Remove(ctx context.Context, key string) (err error) {
 		}
 	}()
 	return s.ms.WithTransaction(ctx, true, func(ctx context.Context) error {
-		var k snapshots.Kind
-
-		id, k, err = storage.Remove(ctx, key)
+		id, kind, err = storage.Remove(ctx, key)
 		if err != nil {
 			return fmt.Errorf("failed to remove snapshot %s: %w", key, err)
 		}
@@ -670,7 +815,7 @@ func (s *snapshotter) Remove(ctx context.Context, key string) (err error) {
 			return fmt.Errorf("unable to get directories for removal: %w", err)
 		}
 		// The layer blob is only persisted for committed snapshots.
-		if k == snapshots.KindCommitted {
+		if kind == snapshots.KindCommitted {
 			// Clear IMMUTABLE_FL before removal, since this flag avoids it.
 			err = setImmutable(s.layerBlobPath(id), false)
 			if err != nil && !errdefs.IsNotImplemented(err) {

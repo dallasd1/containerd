@@ -18,12 +18,24 @@
 
 package dmverity
 
-import "fmt"
+import (
+	"context"
+	"fmt"
+)
 
 var errUnsupported = fmt.Errorf("dmverity is only supported on Linux systems")
 
+// IsSupported reports whether the kernel can back a dm-verity device. On
+// non-Linux platforms the answer is determinate, so this returns a nil error
+// and lets callers skip cleanly rather than treating it as a failed check.
 func IsSupported() (bool, error) {
-	return false, errUnsupported
+	return false, nil
+}
+
+// CheckSignatureSupport reports that signed dm-verity mappings are
+// unavailable on non-Linux platforms.
+func CheckSignatureSupport() error {
+	return errUnsupported
 }
 
 func Format(_ string, _ string, _ *DmverityOptions) (string, error) {
@@ -38,10 +50,25 @@ func OpenWithSignature(_ string, _ string, _ string, _ string, _ uint64, _ *Dmve
 	return "", errUnsupported
 }
 
+func OpenWithSignatureData(_ string, _ string, _ string, _ string, _ uint64, _ *DmverityOptions, _ []byte) (string, error) {
+	return "", errUnsupported
+}
+
+func VerifyArtifacts(_ string, _ string, _ string, _ uint32) error {
+	return errUnsupported
+}
+
 func Close(_ string) error {
 	return errUnsupported
 }
 
-func VerifyDevice(_ string, _ string) error {
-	return errUnsupported
+func VerifySignedDevice(_ string, _ string) (DeviceInfo, error) {
+	return DeviceInfo{}, errUnsupported
+}
+
+// FormatLayerBlob appends a dm-verity hash tree to an EROFS layer blob. It is
+// only implemented on Linux; the stub keeps the package's exported surface
+// identical on every platform, matching the other entry points here.
+func FormatLayerBlob(_ context.Context, _ string, _ uint32, _ string) (string, error) {
+	return "", errUnsupported
 }

@@ -25,6 +25,7 @@ import (
 	"net/http"
 	"net/url"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -54,6 +55,7 @@ import (
 	"github.com/containerd/containerd/v2/internal/cri/util"
 	snpkg "github.com/containerd/containerd/v2/pkg/snapshotters"
 	"github.com/containerd/containerd/v2/pkg/tracing"
+	"github.com/containerd/containerd/v2/plugins"
 )
 
 // For image management:
@@ -268,14 +270,31 @@ func (c *CRIImageService) pullImageWithLocalPull(
 	}
 
 	pullOpts = append(pullOpts, c.encryptedImagesPullOpts()...)
+	// WithImageHandlerWrapper stores a single wrapper, so each caller would
+	// overwrite the last. Compose them into one instead: enabling dm-verity
+	// referrers must not silently drop the remote-snapshot annotations.
+	var handlerWrappers []func(containerdimages.Handler) containerdimages.Handler
 	if !c.config.DisableSnapshotAnnotations {
-		pullOpts = append(pullOpts,
-			containerd.WithImageHandlerWrapper(snpkg.AppendInfoHandlerWrapper(ref)))
+		handlerWrappers = append(handlerWrappers, snpkg.AppendInfoHandlerWrapper(ref))
 	}
-	// Always fetch signatures if available - the handler is a no-op if no referrers exist.
-	// The snapshotter decides whether to use them during mount.
-	pullOpts = append(pullOpts,
-		containerd.WithImageHandlerWrapper(snpkg.AppendSignatureHandlerWrapperFromResolver(resolver, ref)))
+	if c.config.EnableDmverityReferrers {
+		if slices.Contains(c.snapshotterCapabilities[snapshotter], plugins.CapabilityDmverityReferrers) {
+			handlerWrappers = append(handlerWrappers, snpkg.AppendRetainedSignatureHandlerWrapperFromResolver(
+				resolver,
+				ref,
+				c.content,
+			))
+		}
+	}
+	if len(handlerWrappers) > 0 {
+		pullOpts = append(pullOpts, containerd.WithImageHandlerWrapper(
+			func(h containerdimages.Handler) containerdimages.Handler {
+				for i := len(handlerWrappers) - 1; i >= 0; i-- {
+					h = handlerWrappers[i](h)
+				}
+				return h
+			}))
+	}
 
 	if c.config.DiscardUnpackedLayers {
 		// Allows GC to clean layers up from the content store after unpacking

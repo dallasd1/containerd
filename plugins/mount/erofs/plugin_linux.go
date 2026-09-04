@@ -20,17 +20,18 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
-	"path/filepath"
 	"runtime"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/containerd/log"
 	"github.com/containerd/platforms"
 	"github.com/containerd/plugin"
 	"github.com/containerd/plugin/registry"
+	"github.com/opencontainers/go-digest"
+	"github.com/opencontainers/selinux/go-selinux"
 
 	"github.com/containerd/containerd/v2/core/mount"
 	"github.com/containerd/containerd/v2/internal/dmverity"
@@ -42,53 +43,129 @@ import (
 
 var forceloop bool
 
-type erofsMountHandler struct{}
-
-// NewErofsMountHandler creates a new EROFS mount handler that supports dm-verity
-func NewErofsMountHandler() mount.Handler {
-	return &erofsMountHandler{}
+type erofsMountHandler struct {
+	// sharedLayerContext is the SELinux label every EROFS layer mount asks
+	// for. Configurable because the value is policy-specific and upstream
+	// containerd cannot assume a distro's type names.
+	sharedLayerContext string
 }
 
-// dmverityOpenMu serializes the "does this device already exist?" check and the
-// creation that follows it.
+// NewErofsMountHandler creates a new EROFS mount handler that supports dm-verity
+func NewErofsMountHandler(sharedLayerContext string) mount.Handler {
+	if sharedLayerContext == "" {
+		sharedLayerContext = defaultSharedLayerContext
+	}
+	return &erofsMountHandler{sharedLayerContext: sharedLayerContext}
+}
+
+// selinuxContextOpt is the superblock-wide SELinux mount option. Unlike
+// defcontext=/rootcontext=, it labels the whole superblock, so every mount of a
+// given device must agree on its value.
+const selinuxContextOpt = "context="
+const maxDmveritySignatureSize = 4 * 1024 * 1024
+
+// sharedLayerContext is the one SELinux label every EROFS layer mount asks for.
 //
-// Device-mapper names are derived from the snapshot ID, so two concurrent mounts
-// of the same layer -- routine when several pods start from one image -- can both
-// observe the device as absent and both call into the create path. The loser's
-// DM_DEV_CREATE fails because the name is taken, and its cleanup then removes the
-// winner's device out from under a live mount.
+// EROFS layers are shared by design: one image layer backs every container
+// started from that image. Each consumer is a separate mount-manager
+// activation, so the same block device is mounted once per consumer and the
+// kernel hands out a single superblock for it. "context=" is a property of that
+// superblock, so the first mount fixes it and any later mount that disagrees is
+// rejected outright:
 //
-// One lock is enough. The guarded section is a handful of ioctls, and the kernel
-// already serializes device-mapper creation internally, so there is little
-// parallelism to win by sharding this per device name.
-var dmverityOpenMu sync.Mutex
+//	SELinux: mount invalid. Same superblock, different security settings
+//	         for (dev dm-31, type erofs)
+//
+// Two containerd paths reach this handler with different settings, and they
+// cannot be reconciled by rewriting what the caller passed:
+//
+//   - container creation activates the layer with no context= at all;
+//   - task creation goes through client.getRootFS, which appends the consuming
+//     container's mount label, carrying a per-container MCS category pair.
+//
+// Normalising the label is therefore not sufficient -- an unlabelled mount and a
+// labelled one still disagree no matter how the label is rewritten. The two
+// paths have to be made to agree on a single value, so the value is synthesised
+// here instead of being derived from whatever the caller happened to supply.
+//
+// Isolation is unaffected. This label applies to the read-only shared layer
+// only; the per-container overlay stacked above it still carries the full MCS
+// pair, and that overlay, not the layer, is what the container sees. It is also
+// what overlayfs already does -- its lowerdirs sit on disk with a single shared
+// type and no categories.
+//
+// The type below is container_file_t rather than the read-only
+// container_ro_file_t: EROFS layers are also consumed through paths that expect
+// the standard container file type, and this is the value the deployment is
+// validated against. Override shared_layer_context to use a stricter type where
+// the local policy grants container domains read access to it.
+const defaultSharedLayerContext = "system_u:object_r:container_file_t:s0"
+
+// sharedLayerMountOptions returns opts with the mount-manager bookkeeping
+// options removed and the per-consumer SELinux label replaced by the single
+// shared-layer label, so that every mount of a given layer requests byte
+// identical superblock settings.
+//
+// context= is dropped rather than rewritten because callers disagree on whether
+// to supply one at all; it is then re-added unconditionally so that labelled and
+// unlabelled callers converge on the same request. It is only re-added when
+// SELinux is enabled, since mount(2) rejects the option outright otherwise.
+func sharedLayerMountOptions(opts []string, selinuxEnabled bool, sharedLayerContext string) []string {
+	filtered := make([]string, 0, len(opts)+1)
+	for _, v := range opts {
+		// Skip loop and dm-verity bookkeeping options handled by this plugin.
+		if v == "loop" ||
+			strings.HasPrefix(v, dmverity.MountOptionModePrefix) ||
+			strings.HasPrefix(v, dmverity.MountOptionRootHashPrefix) ||
+			strings.HasPrefix(v, dmverity.MountOptionSignatureDigestPrefix) {
+			continue
+		}
+		if strings.HasPrefix(v, selinuxContextOpt) {
+			continue
+		}
+		filtered = append(filtered, v)
+	}
+	if selinuxEnabled {
+		filtered = append(filtered, selinuxContextOpt+`"`+sharedLayerContext+`"`)
+	}
+	return filtered
+}
 
 // openOrReuseDmverityDevice returns the /dev/mapper path for a layer, creating
 // the device if it does not already exist and validating it if it does.
-func openOrReuseDmverityDevice(ctx context.Context, source, deviceName string, metadata *dmverity.DmverityMetadata) (string, error) {
-	dmverityOpenMu.Lock()
-	defer dmverityOpenMu.Unlock()
+//
+// The caller must hold the keyed lifecycle lock for deviceName until the
+// returned device has been mounted or rolled back. Returning while the device
+// is merely created would leave a zero-open window in which another unmount
+// could remove it before mount(2).
+func openOrReuseDmverityDevice(ctx context.Context, source, deviceName string, metadata *dmverity.DmverityMetadata, expectedSignatureDigest string) (string, error) {
+	signature, err := requiredDmveritySignature(source, expectedSignatureDigest)
+	if err != nil {
+		return "", err
+	}
 
 	devicePath := dmverity.DevicePath(deviceName)
-	if _, err := os.Stat(devicePath); !os.IsNotExist(err) {
-		// Device-mapper names are host-global while snapshot IDs are only
-		// unique within a snapshotter root, so an existing device of this
-		// name is not necessarily this layer. Confirm the live table's root
-		// hash before trusting it.
-		if err := dmverity.VerifyDevice(deviceName, metadata.RootHash); err != nil {
-			return "", fmt.Errorf("refusing to reuse existing dm-verity device %q: %w", deviceName, err)
-		}
+	deviceInfo, verifyErr := dmverity.VerifySignedDevice(deviceName, metadata.RootHash)
+	if verifyErr == nil {
+		// A live verity table is identified by its root hash and the kernel's
+		// signature requirement. Different trusted PKCS#7 envelopes over the
+		// same root hash produce the same protected block device.
 		log.G(ctx).WithField("device", devicePath).Debug("dm-verity device already exists, reusing")
 		return devicePath, nil
 	}
-
-	// Use signature file if it exists (written by the differ during Apply)
-	signatureFile := dmverity.SignaturePath(source)
-	if _, err := os.Stat(signatureFile); err != nil {
-		signatureFile = ""
-	} else {
-		log.G(ctx).WithField("root_hash", metadata.RootHash).Info("Using signature for dm-verity")
+	if deviceInfo.Exists {
+		if deviceInfo.OpenCount != 0 {
+			return "", fmt.Errorf("refusing to reuse existing dm-verity device %q: %w", deviceName, verifyErr)
+		}
+		if err := dmverity.Close(deviceName); err != nil && !errors.Is(err, unix.ENXIO) {
+			return "", fmt.Errorf("remove invalid idle dm-verity device %q: %w", deviceName, err)
+		}
+		log.G(ctx).WithError(verifyErr).WithField("device", devicePath).Warn("recreating invalid idle dm-verity device")
+	} else if !errors.Is(verifyErr, unix.ENXIO) && !errors.Is(verifyErr, os.ErrNotExist) {
+		return "", fmt.Errorf("inspect existing dm-verity device %q: %w", deviceName, verifyErr)
 	}
+
+	log.G(ctx).WithField("root_hash", metadata.RootHash).Info("Using signature for dm-verity")
 
 	log.G(ctx).WithFields(log.Fields{
 		"source":      source,
@@ -96,7 +173,8 @@ func openOrReuseDmverityDevice(ctx context.Context, source, deviceName string, m
 		"hash-offset": metadata.HashOffset,
 	}).Debug("opening dm-verity device")
 
-	devicePath, err := dmverity.OpenWithSignature(source, deviceName, source, metadata.RootHash, metadata.HashOffset, nil, signatureFile)
+	hashDevice := dmverity.ResolveHashDevice(source, metadata)
+	devicePath, err = dmverity.OpenWithSignatureData(source, deviceName, hashDevice, metadata.RootHash, metadata.HashOffset, nil, signature)
 	if err != nil {
 		return "", fmt.Errorf("failed to open dm-verity device: %w", err)
 	}
@@ -119,6 +197,76 @@ func openOrReuseDmverityDevice(ctx context.Context, source, deviceName string, m
 	return devicePath, nil
 }
 
+// closeDmverityDevice closes an idle mapper while its keyed lifecycle lock is
+// held. EBUSY is expected when another mount still references the shared layer.
+func closeDmverityDevice(ctx context.Context, deviceName, reason string) {
+	err := dmverity.Close(deviceName)
+	switch {
+	case err == nil:
+		log.G(ctx).WithFields(log.Fields{
+			"device": deviceName,
+			"reason": reason,
+		}).Debug("dm-verity device closed")
+	case errors.Is(err, unix.EBUSY):
+		log.G(ctx).WithFields(log.Fields{
+			"device": deviceName,
+			"reason": reason,
+		}).Debug("dm-verity device is still active")
+	case errors.Is(err, unix.ENXIO), errors.Is(err, os.ErrNotExist):
+		log.G(ctx).WithFields(log.Fields{
+			"device": deviceName,
+			"reason": reason,
+		}).Debug("dm-verity device is already absent")
+	default:
+		log.G(ctx).WithError(err).WithFields(log.Fields{
+			"device": deviceName,
+			"reason": reason,
+		}).Warn("failed to close dm-verity device")
+	}
+}
+
+func requiredDmveritySignature(source, expectedDigest string) ([]byte, error) {
+	signatureFile := dmverity.SignaturePath(source)
+	file, err := os.Open(signatureFile)
+	if err != nil {
+		return nil, fmt.Errorf("layer %q has dm-verity metadata but no usable signature: %w", source, err)
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("inspect dm-verity signature %q: %w", signatureFile, err)
+	}
+	if !info.Mode().IsRegular() || info.Size() == 0 {
+		return nil, fmt.Errorf("layer %q has dm-verity metadata but signature %q is not a non-empty regular file", source, signatureFile)
+	}
+	if info.Size() > maxDmveritySignatureSize {
+		return nil, fmt.Errorf("layer %q dm-verity signature %q exceeds maximum size %d", source, signatureFile, maxDmveritySignatureSize)
+	}
+	signature, err := io.ReadAll(io.LimitReader(file, maxDmveritySignatureSize+1))
+	if err != nil {
+		return nil, fmt.Errorf("read dm-verity signature %q: %w", signatureFile, err)
+	}
+	if int64(len(signature)) != info.Size() {
+		return nil, fmt.Errorf("dm-verity signature %q changed while it was read", signatureFile)
+	}
+	if expectedDigest != "" {
+		expected, err := digest.Parse(expectedDigest)
+		if err != nil {
+			return nil, fmt.Errorf("invalid expected dm-verity signature digest %q: %w", expectedDigest, err)
+		}
+		actual := expected.Algorithm().FromBytes(signature)
+		if actual != expected {
+			return nil, fmt.Errorf(
+				"dm-verity signature %q digest %s does not match expected digest %s",
+				signatureFile,
+				actual,
+				expected,
+			)
+		}
+	}
+	return signature, nil
+}
+
 func (h *erofsMountHandler) Mount(ctx context.Context, m mount.Mount, mp string, _ []mount.ActiveMount) (mount.ActiveMount, error) {
 	if m.Type != "erofs" {
 		return mount.ActiveMount{}, errdefs.ErrNotImplemented
@@ -128,10 +276,23 @@ func (h *erofsMountHandler) Mount(ctx context.Context, m mount.Mount, mp string,
 
 	// Check for dmverity mode in mount options
 	dmverityMode := "auto" // default
+	var expectedRootHash string
+	var expectedSignatureDigest string
 	for _, opt := range m.Options {
-		if strings.HasPrefix(opt, "X-containerd.dmverity=") {
-			dmverityMode = strings.TrimPrefix(opt, "X-containerd.dmverity=")
+		switch {
+		case strings.HasPrefix(opt, dmverity.MountOptionModePrefix):
+			dmverityMode = strings.TrimPrefix(opt, dmverity.MountOptionModePrefix)
+		case strings.HasPrefix(opt, dmverity.MountOptionRootHashPrefix):
+			expectedRootHash = strings.TrimPrefix(opt, dmverity.MountOptionRootHashPrefix)
+		case strings.HasPrefix(opt, dmverity.MountOptionSignatureDigestPrefix):
+			expectedSignatureDigest = strings.TrimPrefix(opt, dmverity.MountOptionSignatureDigestPrefix)
 		}
+	}
+	if (expectedRootHash == "") != (expectedSignatureDigest == "") {
+		return mount.ActiveMount{}, fmt.Errorf("incomplete expected dm-verity materialization for layer %q", m.Source)
+	}
+	if expectedRootHash != "" && dmverityMode != "on" {
+		return mount.ActiveMount{}, fmt.Errorf("expected signed dm-verity materialization for layer %q requires mode \"on\"", m.Source)
 	}
 
 	// Check if this layer has dm-verity metadata.
@@ -159,19 +320,32 @@ func (h *erofsMountHandler) Mount(ctx context.Context, m mount.Mount, mp string,
 	}
 
 	if metadata != nil {
+		if expectedRootHash != "" && metadata.RootHash != expectedRootHash {
+			return mount.ActiveMount{}, fmt.Errorf(
+				"layer %q dm-verity root hash %q does not match expected root hash %q",
+				m.Source,
+				metadata.RootHash,
+				expectedRootHash,
+			)
+		}
 		log.G(ctx).WithField("source", m.Source).Debug("detected dm-verity metadata, setting up dm-verity device")
 
 		supported, err := dmverity.IsSupported()
-		if err != nil || !supported {
-			return mount.ActiveMount{}, fmt.Errorf("layer requires dm-verity but system doesn't support it (dm_verity module not loaded): %w", err)
+		if err != nil {
+			return mount.ActiveMount{}, fmt.Errorf("layer %q requires dm-verity but support could not be determined: %w", m.Source, err)
+		}
+		if !supported {
+			return mount.ActiveMount{}, fmt.Errorf("layer %q requires dm-verity but the system does not provide it", m.Source)
 		}
 
-		// Extract snapshot ID from source path
-		// Path format: {root}/snapshots/{id}/layer.erofs
-		snapshotID := filepath.Base(filepath.Dir(m.Source))
-		deviceName := fmt.Sprintf("containerd-erofs-%s", snapshotID)
+		deviceName := dmverity.ErofsDeviceName(m.Source)
+		unlock, err := dmverity.LockDevice(ctx, deviceName)
+		if err != nil {
+			return mount.ActiveMount{}, fmt.Errorf("lock dm-verity device %q: %w", deviceName, err)
+		}
+		defer unlock()
 
-		devicePath, err := openOrReuseDmverityDevice(ctx, m.Source, deviceName, metadata)
+		devicePath, err := openOrReuseDmverityDevice(ctx, m.Source, deviceName, metadata, expectedSignatureDigest)
 		if err != nil {
 			return mount.ActiveMount{}, err
 		}
@@ -181,19 +355,11 @@ func (h *erofsMountHandler) Mount(ctx context.Context, m mount.Mount, mp string,
 	}
 	// else: no metadata file, proceed with regular EROFS mount
 
-	filteredOptions := make([]string, 0, len(m.Options))
-	for _, v := range m.Options {
-		// Skip loop option (handled by loop device setup) and dmverity mode option (already processed)
-		if v == "loop" || strings.HasPrefix(v, "X-containerd.dmverity=") {
-			continue
-		}
-		filteredOptions = append(filteredOptions, v)
-	}
-	m.Options = filteredOptions
+	m.Options = sharedLayerMountOptions(m.Options, selinux.GetEnabled(), h.sharedLayerContext)
 
 	if err := os.MkdirAll(mp, 0700); err != nil {
 		if dmverityDevice != "" {
-			dmverity.Close(dmverityDevice)
+			closeDmverityDevice(ctx, dmverityDevice, "mount rollback")
 		}
 		return mount.ActiveMount{}, err
 	}
@@ -240,7 +406,7 @@ func (h *erofsMountHandler) Mount(ctx context.Context, m mount.Mount, mp string,
 				loop, err := mount.SetupLoop(strings.TrimPrefix(v, "device="), params)
 				if err != nil {
 					if dmverityDevice != "" {
-						dmverity.Close(dmverityDevice)
+						closeDmverityDevice(ctx, dmverityDevice, "mount rollback")
 					}
 					return mount.ActiveMount{}, err
 				}
@@ -250,13 +416,13 @@ func (h *erofsMountHandler) Mount(ctx context.Context, m mount.Mount, mp string,
 		err = m.Mount(mp)
 		if err != nil {
 			if dmverityDevice != "" {
-				dmverity.Close(dmverityDevice)
+				closeDmverityDevice(ctx, dmverityDevice, "mount rollback")
 			}
 			return mount.ActiveMount{}, err
 		}
 	} else if err != nil {
 		if dmverityDevice != "" {
-			dmverity.Close(dmverityDevice)
+			closeDmverityDevice(ctx, dmverityDevice, "mount rollback")
 		}
 		return mount.ActiveMount{}, err
 	}
@@ -275,30 +441,34 @@ func (h *erofsMountHandler) Unmount(ctx context.Context, path string) error {
 	mountInfo, err := mount.Lookup(path)
 	if err == nil {
 		source := mountInfo.Source
-		if strings.HasPrefix(source, "/dev/mapper/containerd-erofs-") {
-			deviceName = strings.TrimPrefix(source, "/dev/mapper/")
+		devicePathPrefix := dmverity.DevicePath(dmverity.ErofsDeviceNamePrefix)
+		if strings.HasPrefix(source, devicePathPrefix) {
+			deviceName = strings.TrimPrefix(source, dmverity.DevicePath(""))
 		}
 	}
 
-	err = mount.Unmount(path, 0)
-
-	if deviceName != "" {
-		log.G(ctx).WithFields(log.Fields{
-			"mount-point": path,
-			"device":      deviceName,
-		}).Debug("attempting to close dm-verity device")
-
-		if closeErr := dmverity.Close(deviceName); closeErr != nil {
-			log.G(ctx).WithError(closeErr).WithField("device", deviceName).Debug("unable to close dm-verity device")
-		} else {
-			log.G(ctx).WithField("device", deviceName).Debug("dm-verity device closed successfully")
-		}
+	if deviceName == "" {
+		return mount.Unmount(path, 0)
 	}
 
-	return err
+	if err := mount.Unmount(path, 0); err != nil {
+		return err
+	}
+
+	unlock, err := dmverity.LockDevice(context.WithoutCancel(ctx), deviceName)
+	if err != nil {
+		return fmt.Errorf("lock dm-verity device %q: %w", deviceName, err)
+	}
+	defer unlock()
+	closeDmverityDevice(ctx, deviceName, "final unmount")
+	return nil
 }
 
-type Config struct{}
+type Config struct {
+	// SharedLayerContext overrides the SELinux label applied to shared EROFS
+	// layer mounts. Empty uses defaultSharedLayerContext.
+	SharedLayerContext string `toml:"shared_layer_context"`
+}
 
 func init() {
 	registry.Register(&plugin.Registration{
@@ -310,7 +480,8 @@ func init() {
 			p.OS = runtime.GOOS
 			ic.Meta.Platforms = append(ic.Meta.Platforms, p)
 
-			return NewErofsMountHandler(), nil
+			cfg := ic.Config.(*Config)
+			return NewErofsMountHandler(cfg.SharedLayerContext), nil
 		},
 	})
 }

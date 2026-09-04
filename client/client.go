@@ -22,6 +22,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -78,6 +79,7 @@ import (
 	ptypes "github.com/containerd/containerd/v2/pkg/protobuf/types"
 	"github.com/containerd/containerd/v2/pkg/tracing"
 	"github.com/containerd/containerd/v2/plugins"
+	pluginservices "github.com/containerd/containerd/v2/plugins/services"
 )
 
 func init() {
@@ -985,6 +987,53 @@ func (c *Client) GetSnapshotterCapabilities(ctx context.Context, snapshotterName
 
 	sn := resp.Plugins[0]
 	return sn.Capabilities, nil
+}
+
+// GetUnpackSnapshotterCapabilities returns snapshotter capabilities filtered
+// through the selected diff-service applier. Optional dm-verity support is
+// disabled when the selected applier cannot materialize protected layers, and
+// required-policy mismatches are rejected.
+func (c *Client) GetUnpackSnapshotterCapabilities(ctx context.Context, snapshotterName string) ([]string, error) {
+	snapshotterCapabilities, err := c.GetSnapshotterCapabilities(ctx, snapshotterName)
+	if err != nil {
+		return nil, err
+	}
+
+	filters := []string{fmt.Sprintf("type==%s, id==%s", plugins.ServicePlugin, pluginservices.DiffService)}
+	resp, err := c.IntrospectionService().Plugins(ctx, filters...)
+	if err != nil {
+		return nil, err
+	}
+	if len(resp.Plugins) == 0 {
+		return nil, fmt.Errorf("inspection service could not find diff service plugin")
+	}
+	return effectiveDmverityCapabilities(snapshotterCapabilities, resp.Plugins[0].Capabilities)
+}
+
+func effectiveDmverityCapabilities(snapshotterCapabilities, diffCapabilities []string) ([]string, error) {
+	diffSupportsDmverity := slices.Contains(diffCapabilities, plugins.CapabilityDmverityReferrers)
+	snapshotterUsesErofs := slices.Contains(snapshotterCapabilities, plugins.CapabilityErofsLayers)
+	snapshotterRequiresDmverity := slices.Contains(snapshotterCapabilities, plugins.CapabilityDmveritySignaturesRequired)
+	if snapshotterRequiresDmverity && !diffSupportsDmverity {
+		return nil, fmt.Errorf("snapshotter requires dm-verity signatures but the diff service cannot materialize protected layers")
+	}
+	if snapshotterUsesErofs &&
+		slices.Contains(diffCapabilities, plugins.CapabilityDmveritySignaturesRequired) &&
+		!snapshotterRequiresDmverity {
+		return nil, fmt.Errorf("diff service requires dm-verity signatures but the snapshotter permits plain mounts")
+	}
+	if diffSupportsDmverity {
+		return snapshotterCapabilities, nil
+	}
+
+	effective := make([]string, 0, len(snapshotterCapabilities))
+	for _, capability := range snapshotterCapabilities {
+		if capability != plugins.CapabilityDmverityReferrers &&
+			capability != plugins.CapabilityDmveritySignaturesRequired {
+			effective = append(effective, capability)
+		}
+	}
+	return effective, nil
 }
 
 type RuntimeVersion struct {

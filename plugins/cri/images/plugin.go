@@ -21,6 +21,8 @@ import (
 	"fmt"
 	"path/filepath"
 	"runtime"
+	"slices"
+	"strings"
 
 	containerd "github.com/containerd/containerd/v2/client"
 	"github.com/containerd/containerd/v2/core/metadata"
@@ -30,6 +32,7 @@ import (
 	"github.com/containerd/containerd/v2/internal/cri/constants"
 	"github.com/containerd/containerd/v2/internal/cri/server/images"
 	"github.com/containerd/containerd/v2/plugins"
+	"github.com/containerd/containerd/v2/plugins/services"
 	"github.com/containerd/containerd/v2/plugins/services/warning"
 	"github.com/containerd/containerd/v2/version"
 	"github.com/containerd/log"
@@ -46,6 +49,7 @@ func init() {
 		ID:     "images",
 		Config: &config,
 		Requires: []plugin.Type{
+			plugins.DiffPlugin, // For deriving dm-verity referrer discovery
 			plugins.LeasePlugin,
 			plugins.MetadataPlugin,
 			plugins.SandboxStorePlugin,
@@ -60,6 +64,18 @@ func init() {
 				return nil, err
 			}
 			mdb := m.(*metadata.DB)
+
+			// Referrer discovery is derived from both sides of the signed EROFS
+			// path: a differ that consumes the artifacts and an active snapshotter
+			// that mounts the result.
+			dmverityDifferAvailable := false
+			for _, p := range ic.Plugins().GetAll() {
+				if p.Registration.Type == plugins.DiffPlugin &&
+					slices.Contains(p.Meta.Capabilities, plugins.CapabilityDmverityReferrers) {
+					dmverityDifferAvailable = true
+					break
+				}
+			}
 
 			// only set the default value of config path, if both mirrors and
 			// config path are empty and we are on Linux.
@@ -88,17 +104,103 @@ func init() {
 				criconfig.CheckLocalImagePullConfigs(ic.Context, &config)
 			}
 
+			snapshotters := map[string]struct{}{config.Snapshotter: {}}
+			for _, platform := range config.RuntimePlatforms {
+				name := platform.Snapshotter
+				if name == "" {
+					name = config.Snapshotter
+				}
+				snapshotters[name] = struct{}{}
+			}
+			var dmveritySnapshotters, requiredSnapshotters, erofsSnapshotters []string
+			for name := range snapshotters {
+				p := ic.Plugins().Get(plugins.SnapshotPlugin, name)
+				if p == nil {
+					continue
+				}
+				if slices.Contains(p.Meta.Capabilities, plugins.CapabilityErofsLayers) {
+					erofsSnapshotters = append(erofsSnapshotters, name)
+				}
+				if slices.Contains(p.Meta.Capabilities, plugins.CapabilityDmverityReferrers) {
+					dmveritySnapshotters = append(dmveritySnapshotters, name)
+				}
+				if slices.Contains(p.Meta.Capabilities, plugins.CapabilityDmveritySignaturesRequired) {
+					requiredSnapshotters = append(requiredSnapshotters, name)
+				}
+			}
+			slices.Sort(dmveritySnapshotters)
+			slices.Sort(requiredSnapshotters)
+			slices.Sort(erofsSnapshotters)
+
+			if dmverityDifferAvailable || len(requiredSnapshotters) > 0 {
+				ds, err := ic.GetByID(plugins.ServicePlugin, services.DiffService)
+				if err != nil {
+					return nil, fmt.Errorf("validate dm-verity diff service: %w", err)
+				}
+				reporter, ok := ds.(interface {
+					DmverityAppliers() (ordered []string, capable []string)
+				})
+				if !ok {
+					return nil, fmt.Errorf("diff service cannot report dm-verity applier capabilities")
+				}
+				ordered, capable := reporter.DmverityAppliers()
+				selectedCapable := len(ordered) > 0 && len(capable) > 0 && ordered[0] == capable[0]
+
+				if len(requiredSnapshotters) > 0 && !selectedCapable {
+					return nil, fmt.Errorf(
+						"snapshotter(s) [%s] require dm-verity signatures but the diff service applier chain [%s] "+
+							"cannot materialize protected layers",
+						strings.Join(requiredSnapshotters, ", "),
+						strings.Join(ordered, ", "),
+					)
+				}
+				if dmverityDifferAvailable && len(dmveritySnapshotters) > 0 && !selectedCapable {
+					return nil, fmt.Errorf(
+						"dm-verity referrer discovery is enabled but the diff service applier chain [%s] "+
+							"cannot consume dm-verity artifacts during local or deferred unpack; add a "+
+							"dm-verity capable differ to "+
+							"[plugins.\"io.containerd.service.v1.diff-service\"] default",
+						strings.Join(ordered, ", "))
+				}
+				if requiredReporter, ok := ds.(interface {
+					DmveritySignaturesRequired() bool
+				}); ok && requiredReporter.DmveritySignaturesRequired() {
+					var incompatible []string
+					for _, name := range erofsSnapshotters {
+						p := ic.Plugins().Get(plugins.SnapshotPlugin, name)
+						if p == nil || !slices.Contains(p.Meta.Capabilities, plugins.CapabilityDmveritySignaturesRequired) {
+							incompatible = append(incompatible, name)
+						}
+					}
+					if len(incompatible) > 0 {
+						return nil, fmt.Errorf(
+							"dm-verity signatures are required but EROFS snapshotter(s) [%s] permit plain mounts; "+
+								"set dmverity_mode = \"on\"",
+							strings.Join(incompatible, ", "),
+						)
+					}
+				}
+				if dmverityDifferAvailable && len(dmveritySnapshotters) > 0 {
+					config.EnableDmverityReferrers = true
+					log.G(ic.Context).Debugf(
+						"enabling dm-verity referrer discovery for snapshotter(s) [%s]",
+						strings.Join(dmveritySnapshotters, ", "),
+					)
+				}
+			}
+
 			ts, err := ic.GetSingle(plugins.TransferPlugin)
 			if err != nil {
 				return nil, err
 			}
 
 			options := &images.CRIImageServiceOptions{
-				Content:          mdb.ContentStore(),
-				RuntimePlatforms: map[string]images.ImagePlatform{},
-				Snapshotters:     map[string]snapshots.Snapshotter{},
-				ImageFSPaths:     map[string]string{},
-				Transferrer:      ts.(transfer.Transferrer),
+				Content:                 mdb.ContentStore(),
+				RuntimePlatforms:        map[string]images.ImagePlatform{},
+				Snapshotters:            map[string]snapshots.Snapshotter{},
+				SnapshotterCapabilities: map[string][]string{},
+				ImageFSPaths:            map[string]string{},
+				Transferrer:             ts.(transfer.Transferrer),
 			}
 
 			ctrdCli, err := containerd.New(
@@ -119,6 +221,9 @@ func init() {
 				options.Snapshotters[defaultSnapshotter] = s
 			} else {
 				return nil, fmt.Errorf("failed to find snapshotter %q", defaultSnapshotter)
+			}
+			if p := ic.Plugins().Get(plugins.SnapshotPlugin, defaultSnapshotter); p != nil {
+				options.SnapshotterCapabilities[defaultSnapshotter] = p.Meta.Capabilities
 			}
 
 			snapshotRoot := func(snapshotter string) (snapshotRoot string) {
@@ -144,6 +249,11 @@ func init() {
 				if _, ok := options.ImageFSPaths[snapshotter]; !ok {
 					options.ImageFSPaths[snapshotter] = snapshotRoot(snapshotter)
 					log.L.Infof("Get image filesystem path %q for snapshotter %q", options.ImageFSPaths[snapshotter], snapshotter)
+				}
+				if _, ok := options.SnapshotterCapabilities[snapshotter]; !ok {
+					if p := ic.Plugins().Get(plugins.SnapshotPlugin, snapshotter); p != nil {
+						options.SnapshotterCapabilities[snapshotter] = p.Meta.Capabilities
+					}
 				}
 
 				platform := platforms.DefaultSpec()

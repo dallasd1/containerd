@@ -133,6 +133,7 @@ func (image *Image) Size(ctx context.Context, provider content.Provider, platfor
 }
 
 type platformManifest struct {
+	d ocispec.Descriptor
 	p *ocispec.Platform
 	m *ocispec.Manifest
 }
@@ -151,6 +152,13 @@ type platformManifest struct {
 // to return a manifest descriptor or decide that we want to bring the API in
 // this direction because this abstraction is not needed.
 func Manifest(ctx context.Context, provider content.Provider, image ocispec.Descriptor, platform platforms.MatchComparer) (ocispec.Manifest, error) {
+	_, manifest, err := ManifestWithDescriptor(ctx, provider, image, platform)
+	return manifest, err
+}
+
+// ManifestWithDescriptor resolves a manifest and its descriptor from the image
+// for the given platform.
+func ManifestWithDescriptor(ctx context.Context, provider content.Provider, image ocispec.Descriptor, platform platforms.MatchComparer) (ocispec.Descriptor, ocispec.Manifest, error) {
 	var (
 		limit    = 1
 		m        []platformManifest
@@ -191,6 +199,7 @@ func Manifest(ctx context.Context, provider content.Provider, image ocispec.Desc
 			}
 
 			m = append(m, platformManifest{
+				d: desc,
 				p: desc.Platform,
 				m: &manifest,
 			})
@@ -241,7 +250,7 @@ func Manifest(ctx context.Context, provider content.Provider, image ocispec.Desc
 		}
 		return nil, fmt.Errorf("unexpected media type %v for %v: %w", desc.MediaType, desc.Digest, errdefs.ErrNotFound)
 	}), image); err != nil {
-		return ocispec.Manifest{}, err
+		return ocispec.Descriptor{}, ocispec.Manifest{}, err
 	}
 
 	if len(m) == 0 {
@@ -249,9 +258,9 @@ func Manifest(ctx context.Context, provider content.Provider, image ocispec.Desc
 		if wasIndex {
 			err = fmt.Errorf("no match for platform in manifest %v: %w", image.Digest, errdefs.ErrNotFound)
 		}
-		return ocispec.Manifest{}, err
+		return ocispec.Descriptor{}, ocispec.Manifest{}, err
 	}
-	return *m[0].m, nil
+	return m[0].d, *m[0].m, nil
 }
 
 // Config resolves the image configuration descriptor using a content provided
