@@ -224,6 +224,9 @@ func (ts *localTransferService) pull(ctx context.Context, ir transfer.ImageFetch
 			if enableRemoteSnapshotAnnotations {
 				handler = snpkg.AppendInfoHandlerWrapper(name)(handler)
 			}
+			// Always fetch signatures if available - the handler is a no-op if no referrers exist.
+			// The snapshotter decides whether to use them during mount.
+			handler = snpkg.AppendSignatureHandlerWrapper(fetcher)(handler)
 
 			unpacker, err = unpack.NewUnpacker(ctx, ts.content, uopts...)
 			if err != nil {
