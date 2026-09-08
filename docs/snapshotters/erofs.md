@@ -148,7 +148,7 @@ quota.  The `default_size` option can be used in the containerd configuration:
 
 ## Data Integrity
 
-The EROFS snapshotter provides two methods to consolidate data integrity:
+The EROFS snapshotter provides three methods to consolidate data integrity:
 
 ### Data Integrity with Immutable File Attribute
 
@@ -178,6 +178,106 @@ introduces additional runtime overhead since all container image reads from
 the container will be slower because it needs to verify the Merkle hash tree
 first.
 
+### Data Integrity with dm-verity
+
+The EROFS snapshotter supports device-mapper verity to provide block-level integrity
+verification for each EROFS layer. This method creates a dm-verity device for each
+layer and mounts it read-only. The dm-verity implementation uses the `go-dmverity`
+Go library, eliminating the need for external `veritysetup` command-line tools.
+Signed mappings require a Linux kernel with dm-verity support, a verity target
+version of at least 1.5, `CONFIG_DM_VERITY_VERIFY_ROOTHASH_SIG`, and kernel
+keyring support. Capability discovery requires the read-only
+`/sys/module/dm_verity/parameters/require_signatures` feature marker exposed by
+upstream Linux 5.13 and later (or an equivalent backport). The probe checks that
+the mechanism is available to containerd; signature activation still requires
+the signing certificate chain to be enrolled in a trusted kernel keyring.
+
+The differ must be configured to discover and consume signed dm-verity
+metadata:
+
+```toml
+[plugins."io.containerd.differ.v1.erofs"]
+  enable_dmverity = true
+```
+
+When dm-verity is enabled, layers carrying a valid signature and root-hash
+annotation are materialized with dm-verity metadata. A precomputed referrer
+supplies EROFS metadata and a Merkle tree; a signed layer without
+precomputed artifacts is formatted locally and its computed root hash must
+match the signed value. Unsigned layers remain ordinary EROFS unless
+`require_signatures` rejects them.
+
+Protected layers carry a `.dmverity` metadata sidecar, a non-empty `.sig`
+PKCS#7 sidecar, and an internal `.sig-required` marker. The marker lets `auto`
+mode distinguish newly protected materializations from unsigned snapshots
+created by older versions that formatted every layer with dm-verity metadata.
+Incomplete protected materializations fail closed; legacy metadata without a
+signature mounts as plain EROFS during upgrade. Committed snapshots also record
+compact materialization labels (version, root hash, and signature digest). If a
+ChainID was previously unpacked as plain EROFS, a later signed pull will refuse
+to reuse it silently; remove the stale snapshot and pull again.
+
+Locally formatted layers store the hash tree inline within the layer blob. The
+root hash and hash offset are saved in a `.dmverity` metadata file alongside
+the layer blob in JSON format. All other dm-verity parameters (block sizes,
+salt, etc.) are stored in a superblock within the layer blob and are
+auto-detected when mounting. Regular mode uses 4096-byte blocks (standard page
+size), while tar-index mode uses 512-byte blocks (dm-verity
+logical_block_size constraint).
+
+The snapshotter can be configured to control dm-verity behavior using `dmverity_mode`:
+
+```toml
+[plugins."io.containerd.snapshotter.v1.erofs"]
+  dmverity_mode = "auto"  # Options: "auto" (default), "on", "off"
+```
+
+The available modes are:
+
+- `"auto"` (default): Uses dm-verity if `.dmverity` metadata exists for a layer,
+  otherwise mounts as regular EROFS. This allows mixing dm-verity and non-dm-verity
+  layers in the same system. If signed mappings are unavailable, the plugin
+  does not advertise referrer support and continues with plain EROFS.
+
+- `"on"`: Requires dm-verity for all layers. If a layer lacks `.dmverity` metadata,
+  mounting will fail with an error. Plugin initialization also fails if the host
+  cannot activate signed dm-verity mappings. Use this mode when you want to enforce
+  integrity verification for all layers.
+
+- `"off"`: Disables dm-verity completely, even if `.dmverity` metadata exists.
+  Layers are mounted as regular EROFS without integrity verification. Use this for
+  compatibility or when dm-verity overhead is unacceptable.
+
+If the differ uses `require_signatures = true`, the snapshotter must use
+`dmverity_mode = "on"`. Containerd rejects a configuration that asks the differ
+to require signatures while allowing the snapshotter to mount pre-existing
+plain snapshots.
+
+Discovery of dm-verity referrers (per-layer signatures and precomputed EROFS
+artifacts) requires an extra registry lookup during pull and import, so it is
+performed only when a differ that can consume those artifacts is loaded. The
+EROFS differ advertises this when `enable_dmverity` is set and the signed
+dm-verity capability probe succeeds:
+
+```toml
+[plugins."io.containerd.differ.v1.erofs"]
+  enable_dmverity = true
+```
+
+Both the transfer service and the CRI image service derive referrer discovery
+from that capability, so no additional configuration is needed. With
+`enable_dmverity` disabled, which is the default, no referrer lookup is
+performed and pull behaves exactly as it does without this feature. If
+`enable_dmverity` is optional and the host lacks signed mapping support, the
+differ remains available but applies layers as plain EROFS. Setting
+`require_signatures = true` instead makes plugin initialization fail.
+
+When mounting a layer with dm-verity enabled, the snapshotter reads the metadata
+from the `.dmverity` file, requires its `.sig` sidecar, and creates a dm-verity device. The dm-verity library
+automatically reads all parameters from the superblock, ensuring that any corruption
+or tampering will be detected at read time. The dm-verity device is then mounted as
+the backing layer in the OverlayFS stack
+
 ## How It Works
 
 For each layer, the EROFS snapshotter prepares a directory containing the
@@ -204,9 +304,21 @@ In this case, the snapshot layer directory will look like this:
   work
 ```
 
+If dm-verity is enabled, a `.dmverity` metadata file will also be present:
+```
+  .erofslayer
+  fs
+  layer.erofs
+  layer.erofs.dmverity
+  layer.erofs.sig
+  work
+```
+
 Then the EROFS snapshotter will check for the existence of `layer.erofs`: it
 will mount the EROFS layer blob to `fs/` and return a valid overlayfs mount
-with all parent layers.
+with all parent layers. If dm-verity is enabled and both protected sidecars
+exist, the snapshotter will create a dm-verity device and mount that instead.
+Missing or malformed protected metadata never falls back to a plain mount.
 
 If other differs (not the EROFS differ) are used, the EROFS snapshotter will
 convert the flat directory into an EROFS layer blob on Commit instead.
@@ -224,7 +336,7 @@ Instead of extracting the entire tar archive to create an EROFS filesystem, the 
 2. Appends the original tar content to the index
 3. Creates a combined file: `[Tar index][Original tar content]`
 
-The tar index can be stored in a registry alongside image layers, allowing nodes to fetch it directly when needed. Typically, the tar index is much smaller than a full EROFS blob, making it more efficient to store and transfer. If the tar index is not available in the registry, it can be generated on the node as a fallback. When integrating with dm-verity, the registry can also store the dm-verity Merkle tree and root hash signature together with the tar index, enabling nodes to retrieve all necessary artifacts without redundant computation.
+The EROFS metadata produced by tar-index mode can be stored in a registry alongside image layers, allowing nodes to fetch it directly when needed. Typically, this metadata is much smaller than a full EROFS blob, making it more efficient to store and transfer. If the metadata is not available in the registry, it can be generated on the node as a fallback. When integrating with dm-verity, the registry can also store the dm-verity Merkle tree and root hash signature together with the EROFS metadata, enabling nodes to retrieve all necessary artifacts without redundant computation.
 
 In addition, we have a tar diffID for each layer according to the OCI image spec, so we don't need to reinvent a new way to verify the image layer content for confidential containers but just calculate the sha256 of the original tar data (because erofs could just reuse the tar data with 512-byte fs block size and build a minimal index for direct mounting of tar) out of the tar index mode in the guest and compare it with each diffID.
 
@@ -242,5 +354,3 @@ For the EROFS differ:
  - EROFS Flatten filesystem support (EROFS fsmerge feature);
 
  - ID-mapped mount spport;
-
- - DMVerity support.
