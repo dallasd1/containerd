@@ -25,6 +25,7 @@ import (
 	"strings"
 
 	"github.com/containerd/containerd/v2/core/mount"
+	"github.com/containerd/containerd/v2/internal/dmverity"
 	"github.com/containerd/containerd/v2/internal/fsview"
 	"github.com/containerd/errdefs"
 	"github.com/erofs/go-erofs"
@@ -41,6 +42,14 @@ func init() {
 func handleMount(m mount.Mount) (fsview.View, error) {
 	if m.Type != "erofs" {
 		return nil, errdefs.ErrNotImplemented
+	}
+
+	for _, opt := range m.Options {
+		if strings.HasPrefix(opt, dmverity.MountOptionRootHashPrefix) ||
+			strings.HasPrefix(opt, dmverity.MountOptionSignatureDigestPrefix) {
+			// Direct userspace access would bypass the dm-verity mount handler.
+			return nil, fmt.Errorf("dm-verity EROFS mount requires kernel mount handling: %w", errdefs.ErrNotImplemented)
+		}
 	}
 
 	f, err := os.Open(m.Source)

@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -30,17 +31,30 @@ import (
 	"github.com/containerd/platforms"
 	"github.com/containerd/plugin"
 	"github.com/containerd/plugin/registry"
+	"github.com/opencontainers/go-digest"
+	"github.com/opencontainers/selinux/go-selinux"
 
 	"github.com/containerd/containerd/v2/core/mount"
 	"github.com/containerd/containerd/v2/internal/dmverity"
 	"github.com/containerd/containerd/v2/internal/fsmount"
+	"github.com/containerd/containerd/v2/internal/kmutex"
 	"github.com/containerd/containerd/v2/plugins"
 	"github.com/containerd/errdefs"
 
 	"golang.org/x/sys/unix"
 )
 
-var forceloop bool
+var (
+	forceloop                 bool
+	signedDmverityDeviceLocks = kmutex.New()
+)
+
+const (
+	signedDmverityDeviceNamePrefix = "containerd-erofs-signed-"
+	maxDmveritySignatureSize       = 4 * 1024 * 1024
+	defaultSharedLayerContext      = "system_u:object_r:container_file_t:s0"
+	selinuxContextOpt              = "context="
+)
 
 type erofsMountHandler struct{}
 
@@ -49,26 +63,74 @@ func NewErofsMountHandler() mount.Handler {
 	return &erofsMountHandler{}
 }
 
+// Signed EROFS mounts reuse one mapper, so every consumer must use the same
+// superblock context. The per-container overlay retains its MCS label.
+func erofsMountOptions(opts []string, signedDmverity, selinuxEnabled bool) []string {
+	filtered := make([]string, 0, len(opts)+1)
+	for _, value := range opts {
+		if value == "loop" ||
+			strings.HasPrefix(value, dmverity.MountOptionModePrefix) ||
+			strings.HasPrefix(value, dmverity.MountOptionRootHashPrefix) ||
+			strings.HasPrefix(value, dmverity.MountOptionSignatureDigestPrefix) {
+			continue
+		}
+		if signedDmverity && strings.HasPrefix(value, selinuxContextOpt) {
+			continue
+		}
+		filtered = append(filtered, value)
+	}
+	if signedDmverity && selinuxEnabled {
+		filtered = append(filtered, selinuxContextOpt+defaultSharedLayerContext)
+	}
+	return filtered
+}
+
 func (h *erofsMountHandler) Mount(ctx context.Context, m mount.Mount, mp string, _ []mount.ActiveMount) (_ mount.ActiveMount, retErr error) {
 	if m.Type != "erofs" {
 		return mount.ActiveMount{}, errdefs.ErrNotImplemented
 	}
 
-	var dmverityDevice string
-	defer func() {
-		if retErr == nil || dmverityDevice == "" {
-			return
-		}
-		dmverity.Close(dmverityDevice)
-	}()
-
-	// Parse dm-verity metadata path from mount options
-	metadataPath := ""
+	var (
+		metadataPath            string
+		metadataOptionSeen      bool
+		duplicateMetadataOption bool
+		expectedRootHash        string
+		rootHashOptionSeen      bool
+		expectedSignatureDigest string
+		signatureOptionSeen     bool
+	)
 	for _, opt := range m.Options {
-		if path, ok := strings.CutPrefix(opt, "X-containerd.dmverity="); ok {
-			metadataPath = path
-			break
+		if value, ok := strings.CutPrefix(opt, dmverity.MountOptionRootHashPrefix); ok {
+			if rootHashOptionSeen {
+				return mount.ActiveMount{}, fmt.Errorf("duplicate expected dm-verity root hash for layer %q", m.Source)
+			}
+			rootHashOptionSeen = true
+			expectedRootHash = value
+			continue
 		}
+		if value, ok := strings.CutPrefix(opt, dmverity.MountOptionSignatureDigestPrefix); ok {
+			if signatureOptionSeen {
+				return mount.ActiveMount{}, fmt.Errorf("duplicate expected dm-verity signature digest for layer %q", m.Source)
+			}
+			signatureOptionSeen = true
+			expectedSignatureDigest = value
+			continue
+		}
+		if path, ok := strings.CutPrefix(opt, dmverity.MountOptionModePrefix); ok {
+			if metadataOptionSeen {
+				duplicateMetadataOption = true
+				continue
+			}
+			metadataOptionSeen = true
+			metadataPath = path
+		}
+	}
+	signedDmverity := rootHashOptionSeen || signatureOptionSeen
+	if signedDmverity &&
+		(!rootHashOptionSeen || !signatureOptionSeen ||
+			expectedRootHash == "" || expectedSignatureDigest == "" ||
+			!metadataOptionSeen || duplicateMetadataOption || metadataPath == "") {
+		return mount.ActiveMount{}, fmt.Errorf("incomplete expected dm-verity materialization for layer %q", m.Source)
 	}
 
 	// Set up dm-verity device if metadata path is provided
@@ -82,35 +144,53 @@ func (h *erofsMountHandler) Mount(ctx context.Context, m mount.Mount, mp string,
 		if err != nil {
 			return mount.ActiveMount{}, fmt.Errorf("failed to read dm-verity metadata from %s: %w", metadataPath, err)
 		}
+		if expectedRootHash != "" && metadata.RootHash != expectedRootHash {
+			return mount.ActiveMount{}, fmt.Errorf(
+				"layer %q dm-verity root hash %q does not match expected root hash %q",
+				m.Source,
+				metadata.RootHash,
+				expectedRootHash,
+			)
+		}
 
-		devicePath, cleanupName, err := setupDmVerityDevice(ctx, m.Source, metadata)
-		dmverityDevice = cleanupName
+		var devicePath, cleanupName string
+		if signedDmverity {
+			snapshotID := filepath.Base(filepath.Dir(filepath.Clean(m.Source)))
+			materializationID := digest.FromString(expectedRootHash + "\x00" + expectedSignatureDigest).Encoded()[:32]
+			deviceName := signedDmverityDeviceNamePrefix + snapshotID + "-" + materializationID
+			if err := signedDmverityDeviceLocks.Lock(ctx, deviceName); err != nil {
+				return mount.ActiveMount{}, fmt.Errorf("lock dm-verity device %q: %w", deviceName, err)
+			}
+			defer signedDmverityDeviceLocks.Unlock(deviceName)
+			devicePath, cleanupName, err = setupSignedDmVerityDevice(ctx, m.Source, deviceName, metadata, expectedSignatureDigest)
+		} else {
+			devicePath, cleanupName, err = setupDmVerityDevice(ctx, m.Source, metadata)
+		}
+		if cleanupName != "" {
+			defer func() {
+				if retErr != nil {
+					dmverity.Close(cleanupName)
+				}
+			}()
+		}
 		if err != nil {
 			return mount.ActiveMount{}, err
 		}
 		m.Source = devicePath
 	}
 
-	filteredOptions := make([]string, 0, len(m.Options))
-	for _, v := range m.Options {
-		// Skip loop option (handled by loop device setup) and dmverity options (already processed)
-		if v == "loop" || strings.HasPrefix(v, "X-containerd.dmverity=") {
-			continue
-		}
-		filteredOptions = append(filteredOptions, v)
-	}
-	m.Options = filteredOptions
+	m.Options = erofsMountOptions(m.Options, signedDmverity, selinux.GetEnabled())
 
 	if err := os.MkdirAll(mp, 0700); err != nil {
 		return mount.ActiveMount{}, err
 	}
 
 	err := error(unix.ENOTBLK)
-	if !forceloop {
+	if !forceloop || signedDmverity {
 		// Try to use file-backed mount feature if available (Linux 6.12+) first
 		err = doMount(m, mp)
 	}
-	if errors.Is(err, unix.ENOTBLK) {
+	if errors.Is(err, unix.ENOTBLK) && !signedDmverity {
 		var loops []*os.File
 
 		// Never try to mount with raw files anymore if tried
@@ -205,6 +285,75 @@ func setupDmVerityDevice(ctx context.Context, source string, metadata *dmverity.
 	return devicePath, "", nil
 }
 
+// setupSignedDmVerityDevice creates or reuses one signed mapper for a layer.
+// The caller holds its lifecycle lock until the mapper is mounted or rolled back.
+func setupSignedDmVerityDevice(ctx context.Context, source, deviceName string, metadata *dmverity.DmverityMetadata, expectedSignatureDigest string) (devicePath string, cleanupName string, err error) {
+	supported, err := dmverity.IsSupported()
+	if err != nil || !supported {
+		return "", "", fmt.Errorf("layer requires dm-verity but system doesn't support it (dm_verity module not loaded): %w", err)
+	}
+
+	devicePath = dmverity.DevicePath(deviceName)
+	hashDevice := dmverity.ResolveHashDevice(source, metadata)
+	signature, err := loadValidatedDmveritySignature(source, expectedSignatureDigest)
+	if err != nil {
+		return "", "", err
+	}
+
+	if _, statErr := os.Stat(devicePath); statErr == nil {
+		if verifyErr := dmverity.VerifySignedDevice(deviceName, metadata.RootHash); verifyErr != nil {
+			return "", "", fmt.Errorf("existing signed dm-verity device %q verification failed: %w", deviceName, verifyErr)
+		}
+		log.G(ctx).WithField("device", devicePath).Debug("signed dm-verity device already exists and is verified, reusing")
+		return devicePath, "", nil
+	} else if !os.IsNotExist(statErr) {
+		return "", "", fmt.Errorf("inspect dm-verity device %q: %w", deviceName, statErr)
+	}
+
+	if _, err := dmverity.OpenSigned(source, deviceName, hashDevice, metadata.RootHash, metadata.HashOffset, signature); err != nil {
+		return "", "", fmt.Errorf("failed to open signed dm-verity device: %w", err)
+	}
+	if waitErr := waitForDevice(devicePath); waitErr != nil {
+		return "", deviceName, waitErr
+	}
+	log.G(ctx).WithField("device", devicePath).Debug("signed dm-verity device created successfully")
+	return devicePath, deviceName, nil
+}
+
+func loadValidatedDmveritySignature(source, expectedDigest string) ([]byte, error) {
+	signatureFile := dmverity.SignaturePath(source)
+	file, err := os.Open(signatureFile)
+	if err != nil {
+		return nil, fmt.Errorf("layer %q has dm-verity metadata but no usable signature: %w", source, err)
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("inspect dm-verity signature %q: %w", signatureFile, err)
+	}
+	if !info.Mode().IsRegular() || info.Size() == 0 {
+		return nil, fmt.Errorf("layer %q has dm-verity metadata but signature %q is not a non-empty regular file", source, signatureFile)
+	}
+	if info.Size() > maxDmveritySignatureSize {
+		return nil, fmt.Errorf("layer %q dm-verity signature %q exceeds maximum size %d", source, signatureFile, maxDmveritySignatureSize)
+	}
+	signature, err := io.ReadAll(io.LimitReader(file, maxDmveritySignatureSize+1))
+	if err != nil {
+		return nil, fmt.Errorf("read dm-verity signature %q: %w", signatureFile, err)
+	}
+	if int64(len(signature)) != info.Size() {
+		return nil, fmt.Errorf("dm-verity signature %q changed while it was read", signatureFile)
+	}
+	expected, err := digest.Parse(expectedDigest)
+	if err != nil {
+		return nil, fmt.Errorf("invalid expected dm-verity signature digest %q: %w", expectedDigest, err)
+	}
+	if actual := expected.Algorithm().FromBytes(signature); actual != expected {
+		return nil, fmt.Errorf("dm-verity signature %q digest %s does not match expected digest %s", signatureFile, actual, expected)
+	}
+	return signature, nil
+}
+
 // waitForDevice polls for the device node to appear, returning an error if it
 // does not appear within a reasonable timeout.
 func waitForDevice(devicePath string) error {
@@ -234,16 +383,30 @@ func doMount(m mount.Mount, target string) error {
 
 func (h *erofsMountHandler) Unmount(ctx context.Context, path string) error {
 	// Check what's currently mounted to determine if dm-verity device cleanup is needed
-	var deviceName string
+	var (
+		deviceName     string
+		signedDmverity bool
+	)
 	mountInfo, err := mount.Lookup(path)
 	if err == nil {
 		source := mountInfo.Source
 		if strings.HasPrefix(source, "/dev/mapper/containerd-erofs-") {
 			deviceName = strings.TrimPrefix(source, "/dev/mapper/")
+			signedDmverity = strings.HasPrefix(source, dmverity.DevicePath(signedDmverityDeviceNamePrefix))
 		}
 	}
 
+	if signedDmverity {
+		if err := signedDmverityDeviceLocks.Lock(context.WithoutCancel(ctx), deviceName); err != nil {
+			return fmt.Errorf("lock dm-verity device %q: %w", deviceName, err)
+		}
+		defer signedDmverityDeviceLocks.Unlock(deviceName)
+	}
+
 	err = mount.Unmount(path, 0)
+	if signedDmverity && err != nil {
+		return err
+	}
 
 	if deviceName != "" {
 		log.G(ctx).WithFields(log.Fields{

@@ -22,7 +22,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
+)
+
+const (
+	MountOptionModePrefix            = "X-containerd.dmverity="
+	MountOptionRootHashPrefix        = "X-containerd.dmverity.root-hash="
+	MountOptionSignatureDigestPrefix = "X-containerd.dmverity.signature-digest="
 )
 
 type DmverityOptions struct {
@@ -64,6 +71,12 @@ func MetadataPath(layerBlobPath string) string {
 	return layerBlobPath + ".dmverity"
 }
 
+// SignaturePath returns the path to the dm-verity signature file for a layer.
+// The signature file contains the decoded PKCS7 signature for root hash verification.
+func SignaturePath(layerBlobPath string) string {
+	return layerBlobPath + ".sig"
+}
+
 func DevicePath(name string) string {
 	return fmt.Sprintf("/dev/mapper/%s", name)
 }
@@ -71,6 +84,15 @@ func DevicePath(name string) string {
 type DmverityMetadata struct {
 	RootHash   string `json:"roothash"`
 	HashOffset uint64 `json:"hashoffset"`
+	HashDevice string `json:"hashdevice,omitempty"`
+}
+
+// ResolveHashDevice returns the hash device path described by metadata.
+func ResolveHashDevice(layerBlobPath string, metadata *DmverityMetadata) string {
+	if metadata.HashDevice == "" {
+		return layerBlobPath
+	}
+	return filepath.Join(filepath.Dir(layerBlobPath), metadata.HashDevice)
 }
 
 func ReadMetadata(layerBlobPath string) (*DmverityMetadata, error) {

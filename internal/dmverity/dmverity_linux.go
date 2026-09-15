@@ -19,8 +19,11 @@ package dmverity
 import (
 	"fmt"
 	"os"
+	"runtime"
+	"strings"
 
 	"github.com/containerd/containerd/v2/core/mount"
+	dm "github.com/containerd/go-dmverity/pkg/dm"
 	"github.com/containerd/go-dmverity/pkg/utils"
 	"github.com/containerd/go-dmverity/pkg/verity"
 )
@@ -124,6 +127,10 @@ func Format(dataDevice, hashDevice string, opts *DmverityOptions) (string, error
 //     Uses explicitly provided parameters from opts. All dm-verity parameters must be
 //     supplied programmatically since there's no superblock to read from.
 func Open(dataDevice string, name string, hashDevice string, rootHash string, hashOffset uint64, opts *DmverityOptions) (string, error) {
+	return open(dataDevice, name, hashDevice, rootHash, hashOffset, opts, "")
+}
+
+func open(dataDevice string, name string, hashDevice string, rootHash string, hashOffset uint64, opts *DmverityOptions, signatureFile string) (string, error) {
 	if rootHash == "" {
 		return "", fmt.Errorf("rootHash cannot be empty")
 	}
@@ -169,7 +176,19 @@ func Open(dataDevice string, name string, hashDevice string, rootHash string, ha
 		hashLoopDevice = dataLoopDevice
 	}
 
-	devicePath, err := verity.Open(&params, name, dataLoopDevice, hashLoopDevice, rootDigest, "", nil)
+	// go-dmverity loads the root-hash signature into KEY_SPEC_THREAD_KEYRING and
+	// then names it in the device-mapper table, which the kernel resolves against
+	// the calling thread's keyrings. Go is free to reschedule this goroutine onto
+	// a different OS thread between the add_key and the DM ioctls, and that thread
+	// cannot see the key -- so a perfectly valid signature is rejected, and the
+	// deferred unlink misses too, leaking the key. Pin the goroutine across the
+	// call. verity.Open is fully synchronous, so this covers the whole sequence.
+	if signatureFile != "" {
+		runtime.LockOSThread()
+		defer runtime.UnlockOSThread()
+	}
+
+	devicePath, err := verity.Open(&params, name, dataLoopDevice, hashLoopDevice, rootDigest, signatureFile, nil)
 	if err != nil {
 		dataLoop.Close()
 		if hashLoop != nil {
@@ -185,6 +204,35 @@ func Open(dataDevice string, name string, hashDevice string, rootHash string, ha
 	}
 
 	return devicePath, nil
+}
+
+// OpenSigned creates a signed dm-verity mapping from signature bytes already
+// validated by the caller.
+func OpenSigned(dataDevice string, name string, hashDevice string, rootHash string, hashOffset uint64, signature []byte) (string, error) {
+	if len(signature) == 0 {
+		return "", fmt.Errorf("signature cannot be empty")
+	}
+	file, err := os.CreateTemp("", "containerd-dmverity-signature-")
+	if err != nil {
+		return "", fmt.Errorf("create temporary signature file: %w", err)
+	}
+	path := file.Name()
+	defer os.Remove(path)
+	defer file.Close()
+	if _, err := file.Write(signature); err != nil {
+		return "", fmt.Errorf("write temporary signature file: %w", err)
+	}
+	if _, err := file.Seek(0, 0); err != nil {
+		return "", fmt.Errorf("rewind temporary signature file: %w", err)
+	}
+	if err := os.Remove(path); err != nil {
+		return "", fmt.Errorf("unlink temporary signature file: %w", err)
+	}
+
+	// Keep the validated inode open and let go-dmverity reopen it through procfs.
+	// The unlinked file has no replaceable pathname between validation and use.
+	fdPath := fmt.Sprintf("/proc/self/fd/%d", file.Fd())
+	return open(dataDevice, name, hashDevice, rootHash, hashOffset, nil, fdPath)
 }
 
 func Close(name string) error {
@@ -206,5 +254,70 @@ func VerifyDevice(name string, rootHash string) error {
 		return fmt.Errorf("dm-verity device %q verification failed", name)
 	}
 
+	return nil
+}
+
+// VerifySignedDevice ensures an existing dm-verity device matches the expected
+// signed metadata and is healthy.
+func VerifySignedDevice(name string, rootHash string) error {
+	rootDigest, err := utils.ParseRootHash(rootHash)
+	if err != nil {
+		return fmt.Errorf("invalid root hash: %w", err)
+	}
+
+	control, err := dm.Open()
+	if err != nil {
+		return fmt.Errorf("open device-mapper control: %w", err)
+	}
+	defer control.Close()
+
+	status, err := control.DeviceStatus(name)
+	if err != nil {
+		return fmt.Errorf("inspect dm-verity device %q: %w", name, err)
+	}
+	if !status.ActivePresent || status.TargetCount != 1 {
+		return fmt.Errorf("dm-verity device %q does not have one active target", name)
+	}
+
+	verityStatus, err := control.TableStatus(name, false)
+	if err != nil {
+		return fmt.Errorf("read dm-verity device %q status: %w", name, err)
+	}
+	if strings.TrimSpace(verityStatus) != "V" {
+		return fmt.Errorf("dm-verity device %q is not in the verified state", name)
+	}
+
+	table, err := control.TableStatus(name, true)
+	if err != nil {
+		return fmt.Errorf("read dm-verity device %q table: %w", name, err)
+	}
+	if err := verifySignedVerityTable(table, fmt.Sprintf("%x", rootDigest), name); err != nil {
+		return fmt.Errorf("verify dm-verity device %q table: %w", name, err)
+	}
+	return nil
+}
+
+func verifySignedVerityTable(table, expectedRootHash, deviceName string) error {
+	fields := strings.Fields(table)
+	if len(fields) < 10 {
+		return fmt.Errorf("invalid verity table with %d fields", len(fields))
+	}
+	if !strings.EqualFold(fields[8], expectedRootHash) {
+		return fmt.Errorf("root hash is %q, expected %q", fields[8], expectedRootHash)
+	}
+	if len(fields) == 10 {
+		return fmt.Errorf("verity table does not require a root-hash signature")
+	}
+	if len(fields) != 13 || fields[10] != "2" {
+		return fmt.Errorf("verity table has unexpected optional arguments")
+	}
+	keyDescription := fields[12]
+	if fields[11] != "root_hash_sig_key_desc" || keyDescription == "" {
+		return fmt.Errorf("verity table does not require a root-hash signature")
+	}
+	if keyDescription != "cryptsetup:"+deviceName &&
+		(!strings.HasPrefix(keyDescription, "cryptsetup:") || !strings.HasSuffix(keyDescription, "-"+deviceName)) {
+		return fmt.Errorf("root-hash signature key %q does not match device %q", keyDescription, deviceName)
+	}
 	return nil
 }
