@@ -19,6 +19,7 @@ package transfer
 import (
 	"errors"
 	"fmt"
+	"slices"
 
 	"github.com/containerd/errdefs"
 	"github.com/containerd/log"
@@ -129,7 +130,7 @@ func configureUnpackPlatforms(ic *plugin.InitContext, ms *metadata.DB, config *t
 			snCapabilities = p.Meta.Capabilities
 		}
 
-		applier, skip, err := getApplier(ic, uc, p)
+		applier, applierID, skip, err := getApplier(ic, uc, p)
 		if err != nil {
 			return err
 		}
@@ -141,6 +142,20 @@ func configureUnpackPlatforms(ic *plugin.InitContext, ms *metadata.DB, config *t
 				continue
 			}
 			return fmt.Errorf("no matching diff plugins: %w", errdefs.ErrNotFound)
+		}
+		effectiveSnapshotterCapabilities := snCapabilities
+		snapshotterSupportsDmverity := slices.Contains(snCapabilities, plugins.CapabilityDmverityReferrers)
+		dp := ic.Plugins().Get(plugins.DiffPlugin, applierID)
+		differSupportsDmverity := dp != nil && slices.Contains(dp.Meta.Capabilities, plugins.CapabilityDmverityReferrers)
+		if differSupportsDmverity && snapshotterSupportsDmverity {
+			lc.EnableDmverityReferrers = true
+		} else if snapshotterSupportsDmverity {
+			effectiveSnapshotterCapabilities = make([]string, 0, len(snCapabilities))
+			for _, capability := range snCapabilities {
+				if capability != plugins.CapabilityDmverityReferrers {
+					effectiveSnapshotterCapabilities = append(effectiveSnapshotterCapabilities, capability)
+				}
+			}
 		}
 
 		target := platforms.Only(p)
@@ -154,7 +169,7 @@ func configureUnpackPlatforms(ic *plugin.InitContext, ms *metadata.DB, config *t
 			SnapshotterKey:          uc.Snapshotter,
 			Snapshotter:             sn,
 			SnapshotterExports:      snExports,
-			SnapshotterCapabilities: snCapabilities,
+			SnapshotterCapabilities: effectiveSnapshotterCapabilities,
 			Applier:                 applier,
 			ConfigType:              uc.ConfigType,
 			LayerTypes:              uc.LayerTypes,
@@ -164,16 +179,16 @@ func configureUnpackPlatforms(ic *plugin.InitContext, ms *metadata.DB, config *t
 	return nil
 }
 
-func getApplier(ic *plugin.InitContext, uc unpackConfiguration, p specs.Platform) (diff.Applier, bool, error) {
+func getApplier(ic *plugin.InitContext, uc unpackConfiguration, p specs.Platform) (diff.Applier, string, bool, error) {
 	if uc.Differ != "" {
 		inst, err := ic.GetByID(plugins.DiffPlugin, uc.Differ)
 		if err != nil {
 			if uc.Optional {
-				return nil, true, nil
+				return nil, "", true, nil
 			}
-			return nil, false, fmt.Errorf("failed to get instance for diff plugin %q: %w", uc.Differ, err)
+			return nil, "", false, fmt.Errorf("failed to get instance for diff plugin %q: %w", uc.Differ, err)
 		}
-		return inst.(diff.Applier), false, nil
+		return inst.(diff.Applier), uc.Differ, false, nil
 	}
 
 	var (
@@ -219,15 +234,15 @@ func getApplier(ic *plugin.InitContext, uc unpackConfiguration, p specs.Platform
 				continue
 			}
 			if uc.Optional {
-				return nil, true, nil
+				return nil, "", true, nil
 			}
-			return nil, false, fmt.Errorf("failed to get instance for diff plugin %q: %w", candidate.Registration.ID, err)
+			return nil, "", false, fmt.Errorf("failed to get instance for diff plugin %q: %w", candidate.Registration.ID, err)
 		}
 		applier = inst.(diff.Applier)
 		applierID = candidate.Registration.ID
 	}
 
-	return applier, false, nil
+	return applier, applierID, false, nil
 }
 
 type transferConfig struct {

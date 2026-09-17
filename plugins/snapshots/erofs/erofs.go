@@ -34,6 +34,7 @@ import (
 	"github.com/containerd/containerd/v2/internal/dmverity"
 	"github.com/containerd/containerd/v2/internal/fsverity"
 	"github.com/containerd/containerd/v2/internal/userns"
+	snpkg "github.com/containerd/containerd/v2/pkg/snapshotters"
 )
 
 const snapshotTempDirPrefix = "new-"
@@ -51,6 +52,9 @@ type SnapshotterConfig struct {
 	remapIDs    bool
 	// dmverityMode controls dm-verity behavior: "auto" (use if .dmverity exists), "on" (require .dmverity), "off" (disable)
 	dmverityMode string
+	// enableDmverityReferrers enables signed-referrer materialization without
+	// changing upstream dmverityMode semantics.
+	enableDmverityReferrers bool
 }
 
 // Opt is an option to configure the erofs snapshotter
@@ -84,6 +88,13 @@ func WithDmverityMode(mode string) Opt {
 	}
 }
 
+// WithDmverityReferrers enables signed dm-verity materializations.
+func WithDmverityReferrers() Opt {
+	return func(config *SnapshotterConfig) {
+		config.enableDmverityReferrers = true
+	}
+}
+
 // WithDefaultSize creates a default size writable layer for active snapshots
 func WithDefaultSize(size int64) Opt {
 	return func(config *SnapshotterConfig) {
@@ -105,15 +116,16 @@ type MetaStore interface {
 }
 
 type snapshotter struct {
-	root            string
-	ms              *storage.MetaStore
-	ovlOptions      []string
-	enableFsverity  bool
-	setImmutable    bool
-	defaultWritable int64
-	blockMode       bool
-	remapIDs        bool
-	dmverityMode    string
+	root                    string
+	ms                      *storage.MetaStore
+	ovlOptions              []string
+	enableFsverity          bool
+	setImmutable            bool
+	defaultWritable         int64
+	blockMode               bool
+	remapIDs                bool
+	dmverityMode            string
+	enableDmverityReferrers bool
 }
 
 // NewSnapshotter returns a Snapshotter which uses EROFS+OverlayFS. The layers
@@ -181,15 +193,16 @@ func NewSnapshotter(root string, opts ...Opt) (snapshots.Snapshotter, error) {
 	}
 
 	return &snapshotter{
-		root:            root,
-		ms:              ms,
-		ovlOptions:      config.ovlOptions,
-		enableFsverity:  config.enableFsverity,
-		setImmutable:    config.setImmutable,
-		defaultWritable: config.defaultSize,
-		blockMode:       config.defaultSize > 0,
-		remapIDs:        config.remapIDs,
-		dmverityMode:    config.dmverityMode,
+		root:                    root,
+		ms:                      ms,
+		ovlOptions:              config.ovlOptions,
+		enableFsverity:          config.enableFsverity,
+		setImmutable:            config.setImmutable,
+		defaultWritable:         config.defaultSize,
+		blockMode:               config.defaultSize > 0,
+		remapIDs:                config.remapIDs,
+		dmverityMode:            config.dmverityMode,
+		enableDmverityReferrers: config.enableDmverityReferrers,
 	}, nil
 }
 
@@ -311,10 +324,23 @@ func (s *snapshotter) applyDmverityPolicy(layerBlob string) (string, error) {
 
 // createErofsMount creates a mount specification for an EROFS layer.
 // Applies dmverityMode policy and passes it to the mount handler.
-func (s *snapshotter) createErofsMount(layerBlob string) (mount.Mount, error) {
+func (s *snapshotter) createErofsMount(layerBlob string, labels map[string]string) (mount.Mount, error) {
 	options := []string{"ro", "loop"}
 
-	if dmverityOpt, err := s.applyDmverityPolicy(layerBlob); err != nil {
+	rootHash, signatureDigest, signedMaterialization, err := snpkg.DmveritySnapshotIdentity(labels)
+	if err != nil {
+		return mount.Mount{}, fmt.Errorf("invalid dm-verity materialization labels for layer %s: %w", layerBlob, err)
+	}
+	if signedMaterialization {
+		if !s.enableDmverityReferrers {
+			return mount.Mount{}, fmt.Errorf("layer %s requires signed dm-verity referrers but enable_dmverity_referrers is false", layerBlob)
+		}
+		options = append(options,
+			dmverity.MountOptionModePrefix+dmverity.MetadataPath(layerBlob),
+			dmverity.MountOptionRootHashPrefix+rootHash,
+			dmverity.MountOptionSignatureDigestPrefix+signatureDigest,
+		)
+	} else if dmverityOpt, err := s.applyDmverityPolicy(layerBlob); err != nil {
 		return mount.Mount{}, err
 	} else if dmverityOpt != "" {
 		options = append(options, dmverityOpt)
@@ -327,7 +353,27 @@ func (s *snapshotter) createErofsMount(layerBlob string) (mount.Mount, error) {
 	}, nil
 }
 
-func (s *snapshotter) mounts(snap storage.Snapshot, info snapshots.Info) ([]mount.Mount, error) {
+func parentSnapshotInfos(ctx context.Context, info snapshots.Info, parentIDs []string) ([]snapshots.Info, error) {
+	infos := make([]snapshots.Info, len(parentIDs))
+	parent := info.Parent
+	for i, expectedID := range parentIDs {
+		if parent == "" {
+			return nil, fmt.Errorf("snapshot parent chain ended before parent ID %s", expectedID)
+		}
+		id, parentInfo, _, err := storage.GetInfo(ctx, parent)
+		if err != nil {
+			return nil, fmt.Errorf("get parent snapshot %q: %w", parent, err)
+		}
+		if id != expectedID {
+			return nil, fmt.Errorf("snapshot parent %q has ID %s, expected %s", parent, id, expectedID)
+		}
+		infos[i] = parentInfo
+		parent = parentInfo.Parent
+	}
+	return infos, nil
+}
+
+func (s *snapshotter) mounts(snap storage.Snapshot, info snapshots.Info, parentInfos []snapshots.Info) ([]mount.Mount, error) {
 	var options []string
 
 	if len(snap.ParentIDs) == 0 {
@@ -340,7 +386,7 @@ func (s *snapshotter) mounts(snap storage.Snapshot, info snapshots.Info) ([]moun
 					return nil, err
 				}
 			}
-			m, err := s.createErofsMount(layerBlob)
+			m, err := s.createErofsMount(layerBlob, info.Labels)
 			if err != nil {
 				return nil, fmt.Errorf("failed to create erofs mount: %w", err)
 			}
@@ -426,7 +472,7 @@ func (s *snapshotter) mounts(snap storage.Snapshot, info snapshots.Info) ([]moun
 		if err != nil {
 			return nil, err
 		}
-		m, err := s.createErofsMount(layerBlob)
+		m, err := s.createErofsMount(layerBlob, parentInfos[0].Labels)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create erofs mount: %w", err)
 		}
@@ -436,10 +482,20 @@ func (s *snapshotter) mounts(snap storage.Snapshot, info snapshots.Info) ([]moun
 	// first marks the start of the lowerdir range. A merged fsmeta ends the
 	// range but never moves its start: lowers stacked above it stay in range.
 	first := len(mounts)
+	lastSignedParent := -1
+	for i := range parentInfos {
+		_, _, signed, err := snpkg.DmveritySnapshotIdentity(parentInfos[i].Labels)
+		if err != nil {
+			return nil, fmt.Errorf("validate parent %s dm-verity materialization: %w", snap.ParentIDs[i], err)
+		}
+		if signed {
+			lastSignedParent = i
+		}
+	}
 	for i := range snap.ParentIDs {
 		// If a merged fsmeta is valid for this layer, skip the remaining bottom layers.
 		// Why? Because bottom layers have been flattened with the thin fsmeta.
-		if m, ok := s.mountFsMeta(snap, i); ok {
+		if m, ok := s.mountFsMeta(snap, i); i > lastSignedParent && ok {
 			mounts = append(mounts, m)
 			break
 		}
@@ -449,7 +505,7 @@ func (s *snapshotter) mounts(snap storage.Snapshot, info snapshots.Info) ([]moun
 			return nil, err
 		}
 
-		m, err := s.createErofsMount(layerBlob)
+		m, err := s.createErofsMount(layerBlob, parentInfos[i].Labels)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create erofs mount for parent %s: %w", snap.ParentIDs[i], err)
 		}
@@ -491,9 +547,10 @@ func (s *snapshotter) mounts(snap storage.Snapshot, info snapshots.Info) ([]moun
 
 func (s *snapshotter) createSnapshot(ctx context.Context, kind snapshots.Kind, key, parent string, opts []snapshots.Opt) (_ []mount.Mount, err error) {
 	var (
-		snap     storage.Snapshot
-		td, path string
-		info     snapshots.Info
+		snap        storage.Snapshot
+		td, path    string
+		info        snapshots.Info
+		parentInfos []snapshots.Info
 	)
 
 	defer func() {
@@ -527,6 +584,10 @@ func (s *snapshotter) createSnapshot(ctx context.Context, kind snapshots.Kind, k
 		_, info, _, err = storage.GetInfo(ctx, key)
 		if err != nil {
 			return fmt.Errorf("failed to get snapshot info: %w", err)
+		}
+		parentInfos, err = parentSnapshotInfos(ctx, info, snap.ParentIDs)
+		if err != nil {
+			return fmt.Errorf("resolve parent snapshot materialization: %w", err)
 		}
 
 		// In non-block mode, set the ownership of the upperdir so that
@@ -589,7 +650,7 @@ func (s *snapshotter) createSnapshot(ctx context.Context, kind snapshots.Kind, k
 		return nil, err
 	}
 
-	return s.mounts(snap, info)
+	return s.mounts(snap, info, parentInfos)
 }
 
 func (s *snapshotter) Prepare(ctx context.Context, key, parent string, opts ...snapshots.Opt) ([]mount.Mount, error) {
@@ -692,6 +753,21 @@ func (s *snapshotter) Commit(ctx context.Context, name, key string, opts ...snap
 		if err != nil {
 			return err
 		}
+		for _, sidecar := range []string{
+			layerBlob + ".hashtree",
+			dmverity.MetadataPath(layerBlob),
+			dmverity.SignaturePath(layerBlob),
+		} {
+			sidecarUsage, err := fs.DiskUsage(ctx, sidecar)
+			if os.IsNotExist(err) {
+				continue
+			}
+			if err != nil {
+				return fmt.Errorf("calculate usage for %s: %w", sidecar, err)
+			}
+			usage.Inodes += sidecarUsage.Inodes
+			usage.Size += sidecarUsage.Size
+		}
 		if _, err = storage.CommitActive(ctx, key, name, snapshots.Usage(usage), opts...); err != nil {
 			return fmt.Errorf("failed to commit snapshot %s: %w", key, err)
 		}
@@ -700,8 +776,11 @@ func (s *snapshotter) Commit(ctx context.Context, name, key string, opts ...snap
 }
 
 func (s *snapshotter) Mounts(ctx context.Context, key string) (_ []mount.Mount, err error) {
-	var snap storage.Snapshot
-	var info snapshots.Info
+	var (
+		snap        storage.Snapshot
+		info        snapshots.Info
+		parentInfos []snapshots.Info
+	)
 	if err := s.ms.WithTransaction(ctx, false, func(ctx context.Context) error {
 		snap, err = storage.GetSnapshot(ctx, key)
 		if err != nil {
@@ -712,11 +791,15 @@ func (s *snapshotter) Mounts(ctx context.Context, key string) (_ []mount.Mount, 
 		if err != nil {
 			return fmt.Errorf("failed to get snapshot info: %w", err)
 		}
+		parentInfos, err = parentSnapshotInfos(ctx, info, snap.ParentIDs)
+		if err != nil {
+			return fmt.Errorf("resolve parent snapshot materialization: %w", err)
+		}
 		return nil
 	}); err != nil {
 		return nil, err
 	}
-	return s.mounts(snap, info)
+	return s.mounts(snap, info, parentInfos)
 }
 
 func (s *snapshotter) getCleanupDirectories(ctx context.Context) ([]string, error) {

@@ -42,6 +42,10 @@ type Config struct {
 	// EnableDmverity enables dm-verity formatting for EROFS layers
 	// Linux only
 	EnableDmverity bool `toml:"enable_dmverity"`
+
+	// EnableDmverityReferrers enables discovery and materialization of signed
+	// dm-verity referrer artifacts. It does not change EnableDmverity semantics.
+	EnableDmverityReferrers bool `toml:"enable_dmverity_referrers"`
 }
 
 func init() {
@@ -94,6 +98,11 @@ func init() {
 					return nil, fmt.Errorf("dm-verity is not supported on this system (dm_verity module not loaded): %w", plugin.ErrSkipPlugin)
 				}
 				opts = append(opts, erofs.WithDmverity())
+			}
+
+			if config.EnableDmverityReferrers {
+				opts = append(opts, erofs.WithDmverityReferrers())
+				ic.Meta.Capabilities = append(ic.Meta.Capabilities, plugins.CapabilityDmverityReferrers)
 			}
 
 			return erofs.NewErofsDiffer(cs, opts...), nil

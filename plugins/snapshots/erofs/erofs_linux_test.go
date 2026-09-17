@@ -417,7 +417,7 @@ func TestCreateErofsMount(t *testing.T) {
 	}
 
 	t.Run("creates regular erofs mount", func(t *testing.T) {
-		m, err := s.createErofsMount(layerBlob)
+		m, err := s.createErofsMount(layerBlob, nil)
 		require.NoError(t, err)
 
 		assert.Equal(t, "erofs", m.Type)
@@ -430,7 +430,7 @@ func TestCreateErofsMount(t *testing.T) {
 		s.dmverityMode = "on"
 		createDmverityMetadata(t, layerBlob)
 
-		m, err := s.createErofsMount(layerBlob)
+		m, err := s.createErofsMount(layerBlob, nil)
 		require.NoError(t, err)
 		// Mount type is always "erofs" - dm-verity detection happens in mount handler
 		assert.Equal(t, "erofs", m.Type)
@@ -449,7 +449,7 @@ func TestCreateErofsMount(t *testing.T) {
 
 		s.dmverityMode = "off"
 
-		m, err := s.createErofsMount(layerBlob)
+		m, err := s.createErofsMount(layerBlob, nil)
 		require.NoError(t, err)
 
 		assert.Equal(t, "erofs", m.Type)
@@ -824,7 +824,7 @@ func TestMountsWithMergedFsMeta(t *testing.T) {
 	snap := storage.Snapshot{Kind: snapshots.KindView, ParentIDs: parents}
 	info := snapshots.Info{}
 
-	mounts, err := s.mounts(snap, info)
+	mounts, err := s.mounts(snap, info, make([]snapshots.Info, len(parents)))
 	require.NoError(t, err)
 
 	// Expect: [erofs(p0), erofs(p1), erofs(fsmeta p2, device=p3,p2), overlay]
@@ -869,7 +869,7 @@ func TestMountsWithMergedFsMetaOnTopParent(t *testing.T) {
 	snap := storage.Snapshot{Kind: snapshots.KindView, ParentIDs: parents}
 	info := snapshots.Info{}
 
-	mounts, err := s.mounts(snap, info)
+	mounts, err := s.mounts(snap, info, make([]snapshots.Info, len(parents)))
 	require.NoError(t, err)
 
 	require.Len(t, mounts, 2)

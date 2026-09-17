@@ -19,8 +19,8 @@ package client
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
+	"slices"
 	"sync"
 
 	"github.com/containerd/containerd/v2/core/content"
@@ -28,10 +28,10 @@ import (
 	"github.com/containerd/containerd/v2/core/images"
 	"github.com/containerd/containerd/v2/core/images/usage"
 	"github.com/containerd/containerd/v2/core/snapshots"
+	"github.com/containerd/containerd/v2/core/unpack"
 	"github.com/containerd/containerd/v2/internal/kmutex"
-	"github.com/containerd/containerd/v2/pkg/labels"
-	"github.com/containerd/containerd/v2/pkg/rootfs"
 	"github.com/containerd/containerd/v2/pkg/snapshotters"
+	"github.com/containerd/containerd/v2/plugins"
 	"github.com/containerd/errdefs"
 	"github.com/containerd/platforms"
 	"github.com/opencontainers/go-digest"
@@ -318,18 +318,6 @@ func (i *image) Unpack(ctx context.Context, snapshotterName string, opts ...Unpa
 		return err
 	}
 
-	layers, err := i.getLayers(ctx, manifest)
-	if err != nil {
-		return err
-	}
-
-	var (
-		a  = i.client.DiffService()
-		cs = i.client.ContentStore()
-
-		chain    []digest.Digest
-		unpacked bool
-	)
 	snapshotterName, err = i.client.resolveSnapshotterName(ctx, snapshotterName)
 	if err != nil {
 		return err
@@ -344,49 +332,48 @@ func (i *image) Unpack(ctx context.Context, snapshotterName string, opts ...Unpa
 		return err
 	}
 
-	for _, layer := range layers {
-		snOpts := append(config.SnapshotOpts, snapshots.WithLabels(map[string]string{
-			snapshotters.TargetLayerDigestLabel:    layer.Blob.Digest.String(),
-			snapshotters.TargetManifestDigestLabel: i.Target().Digest.String(),
-			snapshotters.TargetRefLabel: 		  	i.Name(),
-		}))
-		unpacked, err = rootfs.ApplyLayerWithOpts(ctx, layer, chain, sn, a, snOpts, config.ApplyOpts)
-		if err != nil {
-			return fmt.Errorf("apply layer error for %q: %w", i.Name(), err)
-		}
-
-		if unpacked {
-			// Set the uncompressed label after the uncompressed
-			// digest has been verified through apply.
-			cinfo := content.Info{
-				Digest: layer.Blob.Digest,
-				Labels: map[string]string{
-					labels.LabelUncompressed: layer.Diff.Digest.String(),
-				},
-			}
-			if _, err := cs.Update(ctx, cinfo, "labels."+labels.LabelUncompressed); err != nil {
-				return err
-			}
-		}
-
-		chain = append(chain, layer.Diff.Digest)
-	}
-
-	desc, err := i.i.Config(ctx, cs, i.platform)
+	snCapabilities, err := i.client.GetUnpackSnapshotterCapabilities(ctx, snapshotterName)
 	if err != nil {
 		return err
 	}
 
-	rootFS := identity.ChainID(chain).String()
-
-	cinfo := content.Info{
-		Digest: desc.Digest,
-		Labels: map[string]string{
-			fmt.Sprintf("containerd.io/gc.ref.snapshot.%s", snapshotterName): rootFS,
-		},
+	platform := unpack.Platform{
+		Platform:                i.platform,
+		SnapshotterKey:          snapshotterName,
+		Snapshotter:             sn,
+		SnapshotOpts:            config.SnapshotOpts,
+		SnapshotterCapabilities: snCapabilities,
+		Applier:                 i.client.DiffService(),
+		ApplyOpts:               config.ApplyOpts,
+	}
+	uopts := []unpack.UnpackerOpt{unpack.WithUnpackPlatform(platform)}
+	if config.DuplicationSuppressor != nil {
+		uopts = append(uopts, unpack.WithDuplicationSuppressor(config.DuplicationSuppressor))
+	}
+	if config.Limiter != nil {
+		uopts = append(uopts, unpack.WithUnpackLimiter(config.Limiter))
+	}
+	unpacker, err := unpack.NewUnpacker(ctx, i.client.ContentStore(), uopts...)
+	if err != nil {
+		return fmt.Errorf("initialize unpacker: %w", err)
 	}
 
-	_, err = cs.Update(ctx, cinfo, fmt.Sprintf("labels.containerd.io/gc.ref.snapshot.%s", snapshotterName))
+	childrenHandler := images.LimitManifests(
+		images.FilterPlatforms(images.ChildrenHandler(i.client.ContentStore()), i.platform),
+		i.platform,
+		1,
+	)
+	var handler images.Handler = snapshotters.AppendInfoHandlerWrapper(i.Name())(childrenHandler)
+	if slices.Contains(snCapabilities, plugins.CapabilityDmverityReferrers) {
+		handler = snapshotters.AppendCachedSignatureHandlerWrapper(i.client.ContentStore())(handler)
+	}
+	handler = unpacker.Unpack(handler)
+
+	if err := images.Dispatch(ctx, handler, nil, i.Target()); err != nil {
+		unpacker.Wait()
+		return err
+	}
+	_, err = unpacker.Wait()
 	return err
 }
 
@@ -397,34 +384,6 @@ func (i *image) getManifest(ctx context.Context, platform platforms.MatchCompare
 		return ocispec.Manifest{}, err
 	}
 	return manifest, nil
-}
-
-func (i *image) getLayers(ctx context.Context, manifest ocispec.Manifest) ([]rootfs.Layer, error) {
-	diffIDs, err := i.RootFS(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("failed to resolve rootfs: %w", err)
-	}
-
-	// parse out the image layers from oci artifact layers
-	imageLayers := []ocispec.Descriptor{}
-	for _, ociLayer := range manifest.Layers {
-		if images.IsLayerType(ociLayer.MediaType) {
-			imageLayers = append(imageLayers, ociLayer)
-		}
-	}
-	if len(diffIDs) != len(imageLayers) {
-		return nil, errors.New("mismatched image rootfs and manifest layers")
-	}
-	layers := make([]rootfs.Layer, len(diffIDs))
-	for i := range diffIDs {
-		layers[i].Diff = ocispec.Descriptor{
-			// TODO: derive media type from compressed type
-			MediaType: ocispec.MediaTypeImageLayer,
-			Digest:    diffIDs[i],
-		}
-		layers[i].Blob = imageLayers[i]
-	}
-	return layers, nil
 }
 
 func (i *image) checkSnapshotterSupport(ctx context.Context, snapshotterName string,

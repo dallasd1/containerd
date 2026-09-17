@@ -19,6 +19,7 @@ package diff
 import (
 	"context"
 	"fmt"
+	"slices"
 
 	diffapi "github.com/containerd/containerd/api/services/diff/v1"
 	"github.com/containerd/errdefs"
@@ -80,6 +81,12 @@ func init() {
 				ordered[i], ok = d.(differ)
 				if !ok {
 					return nil, fmt.Errorf("differ does not implement Comparer and Applier interface: %s", n)
+				}
+				if i == 0 {
+					if p := ic.Plugins().Get(plugins.DiffPlugin, n); p != nil &&
+						slices.Contains(p.Meta.Capabilities, plugins.CapabilityDmverityReferrers) {
+						ic.Meta.Capabilities = append(ic.Meta.Capabilities, plugins.CapabilityDmverityReferrers)
+					}
 				}
 			}
 

@@ -22,6 +22,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -78,6 +79,7 @@ import (
 	ptypes "github.com/containerd/containerd/v2/pkg/protobuf/types"
 	"github.com/containerd/containerd/v2/pkg/tracing"
 	"github.com/containerd/containerd/v2/plugins"
+	pluginservices "github.com/containerd/containerd/v2/plugins/services"
 )
 
 func init() {
@@ -973,6 +975,35 @@ func (c *Client) GetSnapshotterCapabilities(ctx context.Context, snapshotterName
 
 	sn := resp.Plugins[0]
 	return sn.Capabilities, nil
+}
+
+// GetUnpackSnapshotterCapabilities removes dm-verity support when the selected
+// diff-service applier cannot materialize signed layers.
+func (c *Client) GetUnpackSnapshotterCapabilities(ctx context.Context, snapshotterName string) ([]string, error) {
+	capabilities, err := c.GetSnapshotterCapabilities(ctx, snapshotterName)
+	if err != nil || !slices.Contains(capabilities, plugins.CapabilityDmverityReferrers) {
+		return capabilities, err
+	}
+
+	filters := []string{fmt.Sprintf("type==%s, id==%s", plugins.ServicePlugin, pluginservices.DiffService)}
+	resp, err := c.IntrospectionService().Plugins(ctx, filters...)
+	if err != nil {
+		return nil, err
+	}
+	if len(resp.Plugins) == 0 {
+		return nil, fmt.Errorf("inspection service could not find diff service plugin")
+	}
+	if slices.Contains(resp.Plugins[0].Capabilities, plugins.CapabilityDmverityReferrers) {
+		return capabilities, nil
+	}
+
+	filtered := make([]string, 0, len(capabilities)-1)
+	for _, capability := range capabilities {
+		if capability != plugins.CapabilityDmverityReferrers {
+			filtered = append(filtered, capability)
+		}
+	}
+	return filtered, nil
 }
 
 type RuntimeVersion struct {

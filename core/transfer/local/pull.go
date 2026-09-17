@@ -19,6 +19,7 @@ package local
 import (
 	"context"
 	"fmt"
+	"slices"
 
 	"github.com/containerd/errdefs"
 	"github.com/containerd/log"
@@ -34,6 +35,7 @@ import (
 	"github.com/containerd/containerd/v2/core/unpack"
 	"github.com/containerd/containerd/v2/defaults"
 	snpkg "github.com/containerd/containerd/v2/pkg/snapshotters"
+	"github.com/containerd/containerd/v2/plugins"
 )
 
 func (ts *localTransferService) pull(ctx context.Context, ir transfer.ImageFetcher, is transfer.ImageStorer, tops *transfer.Config) error {
@@ -113,7 +115,9 @@ func (ts *localTransferService) pull(ctx context.Context, ir transfer.ImageFetch
 
 		baseHandlers []images.Handler
 
-		unpacker *unpack.Unpacker
+		unpacker                   *unpack.Unpacker
+		unpackRequested            bool
+		unpackSupportsDmverityRefs bool
 
 		// has a config media type bug (distribution#1622)
 		hasMediaTypeBug1622 bool
@@ -191,6 +195,7 @@ func (ts *localTransferService) pull(ctx context.Context, ir transfer.ImageFetch
 	// If image storer is also an unpacker type, i.e implemented UnpackPlatforms() func
 	if iu, ok := is.(transfer.ImageUnpacker); ok {
 		unpacks := iu.UnpackPlatforms()
+		unpackRequested = len(unpacks) > 0
 		if len(unpacks) > 0 {
 			uopts := []unpack.UnpackerOpt{}
 			enableRemoteSnapshotAnnotations := false
@@ -198,6 +203,9 @@ func (ts *localTransferService) pull(ctx context.Context, ir transfer.ImageFetch
 			for _, u := range unpacks {
 				matched, mu := getSupportedPlatform(ctx, u, ts.config.UnpackPlatforms)
 				if matched {
+					if slices.Contains(mu.SnapshotterCapabilities, plugins.CapabilityDmverityReferrers) {
+						unpackSupportsDmverityRefs = true
+					}
 					if v, ok := mu.SnapshotterExports["enable_remote_snapshot_annotations"]; ok && v == "true" {
 						enableRemoteSnapshotAnnotations = true
 					}
@@ -229,10 +237,15 @@ func (ts *localTransferService) pull(ctx context.Context, ir transfer.ImageFetch
 			if err != nil {
 				return fmt.Errorf("unable to initialize unpacker: %w", err)
 			}
-			handler = unpacker.Unpack(handler)
 		}
 	}
 
+	if ts.config.EnableDmverityReferrers && (!unpackRequested || unpackSupportsDmverityRefs) {
+		handler = snpkg.AppendSignatureHandlerWrapper(fetcher, ts.content)(handler)
+	}
+	if unpacker != nil {
+		handler = unpacker.Unpack(handler)
+	}
 	if err := images.Dispatch(ctx, handler, nil, desc); err != nil {
 		if unpacker != nil {
 			// wait for unpacker to cleanup

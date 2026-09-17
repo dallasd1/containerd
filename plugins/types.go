@@ -111,3 +111,10 @@ const (
 const (
 	SnapshotterRootDir = "root"
 )
+
+const (
+	// CapabilityDmverityReferrers is advertised by a differ that consumes
+	// dm-verity referrer artifacts and by a snapshotter that can mount their
+	// signed result. Immediate pull and unpack paths require both sides.
+	CapabilityDmverityReferrers = "dmverity-referrers"
+)

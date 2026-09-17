@@ -45,7 +45,9 @@ import (
 	"github.com/containerd/containerd/v2/internal/cleanup"
 	"github.com/containerd/containerd/v2/internal/kmutex"
 	"github.com/containerd/containerd/v2/pkg/labels"
+	snpkg "github.com/containerd/containerd/v2/pkg/snapshotters"
 	"github.com/containerd/containerd/v2/pkg/tracing"
+	"github.com/containerd/containerd/v2/plugins"
 )
 
 const (
@@ -195,8 +197,9 @@ func NewUnpacker(ctx context.Context, cs content.Store, opts ...UnpackerOpt) (*U
 // process will be started in a goroutine.
 func (u *Unpacker) Unpack(h images.Handler) images.Handler {
 	var (
-		lock   sync.Mutex
-		layers = map[digest.Digest][]ocispec.Descriptor{}
+		lock                       sync.Mutex
+		layers                     = map[digest.Digest][]ocispec.Descriptor{}
+		validatedDmverityReferrers = snpkg.HasValidatedDmverityReferrers(h)
 	)
 
 	var layerTypes map[string]bool
@@ -240,10 +243,14 @@ func (u *Unpacker) Unpack(h images.Handler) images.Handler {
 			// Split layers from non-layers, layers will be handled after
 			// the config
 			for i, child := range children {
+				if !validatedDmverityReferrers {
+					child.Annotations = snpkg.WithoutDmverityAnnotations(child.Annotations)
+				}
+				isLayer := images.IsLayerType(child.MediaType) || layerTypes[child.MediaType]
 				span.SetAttributes(
 					tracing.Attribute("descriptor.child."+strconv.Itoa(i), []string{child.MediaType, child.Digest.String()}),
 				)
-				if images.IsLayerType(child.MediaType) || layerTypes[child.MediaType] {
+				if isLayer {
 					manifestLayers = append(manifestLayers, child)
 				} else {
 					nonLayers = append(nonLayers, child)
@@ -382,6 +389,14 @@ func (u *Unpacker) unpack(
 		}
 		chainID = chainIDs[i].String()
 
+		supportsDmverityReferrers := slices.Contains(
+			unpack.SnapshotterCapabilities,
+			plugins.CapabilityDmverityReferrers,
+		)
+		if !supportsDmverityReferrers {
+			desc.Annotations = snpkg.WithoutDmverityAnnotations(desc.Annotations)
+		}
+
 		unlock, err := u.lockSnChainID(ctx, chainID, unpack.SnapshotterKey)
 		if err != nil {
 			return nil, err
@@ -401,6 +416,16 @@ func (u *Unpacker) unpack(
 		snapshotLabels[labelSnapshotDiffID] = diffIDs[i].String()
 		if i > 0 {
 			snapshotLabels[labelSnapshotParent] = chainIDs[i-1].String()
+		}
+		var expectedDmverityLabels map[string]string
+		if supportsDmverityReferrers {
+			expectedDmverityLabels, err = snpkg.DmveritySnapshotLabels(desc)
+			if err != nil {
+				return nil, fmt.Errorf("validate dm-verity policy for layer %s: %w", desc.Digest, err)
+			}
+			for key, value := range expectedDmverityLabels {
+				snapshotLabels[key] = value
+			}
 		}
 
 		var (
@@ -422,6 +447,9 @@ func (u *Unpacker) unpack(
 						// Try again, this should be rare, log it
 						log.G(ctx).WithField("key", key).WithField("chainid", chainID).Debug("extraction snapshot already exists, chain id not found")
 					} else {
+						if err := snpkg.ValidateDmveritySnapshot(snInfo.Labels, expectedDmverityLabels); err != nil {
+							return nil, fmt.Errorf("existing snapshot %s does not satisfy dm-verity policy: %w", chainID, err)
+						}
 						log.G(ctx).Debugf("snapshot %s with chainID %s already exists skip fetch blob %q ", snInfo.Name, chainID, desc.Digest)
 						// no need to handle, snapshot now found with chain id
 						return nil, nil
@@ -494,6 +522,13 @@ func (u *Unpacker) unpack(
 					if err = sn.Commit(ctx, chainID, key, opts...); err != nil {
 						cleanup.Do(ctx, abort)
 						if errdefs.IsAlreadyExists(err) {
+							info, statErr := sn.Stat(ctx, chainID)
+							if statErr != nil {
+								return fmt.Errorf("failed to stat concurrently committed snapshot %s: %w", chainID, statErr)
+							}
+							if policyErr := snpkg.ValidateDmveritySnapshot(info.Labels, expectedDmverityLabels); policyErr != nil {
+								return fmt.Errorf("concurrently committed snapshot %s does not satisfy dm-verity policy: %w", chainID, policyErr)
+							}
 							return nil
 						}
 						return fmt.Errorf("failed to commit snapshot %s: %w", key, err)
@@ -583,7 +618,10 @@ func (u *Unpacker) unpack(
 		return err
 	}
 
-	var statusChans []<-chan *unpackStatus
+	var (
+		statusChans []<-chan *unpackStatus
+		topHalfErr  error
+	)
 
 	for i, desc := range layers {
 		_, layerSpan := tracing.StartSpan(ctx, tracing.Name(unpackSpanPrefix, "unpackLayer"))
@@ -595,11 +633,12 @@ func (u *Unpacker) unpack(
 		)
 		statusCh, err := topHalf(i, desc, layerSpan, unpackLayerStart)
 		if err != nil {
+			layerSpan.SetStatus(err)
+			layerSpan.End()
 			if parallel {
+				topHalfErr = err
 				break
 			} else {
-				layerSpan.SetStatus(err)
-				layerSpan.End()
 				return err
 			}
 		}
@@ -619,7 +658,7 @@ func (u *Unpacker) unpack(
 
 	// In parallel mode, snapshots still need to be committed and rebased sequentially
 	if parallel {
-		var errs error
+		errs := topHalfErr
 		for _, sc := range statusChans {
 			if err := bottomHalf(<-sc, errs); err != nil {
 				errs = errors.Join(errs, err)
