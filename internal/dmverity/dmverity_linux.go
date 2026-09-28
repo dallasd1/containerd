@@ -245,13 +245,32 @@ func VerifySignedDevice(name string, rootHash string) error {
 	}
 	defer control.Close()
 
+	// the dm-verity table represents its current configuration parameters string, which includes
+	// the root hash signature option if present.
 	table, err := control.TableStatus(name, true)
 	if err != nil {
 		return fmt.Errorf("read dm-verity device %q table: %w", name, err)
 	}
-	fields := strings.Fields(table)
-	if len(fields) != 13 || fields[10] != "2" || fields[11] != "root_hash_sig_key_desc" {
-		return fmt.Errorf("dm-verity device %q does not have the expected signature options", name)
+	if !hasRootHashSignatureOption(table) {
+		return fmt.Errorf("dm-verity device %q does not have a root hash signature option", name)
 	}
 	return nil
+}
+
+func hasRootHashSignatureOption(table string) bool {
+	// TableStatus returns ten required verity parameters, then the optional argument count.
+	const requiredParamsCount = 10
+	fields := strings.Fields(table)
+	if len(fields) <= requiredParamsCount {
+		return false
+	}
+
+	// Skip the kernel-generated count and search the optional arguments.
+	optionalArgs := fields[requiredParamsCount+1:]
+	for _, opt := range optionalArgs {
+		if opt == "root_hash_sig_key_desc" {
+			return true
+		}
+	}
+	return false
 }

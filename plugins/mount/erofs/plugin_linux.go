@@ -71,6 +71,9 @@ func (h *erofsMountHandler) Mount(ctx context.Context, m mount.Mount, mp string,
 		expectedSignatureDigest string
 		signedDmverity          bool
 	)
+	// The EROFS snapshotter supplies the local dm-verity metadata path, root hash
+	// and signature digest from snapshot labels that are populated during unpack
+	// from the selected OCI referrer.
 	for _, opt := range m.Options {
 		if path, ok := strings.CutPrefix(opt, dmverity.MountOptionMetadataPrefix); ok {
 			metadataPath = path
