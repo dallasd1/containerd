@@ -266,6 +266,58 @@ func TestGCRemove(t *testing.T) {
 	})
 }
 
+func TestGCSignedReferrersFollowImageLifetime(t *testing.T) {
+	db, err := newDatabase(t)
+	require.NoError(t, err)
+
+	subject, referrerA, referrerB := dgst(1), dgst(2), dgst(3)
+	refLabel := string(labelGCContentRef) + ".dmverity-referrer/" + subject.Encoded()
+	err = db.Update(func(tx *bolt.Tx) error {
+		v1bkt, err := tx.CreateBucketIfNotExists(bucketKeyVersion)
+		if err != nil {
+			return err
+		}
+		for _, alter := range []alterFunc{
+			addContent("ns", subject, nil),
+			addContent("ns", referrerA, nil),
+			addContent("ns", referrerB, nil),
+			addImage("ns", "source", subject, labelmap(refLabel, referrerA.String())),
+			addImage("ns", "mirror", subject, labelmap(refLabel, referrerB.String())),
+		} {
+			if err := alter(v1bkt); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	require.NoError(t, err)
+
+	ctx := context.Background()
+	c := startGCContext(ctx, nil)
+	references := func(node gc.Node) []gc.Node {
+		t.Helper()
+		var nodes []gc.Node
+		err := db.View(func(tx *bolt.Tx) error {
+			return c.references(ctx, tx, node, func(ref gc.Node) { nodes = append(nodes, ref) })
+		})
+		require.NoError(t, err)
+		return nodes
+	}
+	subjectNode := gcnode(ResourceContent, "ns", subject.String())
+	sourceNode := gcnode(ResourceImage, "ns", "source")
+	mirrorNode := gcnode(ResourceImage, "ns", "mirror")
+	require.ElementsMatch(t, []gc.Node{subjectNode, gcnode(ResourceContent, "ns", referrerA.String())}, references(sourceNode))
+	require.ElementsMatch(t, []gc.Node{subjectNode, gcnode(ResourceContent, "ns", referrerB.String())}, references(mirrorNode))
+
+	require.NoError(t, db.Update(func(tx *bolt.Tx) error {
+		_, err := c.remove(ctx, tx, sourceNode)
+		return err
+	}))
+	require.Empty(t, references(sourceNode))
+	require.Empty(t, references(subjectNode))
+	require.ElementsMatch(t, []gc.Node{subjectNode, gcnode(ResourceContent, "ns", referrerB.String())}, references(mirrorNode))
+}
+
 func TestGCRefs(t *testing.T) {
 	db, err := newDatabase(t)
 	require.NoError(t, err)

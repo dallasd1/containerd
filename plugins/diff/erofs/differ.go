@@ -34,6 +34,7 @@ import (
 	"github.com/containerd/containerd/v2/core/images"
 	"github.com/containerd/containerd/v2/core/mount"
 	"github.com/containerd/containerd/v2/internal/erofsutils"
+	snpkg "github.com/containerd/containerd/v2/pkg/snapshotters"
 
 	"github.com/google/uuid"
 )
@@ -150,6 +151,11 @@ func (s erofsDiff) Apply(ctx context.Context, desc ocispec.Descriptor, mounts []
 		return emptyDesc, err
 	}
 
+	// Only a validated referrer handler injects this target. Others are stripped.
+	useSignedDmverity := desc.Annotations[snpkg.TargetLayerDmverityLabel] != ""
+	if native && useSignedDmverity {
+		return emptyDesc, fmt.Errorf("signed native EROFS layers are unsupported; layer %s must use an ordinary OCI tar layer", desc.Digest)
+	}
 	ra, err := s.store.ReaderAt(ctx, desc)
 	if err != nil {
 		return emptyDesc, fmt.Errorf("failed to get reader from content store: %w", err)
@@ -186,6 +192,17 @@ func (s erofsDiff) Apply(ctx context.Context, desc ocispec.Descriptor, mounts []
 	digester := digest.Canonical.Digester()
 	rc := &readCounter{
 		r: io.TeeReader(processor, digester.Hash()),
+	}
+
+	if useSignedDmverity {
+		if err := s.applySignedTarIndexArtifacts(ctx, desc, layerBlobPath, rc); err != nil {
+			return emptyDesc, err
+		}
+		return ocispec.Descriptor{
+			MediaType: ocispec.MediaTypeImageLayer,
+			Size:      rc.c,
+			Digest:    digester.Digest(),
+		}, nil
 	}
 
 	// Choose between tar index or tar conversion mode

@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"slices"
 	"strings"
 
 	"github.com/containerd/continuity/fs"
@@ -37,6 +38,7 @@ import (
 	"github.com/containerd/containerd/v2/core/snapshots"
 	"github.com/containerd/containerd/v2/core/unpack"
 	snpkg "github.com/containerd/containerd/v2/pkg/snapshotters"
+	"github.com/containerd/containerd/v2/plugins"
 )
 
 // WithNewSnapshot wraps `containerd.WithNewSnapshot` so that if creating the
@@ -72,9 +74,9 @@ func unpackImage(ctx context.Context, client *containerd.Client, i containerd.Im
 		return err
 	}
 
-	u, err := unpack.NewUnpacker(
-		ctx,
-		i.ContentStore(),
+	signedDmverity := slices.Contains(capabilities, plugins.CapabilityDmverityReferrers)
+
+	uopts := []unpack.UnpackerOpt{
 		unpack.WithUnpackPlatform(unpack.Platform{
 			Platform:                matcher,
 			SnapshotterKey:          snapshotter,
@@ -83,7 +85,12 @@ func unpackImage(ctx context.Context, client *containerd.Client, i containerd.Im
 			SnapshotterCapabilities: capabilities,
 		}),
 		unpack.WithUnpackLimiter(semaphore.NewWeighted(3)),
-	)
+	}
+	if signedDmverity {
+		// Selections restored below were validated when the image was pulled.
+		uopts = append(uopts, unpack.WithDmverityReferrersValidated())
+	}
+	u, err := unpack.NewUnpacker(ctx, i.ContentStore(), uopts...)
 	if err != nil {
 		return fmt.Errorf("unable to initialize unpacker: %w", err)
 	}
@@ -95,6 +102,9 @@ func unpackImage(ctx context.Context, client *containerd.Client, i containerd.Im
 	var h images.Handler = childrenHandler
 	if appendSnapshotLabels {
 		h = snpkg.AppendInfoHandlerWrapper(i.Name())(h)
+	}
+	if signedDmverity {
+		h = snpkg.AppendCachedSignatureHandlerWrapper(i.ContentStore(), i.Labels())(h)
 	}
 
 	if err := images.Dispatch(ctx, u.Unpack(h), nil, i.Target()); err != nil {

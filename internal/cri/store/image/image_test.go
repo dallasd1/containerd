@@ -17,11 +17,19 @@
 package image
 
 import (
+	"context"
 	"sort"
 	"strings"
 	"testing"
 
+	"github.com/containerd/containerd/v2/core/content"
+	"github.com/containerd/containerd/v2/core/images"
+	"github.com/containerd/containerd/v2/core/images/imagetest"
 	"github.com/containerd/errdefs"
+	"github.com/containerd/platforms"
+	"github.com/opencontainers/go-digest"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+	"github.com/stretchr/testify/require"
 
 	"github.com/opencontainers/go-digest/digestset"
 	assertlib "github.com/stretchr/testify/assert"
@@ -315,4 +323,25 @@ func TestImageStore(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestGetImageQualifiedSnapshotLabel(t *testing.T) {
+	ctx := context.Background()
+	cs := imagetest.NewContentStore(ctx, t)
+	layer := cs.Blob(ocispec.MediaTypeImageLayer, []byte("layer"))
+	config := cs.JSONObject(ocispec.MediaTypeImageConfig, ocispec.Image{
+		RootFS: ocispec.RootFS{Type: "layers", DiffIDs: []digest.Digest{layer.Descriptor.Digest}},
+	})
+	manifest := cs.Manifest(config, layer)
+
+	signedLabel := "containerd.io/gc.ref.snapshot.erofs/" + manifest.Descriptor.Digest.Encoded()
+	_, err := cs.Store.Update(ctx, content.Info{
+		Digest: config.Descriptor.Digest,
+		Labels: map[string]string{signedLabel: "signed-chain"},
+	}, "labels."+signedLabel)
+	require.NoError(t, err)
+
+	img, err := NewStore(nil, cs.Store, platforms.All).getImage(ctx, images.Image{Name: "test", Target: manifest.Descriptor})
+	require.NoError(t, err)
+	require.Equal(t, map[string]struct{}{"erofs": {}}, img.Snapshotters)
 }

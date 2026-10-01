@@ -22,9 +22,11 @@ import (
 	"encoding/base64"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"net/url"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -54,6 +56,7 @@ import (
 	"github.com/containerd/containerd/v2/internal/cri/util"
 	snpkg "github.com/containerd/containerd/v2/pkg/snapshotters"
 	"github.com/containerd/containerd/v2/pkg/tracing"
+	"github.com/containerd/containerd/v2/plugins"
 )
 
 // For image management:
@@ -184,6 +187,14 @@ func (c *CRIImageService) PullImage(ctx context.Context, name string, credential
 	// TODO: Add support for DisableSnapshotAnnotations, DiscardUnpackedLayers, ImagePullWithSyncFs and unpackDuplicationSuppressor
 	var image containerd.Image
 	if c.config.UseLocalImagePull {
+		// Local pull skips dm-verity referrer discovery, so refuse signed snapshotters.
+		capabilities, capErr := c.client.GetSnapshotterCapabilities(ctx, snapshotter)
+		if capErr != nil {
+			return "", fmt.Errorf("failed to get capabilities of snapshotter %q: %w", snapshotter, capErr)
+		}
+		if slices.Contains(capabilities, plugins.CapabilityDmverityReferrers) {
+			return "", fmt.Errorf("snapshotter %q requires the transfer service for dm-verity referrers, disable local image pull: %w", snapshotter, errdefs.ErrNotImplemented)
+		}
 		image, err = c.pullImageWithLocalPull(ctx, ref, credentials, snapshotter, labels, imagePullProgressTimeout)
 	} else {
 		image, err = c.pullImageWithTransferService(ctx, ref, credentials, snapshotter, labels, imagePullProgressTimeout)
@@ -201,6 +212,8 @@ func (c *CRIImageService) PullImage(ctx context.Context, name string, credential
 	}
 	imageID := configDesc.Digest.String()
 
+	// Aliases must resolve the same dm-verity selections as the pulled record.
+	maps.Copy(labels, snpkg.DmverityImageSelectionLabels(image.Labels()))
 	repoDigest, repoTag := util.GetRepoDigestAndTag(namedRef, image.Target().Digest)
 	for _, r := range []string{imageID, repoTag, repoDigest} {
 		if r == "" {
@@ -216,6 +229,9 @@ func (c *CRIImageService) PullImage(ctx context.Context, name string, credential
 		if err := c.imageStore.Update(ctx, r); err != nil {
 			return "", fmt.Errorf("failed to update image store %q: %w", r, err)
 		}
+	}
+	if err := c.propagateDmveritySelections(ctx, imageID, snpkg.DmverityImageSelectionLabels(image.Labels())); err != nil {
+		return "", err
 	}
 
 	const mbToByte = 1024 * 1024
@@ -412,11 +428,40 @@ func (c *CRIImageService) createOrUpdateImageReference(ctx context.Context, name
 		labels[crilabels.PinnedImageLabelKey] == crilabels.PinnedImageLabelValue {
 		fieldpaths = append(fieldpaths, "labels."+crilabels.PinnedImageLabelKey)
 	}
+	fieldpaths = append(fieldpaths, snpkg.DmveritySelectionFieldpaths(oldImg.Labels, labels)...)
 	if oldImg.Target.Digest == img.Target.Digest && len(fieldpaths) < 2 {
 		return nil
 	}
 	_, err = c.images.Update(ctx, img, fieldpaths...)
 	return err
+}
+
+// propagateDmveritySelections keeps other aliases of an image ID from holding a
+// stale observation for the pulled manifest.
+func (c *CRIImageService) propagateDmveritySelections(ctx context.Context, imageID string, selections map[string]string) error {
+	if len(selections) == 0 {
+		return nil
+	}
+	cimg, err := c.imageStore.Get(imageID)
+	if err != nil {
+		return nil
+	}
+	for _, r := range cimg.References {
+		old, err := c.images.Get(ctx, r)
+		if errdefs.IsNotFound(err) {
+			continue
+		} else if err != nil {
+			return fmt.Errorf("failed to get image reference %q: %w", r, err)
+		}
+		desired := snpkg.WithDmverityImageSelectionLabels(old.Labels, selections)
+		if fps := snpkg.DmveritySelectionFieldpaths(old.Labels, desired); len(fps) > 0 {
+			old.Labels = desired
+			if _, err := c.images.Update(ctx, old, fps...); err != nil {
+				return fmt.Errorf("failed to update dm-verity selections of %q: %w", r, err)
+			}
+		}
+	}
+	return nil
 }
 
 // getLabels get image labels to be added on CRI image
@@ -450,6 +495,7 @@ func (c *CRIImageService) UpdateImage(ctx context.Context, r string) error {
 
 	labels := img.Labels()
 	criLabels := c.getLabels(ctx, r)
+	maps.Copy(criLabels, snpkg.DmverityImageSelectionLabels(labels))
 	for key, value := range criLabels {
 		if labels[key] != value {
 			// Make sure the image has the image id as its unique

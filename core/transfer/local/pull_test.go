@@ -17,13 +17,18 @@
 package local
 
 import (
+	"context"
 	"testing"
 
 	"github.com/containerd/platforms"
+	"github.com/opencontainers/go-digest"
+	"github.com/stretchr/testify/require"
 
+	"github.com/containerd/containerd/v2/core/images"
 	"github.com/containerd/containerd/v2/core/transfer"
 	"github.com/containerd/containerd/v2/core/unpack"
 	"github.com/containerd/containerd/v2/defaults"
+	snpkg "github.com/containerd/containerd/v2/pkg/snapshotters"
 )
 
 func TestGetSupportedPlatform(t *testing.T) {
@@ -150,4 +155,44 @@ func TestGetSupportedPlatform(t *testing.T) {
 		})
 	}
 
+}
+
+func TestDmveritySelectionStoreKeepsSelections(t *testing.T) {
+	manifest := digest.FromString("manifest")
+	referrer := digest.FromString("referrer")
+	selections := &snpkg.DmveritySelections{}
+	selections.Record(manifest, referrer)
+	selectionKey := "containerd.io/gc.ref.content.dmverity-referrer/" + manifest.Encoded()
+
+	recorder := &recordingImageStore{}
+	s := dmveritySelectionStore{Store: recorder, selections: selections}
+	img := images.Image{Name: "example.com/test:tag", Labels: map[string]string{"user": "value"}}
+
+	_, err := s.Create(t.Context(), img)
+	require.NoError(t, err)
+	// The transfer image storer replaces the whole record on re-pull.
+	_, err = s.Update(t.Context(), img)
+	require.NoError(t, err)
+
+	require.Len(t, recorder.written, 2)
+	for _, written := range recorder.written {
+		require.Equal(t, referrer.String(), written.Labels[selectionKey])
+		require.Equal(t, "value", written.Labels["user"])
+	}
+	require.NotContains(t, img.Labels, selectionKey, "caller labels must not be mutated")
+}
+
+type recordingImageStore struct {
+	images.Store
+	written []images.Image
+}
+
+func (s *recordingImageStore) Create(_ context.Context, image images.Image) (images.Image, error) {
+	s.written = append(s.written, image)
+	return image, nil
+}
+
+func (s *recordingImageStore) Update(_ context.Context, image images.Image, _ ...string) (images.Image, error) {
+	s.written = append(s.written, image)
+	return image, nil
 }

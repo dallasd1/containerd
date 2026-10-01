@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"sync"
 
 	"github.com/containerd/containerd/v2/core/content"
@@ -32,6 +33,7 @@ import (
 	"github.com/containerd/containerd/v2/pkg/labels"
 	"github.com/containerd/containerd/v2/pkg/rootfs"
 	"github.com/containerd/containerd/v2/pkg/snapshotters"
+	"github.com/containerd/containerd/v2/plugins"
 	"github.com/containerd/errdefs"
 	"github.com/containerd/platforms"
 	"github.com/opencontainers/go-digest"
@@ -206,18 +208,42 @@ func (i *image) Config(ctx context.Context) (ocispec.Descriptor, error) {
 	return i.i.Config(ctx, provider, i.platform)
 }
 
+// imageSnapshotKey returns the image's parent snapshot key. Signed EROFS layers
+// are keyed by their verified signatures, not the OCI ChainID.
+func (c *Client) imageSnapshotKey(ctx context.Context, i Image, snapshotterName string) (string, error) {
+	diffIDs, err := i.RootFS(ctx)
+	if err != nil {
+		return "", err
+	}
+	if len(snapshotters.DmverityImageSelectionLabels(i.Labels())) == 0 {
+		return identity.ChainID(diffIDs).String(), nil
+	}
+	snapshotterName, err = c.resolveSnapshotterName(ctx, snapshotterName)
+	if err != nil {
+		return "", err
+	}
+	capabilities, err := c.GetSnapshotterCapabilities(ctx, snapshotterName)
+	if err != nil {
+		return "", err
+	}
+	if !slices.Contains(capabilities, plugins.CapabilityDmverityReferrers) {
+		return identity.ChainID(diffIDs).String(), nil
+	}
+	return snapshotters.DmveritySnapshotKey(ctx, i.ContentStore(), i.Target(), i.Platform(), diffIDs, i.Labels())
+}
+
 func (i *image) IsUnpacked(ctx context.Context, snapshotterName string) (bool, error) {
 	sn, err := i.client.getSnapshotter(ctx, snapshotterName)
 	if err != nil {
 		return false, err
 	}
 
-	diffs, err := i.RootFS(ctx)
+	key, err := i.client.imageSnapshotKey(ctx, i, snapshotterName)
 	if err != nil {
 		return false, err
 	}
 
-	if _, err := sn.Stat(ctx, identity.ChainID(diffs).String()); err != nil {
+	if _, err := sn.Stat(ctx, key); err != nil {
 		if errdefs.IsNotFound(err) {
 			return false, nil
 		}
@@ -423,6 +449,8 @@ func (i *image) getLayers(ctx context.Context, manifest ocispec.Manifest) ([]roo
 			Digest:    diffIDs[i],
 		}
 		layers[i].Blob = imageLayers[i]
+		// Only the referrer-aware unpacker may supply a validated dm-verity target.
+		layers[i].Blob.Annotations = snapshotters.WithoutDmverityTargetAnnotation(imageLayers[i].Annotations)
 	}
 	return layers, nil
 }

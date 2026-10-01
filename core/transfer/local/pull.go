@@ -19,6 +19,7 @@ package local
 import (
 	"context"
 	"fmt"
+	"slices"
 
 	"github.com/containerd/errdefs"
 	"github.com/containerd/log"
@@ -34,6 +35,7 @@ import (
 	"github.com/containerd/containerd/v2/core/unpack"
 	"github.com/containerd/containerd/v2/defaults"
 	snpkg "github.com/containerd/containerd/v2/pkg/snapshotters"
+	"github.com/containerd/containerd/v2/plugins"
 )
 
 func (ts *localTransferService) pull(ctx context.Context, ir transfer.ImageFetcher, is transfer.ImageStorer, tops *transfer.Config) error {
@@ -110,6 +112,9 @@ func (ts *localTransferService) pull(ctx context.Context, ir transfer.ImageFetch
 
 	var (
 		handler images.Handler
+
+		// selections pins each manifest's dm-verity referrer for container creation.
+		selections *snpkg.DmveritySelections
 
 		baseHandlers []images.Handler
 
@@ -194,12 +199,16 @@ func (ts *localTransferService) pull(ctx context.Context, ir transfer.ImageFetch
 		if len(unpacks) > 0 {
 			uopts := []unpack.UnpackerOpt{}
 			enableRemoteSnapshotAnnotations := false
+			enableDmverityReferrers := false
 			// Only unpack if requested unpackconfig matches default/supported unpackconfigs
 			for _, u := range unpacks {
 				matched, mu := getSupportedPlatform(ctx, u, ts.config.UnpackPlatforms)
 				if matched {
 					if v, ok := mu.SnapshotterExports["enable_remote_snapshot_annotations"]; ok && v == "true" {
 						enableRemoteSnapshotAnnotations = true
+					}
+					if slices.Contains(mu.SnapshotterCapabilities, plugins.CapabilityDmverityReferrers) {
+						enableDmverityReferrers = true
 					}
 					if progressTracker != nil {
 						mu.ApplyOpts = append(mu.ApplyOpts, diff.WithProgress(progressTracker.ExtractProgress))
@@ -223,6 +232,13 @@ func (ts *localTransferService) pull(ctx context.Context, ir transfer.ImageFetch
 
 			if enableRemoteSnapshotAnnotations {
 				handler = snpkg.AppendInfoHandlerWrapper(name)(handler)
+			}
+
+			// Discovery must run inside the unpacker so it sees validated layer targets.
+			if enableDmverityReferrers {
+				selections = &snpkg.DmveritySelections{}
+				handler = snpkg.AppendSignatureHandlerWrapper(fetcher, store, selections)(handler)
+				uopts = append(uopts, unpack.WithDmverityReferrersValidated())
 			}
 
 			unpacker, err = unpack.NewUnpacker(ctx, ts.content, uopts...)
@@ -257,7 +273,11 @@ func (ts *localTransferService) pull(ctx context.Context, ir transfer.ImageFetch
 		}
 	}
 
-	imgs, err := is.Store(ctx, desc, ts.images)
+	imageStore := ts.images
+	if selections != nil {
+		imageStore = dmveritySelectionStore{Store: ts.images, selections: selections}
+	}
+	imgs, err := is.Store(ctx, desc, imageStore)
 	if err != nil {
 		return err
 	}
@@ -329,4 +349,20 @@ func getSupportedPlatform(ctx context.Context, uc transfer.UnpackConfiguration, 
 		}
 	}
 	return
+}
+
+// dmveritySelectionStore adds the selection GC labels to every stored image record.
+type dmveritySelectionStore struct {
+	images.Store
+	selections *snpkg.DmveritySelections
+}
+
+func (s dmveritySelectionStore) Create(ctx context.Context, image images.Image) (images.Image, error) {
+	image.Labels = s.selections.ImageLabels(image.Labels)
+	return s.Store.Create(ctx, image)
+}
+
+func (s dmveritySelectionStore) Update(ctx context.Context, image images.Image, fieldpaths ...string) (images.Image, error) {
+	image.Labels = s.selections.ImageLabels(image.Labels)
+	return s.Store.Update(ctx, image, fieldpaths...)
 }

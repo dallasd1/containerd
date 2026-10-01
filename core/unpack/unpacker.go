@@ -45,7 +45,9 @@ import (
 	"github.com/containerd/containerd/v2/internal/cleanup"
 	"github.com/containerd/containerd/v2/internal/kmutex"
 	"github.com/containerd/containerd/v2/pkg/labels"
+	snpkg "github.com/containerd/containerd/v2/pkg/snapshotters"
 	"github.com/containerd/containerd/v2/pkg/tracing"
+	"github.com/containerd/containerd/v2/plugins"
 )
 
 const (
@@ -68,6 +70,9 @@ type unpackerConfig struct {
 	limiter               Limiter
 	duplicationSuppressor KeyedLocker
 	unpackLimiter         Limiter
+
+	// dmverityReferrersValidated is set when discovery validated the layer targets.
+	dmverityReferrersValidated bool
 }
 
 // Platform represents a platform-specific unpack configuration which includes
@@ -155,6 +160,15 @@ func WithUnpackLimiter(l Limiter) UnpackerOpt {
 	})
 }
 
+// WithDmverityReferrersValidated marks layer targets as validated by referrer
+// discovery. Without it, registry-supplied targets are stripped.
+func WithDmverityReferrersValidated() UnpackerOpt {
+	return UnpackerOpt(func(c *unpackerConfig) error {
+		c.dmverityReferrersValidated = true
+		return nil
+	})
+}
+
 // Unpacker unpacks images by hooking into the image handler process.
 // Unpacks happen in the backgrounds and waited on to complete.
 type Unpacker struct {
@@ -195,8 +209,9 @@ func NewUnpacker(ctx context.Context, cs content.Store, opts ...UnpackerOpt) (*U
 // process will be started in a goroutine.
 func (u *Unpacker) Unpack(h images.Handler) images.Handler {
 	var (
-		lock   sync.Mutex
-		layers = map[digest.Digest][]ocispec.Descriptor{}
+		lock      sync.Mutex
+		layers    = map[digest.Digest][]ocispec.Descriptor{}
+		manifests = map[digest.Digest]digest.Digest{}
 	)
 
 	var layerTypes map[string]bool
@@ -253,6 +268,7 @@ func (u *Unpacker) Unpack(h images.Handler) images.Handler {
 			lock.Lock()
 			for _, nl := range nonLayers {
 				layers[nl.Digest] = manifestLayers
+				manifests[nl.Digest] = desc.Digest
 			}
 			lock.Unlock()
 
@@ -260,10 +276,11 @@ func (u *Unpacker) Unpack(h images.Handler) images.Handler {
 		} else if images.IsConfigType(desc.MediaType) || configTypes[desc.MediaType] {
 			lock.Lock()
 			l := layers[desc.Digest]
+			m := manifests[desc.Digest]
 			lock.Unlock()
 			if len(l) > 0 {
 				u.eg.Go(func() error {
-					return u.unpack(h, desc, l)
+					return u.unpack(h, desc, l, m)
 				})
 			}
 		}
@@ -304,6 +321,7 @@ func (u *Unpacker) unpack(
 	h images.Handler,
 	config ocispec.Descriptor,
 	layers []ocispec.Descriptor,
+	manifest digest.Digest,
 ) error {
 	ctx := u.ctx
 	ctx, layerSpan := tracing.StartSpan(ctx, tracing.Name(unpackSpanPrefix, "unpack"))
@@ -367,9 +385,21 @@ func (u *Unpacker) unpack(
 	defer cancel()
 
 	// pre-calculate chain ids for each layer
-	chainIDs := make([]digest.Digest, len(diffIDs))
-	copy(chainIDs, diffIDs)
-	chainIDs = identity.ChainIDs(chainIDs)
+	var chainIDs []digest.Digest
+	// Trust signed targets only if discovery validated them and the snapshotter
+	// can mount them. Otherwise they are stripped below.
+	supportsDmverityReferrers := u.dmverityReferrersValidated && slices.Contains(
+		unpack.SnapshotterCapabilities,
+		plugins.CapabilityDmverityReferrers,
+	)
+	if supportsDmverityReferrers {
+		chainIDs, err = snpkg.DmverityChainIDs(diffIDs, layers)
+		if err != nil {
+			return fmt.Errorf("resolve dm-verity snapshot keys: %w", err)
+		}
+	} else {
+		chainIDs = identity.ChainIDs(slices.Clone(diffIDs))
+	}
 
 	topHalf := func(i int, desc ocispec.Descriptor, span *tracing.Span, startAt time.Time) (<-chan *unpackStatus, error) {
 		var (
@@ -381,6 +411,10 @@ func (u *Unpacker) unpack(
 			parent = chainIDs[i-1].String()
 		}
 		chainID = chainIDs[i].String()
+
+		if !supportsDmverityReferrers {
+			desc.Annotations = snpkg.WithoutDmverityTargetAnnotation(desc.Annotations)
+		}
 
 		unlock, err := u.lockSnChainID(ctx, chainID, unpack.SnapshotterKey)
 		if err != nil {
@@ -397,10 +431,22 @@ func (u *Unpacker) unpack(
 		if snapshotLabels == nil {
 			snapshotLabels = make(map[string]string)
 		}
+		// A signed identity must come only from a validated dm-verity target.
+		snpkg.StripDmveritySnapshotLabels(snapshotLabels)
 		snapshotLabels[labelSnapshotRef] = chainID
 		snapshotLabels[labelSnapshotDiffID] = diffIDs[i].String()
 		if i > 0 {
 			snapshotLabels[labelSnapshotParent] = chainIDs[i-1].String()
+		}
+		var expectedDmverityLabels map[string]string
+		if supportsDmverityReferrers {
+			expectedDmverityLabels, err = snpkg.DmveritySnapshotLabels(desc)
+			if err != nil {
+				return nil, fmt.Errorf("validate dm-verity snapshot identity for layer %s: %w", desc.Digest, err)
+			}
+			for key, value := range expectedDmverityLabels {
+				snapshotLabels[key] = value
+			}
 		}
 
 		var (
@@ -422,6 +468,9 @@ func (u *Unpacker) unpack(
 						// Try again, this should be rare, log it
 						log.G(ctx).WithField("key", key).WithField("chainid", chainID).Debug("extraction snapshot already exists, chain id not found")
 					} else {
+						if err := snpkg.ValidateDmveritySnapshot(snInfo.Labels, expectedDmverityLabels); err != nil {
+							return nil, fmt.Errorf("existing snapshot %s does not match signed dm-verity identity: %w", chainID, err)
+						}
 						log.G(ctx).Debugf("snapshot %s with chainID %s already exists skip fetch blob %q ", snInfo.Name, chainID, desc.Digest)
 						// no need to handle, snapshot now found with chain id
 						return nil, nil
@@ -494,6 +543,13 @@ func (u *Unpacker) unpack(
 					if err = sn.Commit(ctx, chainID, key, opts...); err != nil {
 						cleanup.Do(ctx, abort)
 						if errdefs.IsAlreadyExists(err) {
+							info, statErr := sn.Stat(ctx, chainID)
+							if statErr != nil {
+								return fmt.Errorf("failed to stat concurrently committed snapshot %s: %w", chainID, statErr)
+							}
+							if policyErr := snpkg.ValidateDmveritySnapshot(info.Labels, expectedDmverityLabels); policyErr != nil {
+								return fmt.Errorf("concurrently committed snapshot %s does not match signed dm-verity identity: %w", chainID, policyErr)
+							}
 							return nil
 						}
 						return fmt.Errorf("failed to commit snapshot %s: %w", key, err)
@@ -583,7 +639,10 @@ func (u *Unpacker) unpack(
 		return err
 	}
 
-	var statusChans []<-chan *unpackStatus
+	var (
+		statusChans []<-chan *unpackStatus
+		topHalfErr  error
+	)
 
 	for i, desc := range layers {
 		_, layerSpan := tracing.StartSpan(ctx, tracing.Name(unpackSpanPrefix, "unpackLayer"))
@@ -596,6 +655,10 @@ func (u *Unpacker) unpack(
 		statusCh, err := topHalf(i, desc, layerSpan, unpackLayerStart)
 		if err != nil {
 			if parallel {
+				// Report the failure instead of committing a partial chain.
+				topHalfErr = err
+				layerSpan.SetStatus(err)
+				layerSpan.End()
 				break
 			} else {
 				layerSpan.SetStatus(err)
@@ -619,7 +682,7 @@ func (u *Unpacker) unpack(
 
 	// In parallel mode, snapshots still need to be committed and rebased sequentially
 	if parallel {
-		var errs error
+		errs := topHalfErr
 		for _, sc := range statusChans {
 			if err := bottomHalf(<-sc, errs); err != nil {
 				errs = errors.Join(errs, err)
@@ -634,13 +697,25 @@ func (u *Unpacker) unpack(
 	if len(chainIDs) > 0 {
 		chainID = chainIDs[len(chainIDs)-1].String()
 	}
+	snapshotGCLabel := fmt.Sprintf("containerd.io/gc.ref.snapshot.%s", unpack.SnapshotterKey)
+	signedGCLabel := snapshotGCLabel + "/" + manifest.Encoded()
+	var fieldpaths []string
+	if chainID != identity.ChainID(diffIDs).String() {
+		// A config can be shared by several manifests, so key the edge by manifest.
+		// Re-signing then replaces that manifest's edge instead of accumulating more.
+		snapshotGCLabel = signedGCLabel
+	} else if supportsDmverityReferrers {
+		// An unsigned unpack releases the manifest's previous signed edge.
+		fieldpaths = append(fieldpaths, "labels."+signedGCLabel)
+	}
+	fieldpaths = append(fieldpaths, "labels."+snapshotGCLabel)
 	cinfo := content.Info{
 		Digest: config.Digest,
 		Labels: map[string]string{
-			fmt.Sprintf("containerd.io/gc.ref.snapshot.%s", unpack.SnapshotterKey): chainID,
+			snapshotGCLabel: chainID,
 		},
 	}
-	_, err = cs.Update(ctx, cinfo, fmt.Sprintf("labels.containerd.io/gc.ref.snapshot.%s", unpack.SnapshotterKey))
+	_, err = cs.Update(ctx, cinfo, fieldpaths...)
 	if err != nil {
 		return err
 	}

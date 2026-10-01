@@ -33,7 +33,6 @@ import (
 	"github.com/containerd/errdefs"
 	"github.com/containerd/log"
 	"github.com/containerd/typeurl/v2"
-	"github.com/opencontainers/image-spec/identity"
 	v1 "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
@@ -251,12 +250,11 @@ func WithNewSnapshotView(id string, i Image, opts ...snapshots.Opt) NewContainer
 
 func withNewSnapshot(id string, i Image, readonly bool, opts ...snapshots.Opt) NewContainerOpts {
 	return func(ctx context.Context, client *Client, c *containers.Container) error {
-		diffIDs, err := i.RootFS(ctx)
+		parent, err := client.imageSnapshotKey(ctx, i, c.Snapshotter)
 		if err != nil {
 			return err
 		}
 
-		parent := identity.ChainID(diffIDs).String()
 		c.Snapshotter, err = client.resolveSnapshotterName(ctx, c.Snapshotter)
 		if err != nil {
 			return err

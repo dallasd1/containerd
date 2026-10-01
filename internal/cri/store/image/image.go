@@ -182,7 +182,9 @@ func (s *Store) getImage(ctx context.Context, i images.Image) (*Image, error) {
 	for label := range info.Labels {
 		const prefix = "containerd.io/gc.ref.snapshot."
 		if strings.HasPrefix(label, prefix) {
-			snapshotters[label[len(prefix):]] = struct{}{}
+			// Signed EROFS edges are qualified as <snapshotter>/<manifest>.
+			name, _, _ := strings.Cut(label[len(prefix):], "/")
+			snapshotters[name] = struct{}{}
 		}
 	}
 

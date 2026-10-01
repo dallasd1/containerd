@@ -19,20 +19,134 @@ package images
 import (
 	"context"
 	"encoding/base64"
+	"sync"
 	"testing"
 	"time"
 
+	containerd "github.com/containerd/containerd/v2/client"
+	containerdimages "github.com/containerd/containerd/v2/core/images"
+	"github.com/containerd/containerd/v2/core/images/imagetest"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	runtime "k8s.io/cri-api/pkg/apis/runtime/v1"
 
+	"github.com/containerd/errdefs"
 	"github.com/containerd/platforms"
 
 	"github.com/containerd/containerd/v2/core/transfer"
 	"github.com/containerd/containerd/v2/internal/cri/annotations"
 	criconfig "github.com/containerd/containerd/v2/internal/cri/config"
 	"github.com/containerd/containerd/v2/internal/cri/labels"
+	imagestore "github.com/containerd/containerd/v2/internal/cri/store/image"
+	snpkg "github.com/containerd/containerd/v2/pkg/snapshotters"
+	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
+
+type testImageStore struct {
+	mu     sync.Mutex
+	images map[string]containerdimages.Image
+}
+
+func newTestImageStore(t *testing.T, images ...containerdimages.Image) *testImageStore {
+	t.Helper()
+	s := &testImageStore{images: make(map[string]containerdimages.Image)}
+	for _, image := range images {
+		_, err := s.Create(t.Context(), image)
+		require.NoError(t, err)
+	}
+	return s
+}
+
+func (s *testImageStore) Get(ctx context.Context, name string) (containerdimages.Image, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	image, ok := s.images[name]
+	if !ok {
+		return containerdimages.Image{}, errdefs.ErrNotFound
+	}
+	return image, nil
+}
+
+func (s *testImageStore) List(ctx context.Context, filters ...string) ([]containerdimages.Image, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	images := make([]containerdimages.Image, 0, len(s.images))
+	for _, image := range s.images {
+		images = append(images, image)
+	}
+	return images, nil
+}
+
+func (s *testImageStore) Create(ctx context.Context, image containerdimages.Image) (containerdimages.Image, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.images[image.Name]; ok {
+		return containerdimages.Image{}, errdefs.ErrAlreadyExists
+	}
+	s.images[image.Name] = image
+	return image, nil
+}
+
+func (s *testImageStore) Update(ctx context.Context, image containerdimages.Image, fieldpaths ...string) (containerdimages.Image, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.images[image.Name]; !ok {
+		return containerdimages.Image{}, errdefs.ErrNotFound
+	}
+	s.images[image.Name] = image
+	return image, nil
+}
+
+func (s *testImageStore) Delete(ctx context.Context, name string, opts ...containerdimages.DeleteOpt) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.images[name]; !ok {
+		return errdefs.ErrNotFound
+	}
+	delete(s.images, name)
+	return nil
+}
+
+type testCRIImageClient struct {
+	image containerd.Image
+}
+
+func (c testCRIImageClient) ListImages(ctx context.Context, filters ...string) ([]containerd.Image, error) {
+	return []containerd.Image{c.image}, nil
+}
+
+func (c testCRIImageClient) GetImage(ctx context.Context, ref string) (containerd.Image, error) {
+	if c.image.Name() != ref {
+		return nil, errdefs.ErrNotFound
+	}
+	return c.image, nil
+}
+
+func (c testCRIImageClient) Pull(ctx context.Context, ref string, opts ...containerd.RemoteOpt) (containerd.Image, error) {
+	return nil, errdefs.ErrNotFound
+}
+
+func (c testCRIImageClient) GetSnapshotterCapabilities(ctx context.Context, snapshotterName string) ([]string, error) {
+	return nil, errdefs.ErrNotFound
+}
+
+func dmveritySelectionLabels(subject, referrer digest.Digest) map[string]string {
+	selections := &snpkg.DmveritySelections{}
+	selections.Record(subject, referrer)
+	return selections.ImageLabels(nil)
+}
+
+func testImageContent(ctx context.Context, t *testing.T) (imagetest.ContentStore, imagetest.Content, imagetest.Content) {
+	t.Helper()
+	cs := imagetest.NewContentStore(ctx, t)
+	layer := cs.Blob(ocispec.MediaTypeImageLayer, []byte("layer"))
+	config := cs.JSONObject(ocispec.MediaTypeImageConfig, ocispec.Image{
+		RootFS: ocispec.RootFS{Type: "layers", DiffIDs: []digest.Digest{layer.Descriptor.Digest}},
+	})
+	manifest := cs.Manifest(config, layer)
+	return cs, config, manifest
+}
 
 func TestParseAuth(t *testing.T) {
 	testUser := "username"
@@ -512,6 +626,88 @@ func TestImageGetLabels(t *testing.T) {
 
 		})
 	}
+}
+
+func TestUpdateImagePreservesDmveritySelectionsWhenAdoptingUnmanagedImage(t *testing.T) {
+	ctx := t.Context()
+	cs, config, manifest := testImageContent(ctx, t)
+	ref := "registry.example.test/app:latest"
+	selection := dmveritySelectionLabels(manifest.Descriptor.Digest, digest.FromString("dmverity referrer"))
+	image := containerdimages.Image{
+		Name:   ref,
+		Target: manifest.Descriptor,
+		Labels: selection,
+	}
+	store := newTestImageStore(t, image)
+	client, err := containerd.New("", containerd.WithServices(
+		containerd.WithContentStore(cs.Store),
+		containerd.WithImageStore(store),
+	))
+	require.NoError(t, err)
+	c, _ := newTestCRIService()
+	c.images = store
+	c.imageStore = imagestore.NewStore(store, cs.Store, platforms.All)
+	c.client = testCRIImageClient{image: containerd.NewImageWithPlatform(client, image, platforms.All)}
+
+	require.NoError(t, c.UpdateImage(ctx, ref))
+
+	tag, err := store.Get(ctx, ref)
+	require.NoError(t, err)
+	require.Equal(t, labels.ImageLabelValue, tag.Labels[labels.ImageLabelKey])
+	require.Equal(t, selection, snpkg.DmverityImageSelectionLabels(tag.Labels))
+
+	alias, err := store.Get(ctx, config.Descriptor.Digest.String())
+	require.NoError(t, err)
+	require.Equal(t, labels.ImageLabelValue, alias.Labels[labels.ImageLabelKey])
+	require.Equal(t, selection, snpkg.DmverityImageSelectionLabels(alias.Labels))
+}
+
+func TestPropagateDmveritySelectionsReplacesOppositeObservation(t *testing.T) {
+	ctx := t.Context()
+	imageID := digest.FromString("image config").String()
+	tagRef := "registry.example.test/app:latest"
+	digestRef := "registry.example.test/app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	subject := digest.FromString("manifest")
+	tagTarget := ocispec.Descriptor{Digest: digest.FromString("tag target")}
+	digestTarget := ocispec.Descriptor{Digest: digest.FromString("digest target")}
+	noReferrer := dmveritySelectionLabels(subject, "")
+	referrer := dmveritySelectionLabels(subject, digest.FromString("dmverity referrer"))
+	store := newTestImageStore(t,
+		containerdimages.Image{
+			Name:   tagRef,
+			Target: tagTarget,
+			Labels: snpkg.WithDmverityImageSelectionLabels(map[string]string{"other": "tag"}, noReferrer),
+		},
+		containerdimages.Image{
+			Name:   digestRef,
+			Target: digestTarget,
+			Labels: snpkg.WithDmverityImageSelectionLabels(map[string]string{"other": "digest"}, referrer),
+		},
+	)
+	imageStore, err := imagestore.NewFakeStore([]imagestore.Image{{
+		ID:         imageID,
+		References: []string{tagRef, digestRef},
+	}})
+	require.NoError(t, err)
+	c, _ := newTestCRIService()
+	c.images = store
+	c.imageStore = imageStore
+
+	require.NoError(t, c.propagateDmveritySelections(ctx, "missing", referrer))
+	require.NoError(t, c.propagateDmveritySelections(ctx, imageID, nil))
+	require.NoError(t, c.propagateDmveritySelections(ctx, imageID, referrer))
+
+	tag, err := store.Get(ctx, tagRef)
+	require.NoError(t, err)
+	require.Equal(t, tagTarget, tag.Target)
+	require.Equal(t, "tag", tag.Labels["other"])
+	require.Equal(t, referrer, snpkg.DmverityImageSelectionLabels(tag.Labels))
+
+	digestImage, err := store.Get(ctx, digestRef)
+	require.NoError(t, err)
+	require.Equal(t, digestTarget, digestImage.Target)
+	require.Equal(t, "digest", digestImage.Labels["other"])
+	require.Equal(t, referrer, snpkg.DmverityImageSelectionLabels(digestImage.Labels))
 }
 
 func TestTransferProgressReporter(t *testing.T) {

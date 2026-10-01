@@ -128,7 +128,8 @@ func CalculateImageUsage(ctx context.Context, i images.Image, provider content.I
 							continue
 						}
 
-						sn := config.snapshots(k[len(prefix):])
+						name, _, _ := strings.Cut(k[len(prefix):], "/")
+						sn := config.snapshots(name)
 						if sn == nil {
 							continue
 						}

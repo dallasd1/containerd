@@ -21,13 +21,17 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 
 	containerd "github.com/containerd/containerd/v2/client"
 	"github.com/containerd/containerd/v2/core/leases"
 	"github.com/containerd/containerd/v2/core/mount"
+	snpkg "github.com/containerd/containerd/v2/pkg/snapshotters"
+	"github.com/containerd/containerd/v2/plugins"
 	"github.com/containerd/errdefs"
 	"github.com/containerd/log"
 	"github.com/containerd/platforms"
+	"github.com/opencontainers/go-digest"
 	"github.com/opencontainers/image-spec/identity"
 	imagespec "github.com/opencontainers/image-spec/specs-go/v1"
 	runtime "k8s.io/cri-api/pkg/apis/runtime/v1"
@@ -107,22 +111,29 @@ func (c *criService) mutateImageMount(
 	if err != nil {
 		return fmt.Errorf("failed to ensure %s is mounted: %w", target, err)
 	}
-	if !mounted {
+	var i containerd.Image
+	var chainID string
+	// A reused mount still must not serve an image that is now signed.
+	if !mounted || len(snpkg.DmverityImageSelectionLabels(containerdImage.Labels())) != 0 {
 		img, err := c.client.ImageService().Get(ctx, ref)
 		if err != nil {
 			return fmt.Errorf("failed to get image volume ref %q: %w", ref, err)
 		}
 
-		i := containerd.NewImageWithPlatform(c.client, img, platforms.Only(platform))
-		if err := i.Unpack(ctx, snapshotter); err != nil {
-			return fmt.Errorf("failed to unpack image volume: %w", err)
-		}
-
+		i = containerd.NewImageWithPlatform(c.client, img, platforms.Only(platform))
 		diffIDs, err := i.RootFS(ctx)
 		if err != nil {
 			return fmt.Errorf("failed to get diff IDs for image volume %q: %w", ref, err)
 		}
-		chainID := identity.ChainID(diffIDs).String()
+		chainID = identity.ChainID(diffIDs).String()
+		if err := c.rejectSignedImageVolume(ctx, i, snapshotter, diffIDs, chainID); err != nil {
+			return err
+		}
+	}
+	if !mounted {
+		if err := i.Unpack(ctx, snapshotter); err != nil {
+			return fmt.Errorf("failed to unpack image volume: %w", err)
+		}
 
 		// Get snapshot options with user namespace idmap labels if needed
 		snapshotOpts, err := c.getImageVolumeSnapshotOpts(ctx, extraMount)
@@ -253,4 +264,24 @@ func ensureImageSubPath(mountPoint, subPath string) (string, error) {
 	}
 
 	return file.Name(), nil
+}
+
+// rejectSignedImageVolume refuses signed dm-verity images, which image volumes
+// cannot mount yet, rather than materializing them unsigned.
+func (c *criService) rejectSignedImageVolume(ctx context.Context, i containerd.Image, snapshotter string, diffIDs []digest.Digest, chainID string) error {
+	capabilities, err := c.client.GetSnapshotterCapabilities(ctx, snapshotter)
+	if err != nil {
+		return fmt.Errorf("failed to get capabilities of snapshotter %q: %w", snapshotter, err)
+	}
+	if !slices.Contains(capabilities, plugins.CapabilityDmverityReferrers) {
+		return nil
+	}
+	key, err := snpkg.DmveritySnapshotKey(ctx, i.ContentStore(), i.Target(), i.Platform(), diffIDs, i.Labels())
+	if err != nil {
+		return fmt.Errorf("failed to resolve dm-verity selection for image volume %q: %w", i.Name(), err)
+	}
+	if key != chainID {
+		return fmt.Errorf("image volume %q is a signed dm-verity image, which image volumes do not support: %w", i.Name(), errdefs.ErrNotImplemented)
+	}
+	return nil
 }
