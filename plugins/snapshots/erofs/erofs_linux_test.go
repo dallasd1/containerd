@@ -23,6 +23,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -45,6 +46,7 @@ import (
 	"github.com/containerd/containerd/v2/plugins/content/local"
 	erofsdiffer "github.com/containerd/containerd/v2/plugins/diff/erofs"
 	erofsmount "github.com/containerd/containerd/v2/plugins/mount/erofs"
+	"github.com/containerd/errdefs"
 	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
@@ -57,6 +59,49 @@ const (
   "hashoffset": 4096
 }`
 )
+
+func TestFailedSignedParentViewCanBeRetried(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	require.NoError(t, os.Mkdir(filepath.Join(root, "snapshots"), 0700))
+	ms, err := storage.NewMetaStore(filepath.Join(root, "metadata.db"))
+	require.NoError(t, err)
+	s := &snapshotter{root: root, ms: ms, dmverityMode: "auto"}
+	t.Cleanup(func() { require.NoError(t, s.Close()) })
+
+	_, err = s.Prepare(ctx, "parent-active", "")
+	require.NoError(t, err)
+	var parentID string
+	require.NoError(t, ms.WithTransaction(ctx, false, func(ctx context.Context) error {
+		var err error
+		parentID, _, _, err = storage.GetInfo(ctx, "parent-active")
+		return err
+	}))
+	require.NoError(t, os.WriteFile(s.layerBlobPath(parentID), []byte("layer"), 0600))
+
+	rootHash := strings.Repeat("a", 64)
+	signatureDigest := digest.FromString("signature").String()
+	require.NoError(t, s.Commit(ctx, "parent", "parent-active", snapshots.WithLabels(map[string]string{
+		"containerd.io/snapshot/erofs.dmverity.root-hash":        rootHash,
+		"containerd.io/snapshot/erofs.dmverity.signature-digest": signatureDigest,
+	})))
+
+	_, err = s.View(ctx, "retry-view", "parent")
+	require.ErrorContains(t, err, "requires signed dm-verity referrers")
+	_, err = s.Stat(ctx, "retry-view")
+	require.True(t, errdefs.IsNotFound(err), "failed view left a snapshot: %v", err)
+
+	s.enableDmverityReferrers = true
+	mounts, err := s.View(ctx, "retry-view", "parent")
+	require.NoError(t, err)
+	require.Len(t, mounts, 1)
+	require.Contains(t, mounts[0].Options, "X-containerd.dmverity.root-hash="+rootHash)
+}
+
+func TestSignedReferrersRejectDmverityOff(t *testing.T) {
+	_, err := NewSnapshotter(t.TempDir(), WithDmverityReferrers(), WithDmverityMode("off"))
+	require.ErrorContains(t, err, "enable_dmverity_referrers requires dmverity_mode")
+}
 
 func newSnapshotter(t *testing.T, opts ...Opt) func(ctx context.Context, root string) (snapshots.Snapshotter, func() error, error) {
 	_, err := exec.LookPath("mkfs.erofs")
@@ -417,7 +462,7 @@ func TestCreateErofsMount(t *testing.T) {
 	}
 
 	t.Run("creates regular erofs mount", func(t *testing.T) {
-		m, err := s.createErofsMount(layerBlob)
+		m, err := s.createErofsMount(layerBlob, nil)
 		require.NoError(t, err)
 
 		assert.Equal(t, "erofs", m.Type)
@@ -430,7 +475,7 @@ func TestCreateErofsMount(t *testing.T) {
 		s.dmverityMode = "on"
 		createDmverityMetadata(t, layerBlob)
 
-		m, err := s.createErofsMount(layerBlob)
+		m, err := s.createErofsMount(layerBlob, nil)
 		require.NoError(t, err)
 		// Mount type is always "erofs" - dm-verity detection happens in mount handler
 		assert.Equal(t, "erofs", m.Type)
@@ -449,7 +494,7 @@ func TestCreateErofsMount(t *testing.T) {
 
 		s.dmverityMode = "off"
 
-		m, err := s.createErofsMount(layerBlob)
+		m, err := s.createErofsMount(layerBlob, nil)
 		require.NoError(t, err)
 
 		assert.Equal(t, "erofs", m.Type)
@@ -824,7 +869,7 @@ func TestMountsWithMergedFsMeta(t *testing.T) {
 	snap := storage.Snapshot{Kind: snapshots.KindView, ParentIDs: parents}
 	info := snapshots.Info{}
 
-	mounts, err := s.mounts(snap, info)
+	mounts, err := s.mounts(snap, info, make([]snapshots.Info, len(parents)))
 	require.NoError(t, err)
 
 	// Expect: [erofs(p0), erofs(p1), erofs(fsmeta p2, device=p3,p2), overlay]
@@ -869,7 +914,7 @@ func TestMountsWithMergedFsMetaOnTopParent(t *testing.T) {
 	snap := storage.Snapshot{Kind: snapshots.KindView, ParentIDs: parents}
 	info := snapshots.Info{}
 
-	mounts, err := s.mounts(snap, info)
+	mounts, err := s.mounts(snap, info, make([]snapshots.Info, len(parents)))
 	require.NoError(t, err)
 
 	require.Len(t, mounts, 2)

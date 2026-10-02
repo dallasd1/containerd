@@ -19,12 +19,14 @@ package snapshotters
 import (
 	"context"
 	"fmt"
+	"maps"
 	"strings"
 	"testing"
 
 	digest "github.com/opencontainers/go-digest"
 	imagespec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestImageLayersLabel(t *testing.T) {
@@ -70,4 +72,37 @@ func TestImageLayersLabel(t *testing.T) {
 			assert.Equal(t, tt.wantNum, got)
 		})
 	}
+}
+
+func TestValidateDmveritySnapshotIdentity(t *testing.T) {
+	expected := map[string]string{
+		dmverityReferrerRootHashLabel:        digest.FromString("root").Encoded(),
+		dmverityReferrerSignatureDigestLabel: digest.FromString("signature").String(),
+	}
+	require.NoError(t, ValidateDmveritySnapshot(expected, expected))
+	uppercaseRoot := maps.Clone(expected)
+	uppercaseRoot[dmverityReferrerRootHashLabel] = strings.ToUpper(expected[dmverityReferrerRootHashLabel])
+	require.NoError(t, ValidateDmveritySnapshot(uppercaseRoot, expected))
+	require.Error(t, ValidateDmveritySnapshot(nil, expected))
+	require.NoError(t, ValidateDmveritySnapshot(expected, nil))
+	for _, label := range []string{dmverityReferrerRootHashLabel, dmverityReferrerSignatureDigestLabel} {
+		existing := map[string]string{
+			dmverityReferrerRootHashLabel:        expected[dmverityReferrerRootHashLabel],
+			dmverityReferrerSignatureDigestLabel: expected[dmverityReferrerSignatureDigestLabel],
+		}
+		if label == dmverityReferrerRootHashLabel {
+			existing[label] = digest.FromString("different root").Encoded()
+			require.Error(t, ValidateDmveritySnapshot(existing, expected))
+		} else {
+			existing[label] = digest.FromString("different signature").String()
+			require.NoError(t, ValidateDmveritySnapshot(existing, expected))
+		}
+		delete(existing, label)
+		require.Error(t, ValidateDmveritySnapshot(existing, expected))
+	}
+	require.NoError(t, ValidateDmveritySnapshot(nil, nil))
+	require.Error(t, ValidateDmveritySnapshot(map[string]string{
+		dmverityReferrerRootHashLabel:        "malformed",
+		dmverityReferrerSignatureDigestLabel: digest.FromString("signature").String(),
+	}, nil))
 }
