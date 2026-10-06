@@ -19,11 +19,17 @@ package images
 import (
 	"context"
 	"fmt"
+	"slices"
 	"sync"
 
+	containerd "github.com/containerd/containerd/v2/client"
 	"github.com/containerd/containerd/v2/core/images"
+	snpkg "github.com/containerd/containerd/v2/pkg/snapshotters"
+	"github.com/containerd/containerd/v2/plugins"
+	"github.com/containerd/errdefs"
 	"github.com/containerd/log"
 	"github.com/containerd/platforms"
+	"github.com/opencontainers/image-spec/identity"
 )
 
 // CheckImages checks all existing images to ensure they are ready to
@@ -53,11 +59,12 @@ func (c *CRIImageService) CheckImages(ctx context.Context) error {
 			}
 			// Checking existence of top-level snapshot for each image being recovered.
 			// TODO: This logic should be done elsewhere and owned by the image service
-			unpacked, err := i.IsUnpacked(ctx, snapshotter)
+			unpacked, err := c.imageIsUnpacked(ctx, i, snapshotter)
 			if err != nil {
 				log.G(ctx).WithError(err).Warnf("Failed to check whether image is unpacked for image %s", i.Name())
 				return
 			}
+
 			if !unpacked {
 				log.G(ctx).Warnf("The image %s is not unpacked.", i.Name())
 				// TODO(random-liu): Consider whether we should try unpack here.
@@ -71,4 +78,35 @@ func (c *CRIImageService) CheckImages(ctx context.Context) error {
 	}
 	wg.Wait()
 	return nil
+}
+
+func (c *CRIImageService) imageIsUnpacked(ctx context.Context, i containerd.Image, snapshotter string) (bool, error) {
+	signed, err := snpkg.ImageHasDmverityReferrer(ctx, i.ContentStore(), i.Target(), platforms.Default())
+	if err != nil {
+		return false, fmt.Errorf("inspect signed dm-verity image %q: %w", i.Name(), err)
+	}
+	if signed {
+		capabilities, err := c.client.GetSnapshotterCapabilities(ctx, snapshotter)
+		if err != nil {
+			return false, fmt.Errorf("get snapshotter %q capabilities: %w", snapshotter, err)
+		}
+		if slices.Contains(capabilities, plugins.CapabilityDmverityReferrers) {
+			diffIDs, err := i.RootFS(ctx)
+			if err != nil {
+				return false, fmt.Errorf("get image rootfs for %q: %w", i.Name(), err)
+			}
+			key, err := snpkg.DmveritySnapshotKey(identity.ChainID(diffIDs).String())
+			if err != nil {
+				return false, err
+			}
+			if _, err := c.client.SnapshotService(snapshotter).Stat(ctx, key); err != nil {
+				if errdefs.IsNotFound(err) {
+					return false, nil
+				}
+				return false, fmt.Errorf("stat signed snapshot %q for image %q: %w", key, i.Name(), err)
+			}
+			return true, nil
+		}
+	}
+	return i.IsUnpacked(ctx, snapshotter)
 }

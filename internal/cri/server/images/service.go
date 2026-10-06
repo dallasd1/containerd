@@ -43,6 +43,8 @@ type imageClient interface {
 	ListImages(context.Context, ...string) ([]containerd.Image, error)
 	GetImage(context.Context, string) (containerd.Image, error)
 	Pull(context.Context, string, ...containerd.RemoteOpt) (containerd.Image, error)
+	GetSnapshotterCapabilities(context.Context, string) ([]string, error)
+	SnapshotService(string) snapshots.Snapshotter
 }
 
 type ImagePlatform struct {

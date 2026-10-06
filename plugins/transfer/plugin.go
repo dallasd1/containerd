@@ -17,8 +17,10 @@
 package transfer
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"slices"
 
 	"github.com/containerd/errdefs"
 	"github.com/containerd/log"
@@ -26,14 +28,18 @@ import (
 	"github.com/containerd/plugin"
 	"github.com/containerd/plugin/registry"
 
+	"github.com/containerd/containerd/v2/core/content"
 	"github.com/containerd/containerd/v2/core/diff"
+	"github.com/containerd/containerd/v2/core/images"
 	"github.com/containerd/containerd/v2/core/leases"
 	"github.com/containerd/containerd/v2/core/metadata"
+	"github.com/containerd/containerd/v2/core/remotes"
 	"github.com/containerd/containerd/v2/core/transfer/local"
 	"github.com/containerd/containerd/v2/core/unpack"
 	"github.com/containerd/containerd/v2/defaults"
 	"github.com/containerd/containerd/v2/internal/kmutex"
 	"github.com/containerd/containerd/v2/pkg/imageverifier"
+	snpkg "github.com/containerd/containerd/v2/pkg/snapshotters"
 	"github.com/containerd/containerd/v2/plugins"
 	specs "github.com/opencontainers/image-spec/specs-go/v1"
 
@@ -89,16 +95,41 @@ func init() {
 
 			lc.MaxConcurrentUploadedLayers = config.MaxConcurrentUploadedLayers
 			lc.MaxConcurrentUnpacks = config.MaxConcurrentUnpacks
-
 			if err := configureUnpackPlatforms(ic, ms, config, &lc); err != nil {
 				return nil, err
 			}
+			configureDmverityFetchRetention(ic, ms, &lc)
 			lc.RegistryConfigPath = config.RegistryConfigPath
 			lc.DuplicationSuppressor = kmutex.New()
 
 			return local.NewTransferService(ms.ContentStore(), metadata.NewImageStore(ms), lc), nil
 		},
 	})
+}
+
+func configureDmverityFetchRetention(ic *plugin.InitContext, ms *metadata.DB, lc *local.TransferConfig) {
+	fetchRetention := false
+	for name := range ms.Snapshotters() {
+		if p := ic.Plugins().Get(plugins.SnapshotPlugin, name); p != nil &&
+			slices.Contains(p.Meta.Capabilities, plugins.CapabilityDmverityReferrers) {
+			fetchRetention = true
+			break
+		}
+	}
+	lc.PullHandlerWrapper = func(_ context.Context, fetcher remotes.Fetcher, store content.Store, requestHasUnpack bool, unpackPlatforms []unpack.Platform) (func(images.Handler) images.Handler, error) {
+		for _, up := range unpackPlatforms {
+			if slices.Contains(up.SnapshotterCapabilities, plugins.CapabilityDmverityReferrers) {
+				return snpkg.AppendSignatureHandlerWrapper(fetcher, store), nil
+			}
+		}
+		if fetchRetention && !requestHasUnpack {
+			return snpkg.AppendSignatureHandlerWrapper(fetcher, store), nil
+		}
+		return nil, nil
+	}
+	if fetchRetention {
+		ic.Meta.Capabilities = append(ic.Meta.Capabilities, plugins.CapabilityDmverityReferrers)
+	}
 }
 
 func configureUnpackPlatforms(ic *plugin.InitContext, ms *metadata.DB, config *transferConfig, lc *local.TransferConfig) error {
@@ -158,6 +189,10 @@ func configureUnpackPlatforms(ic *plugin.InitContext, ms *metadata.DB, config *t
 			Applier:                 applier,
 			ConfigType:              uc.ConfigType,
 			LayerTypes:              uc.LayerTypes,
+		}
+		// Set the optional dm-verity prepare layer if the snapshotter supports it.
+		if slices.Contains(snCapabilities, plugins.CapabilityDmverityReferrers) {
+			up.PrepareLayer = snpkg.PrepareDmverityLayer
 		}
 		lc.UnpackPlatforms = append(lc.UnpackPlatforms, up)
 	}

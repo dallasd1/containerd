@@ -128,7 +128,11 @@ func CalculateImageUsage(ctx context.Context, i images.Image, provider content.I
 							continue
 						}
 
-						sn := config.snapshots(k[len(prefix):])
+						snapshotterName := k[len(prefix):]
+						if separator := strings.IndexByte(snapshotterName, '/'); separator >= 0 {
+							snapshotterName = snapshotterName[:separator]
+						}
+						sn := config.snapshots(snapshotterName)
 						if sn == nil {
 							continue
 						}

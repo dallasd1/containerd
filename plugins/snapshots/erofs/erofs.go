@@ -329,7 +329,7 @@ func (s *snapshotter) applyDmverityPolicy(layerBlob string) (string, error) {
 func (s *snapshotter) createErofsMount(layerBlob string, labels map[string]string) (mount.Mount, error) {
 	options := []string{"ro", "loop"}
 
-	rootHash, signatureDigest, dmverityReferrersEnabled, err := snpkg.DmveritySnapshotIdentity(labels)
+	rootHash, signatureDigest, dmverityReferrersEnabled, err := snpkg.GetDmveritySnapshotIdentity(labels)
 	if err != nil {
 		return mount.Mount{}, fmt.Errorf("invalid dm-verity materialization labels for layer %s: %w", layerBlob, err)
 	}
@@ -480,7 +480,7 @@ func (s *snapshotter) mounts(snap storage.Snapshot, info snapshots.Info, parentI
 	first := len(mounts)
 	lastSignedParent := -1
 	for i := range parentInfo {
-		_, _, signed, err := snpkg.DmveritySnapshotIdentity(parentInfo[i].Labels)
+		_, _, signed, err := snpkg.GetDmveritySnapshotIdentity(parentInfo[i].Labels)
 		if err != nil {
 			return nil, fmt.Errorf("validate parent %s dm-verity materialization: %w", snap.ParentIDs[i], err)
 		}

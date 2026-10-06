@@ -144,7 +144,9 @@ type criService struct {
 	// netPlugin is used to setup and teardown network when run/stop pod sandbox.
 	netPlugin map[string]cni.CNI
 	// client is an instance of the containerd client
-	client *containerd.Client
+	client               *containerd.Client
+	dmverityCapabilityMu sync.Mutex
+	dmverityCapabilities map[string]bool
 	// streamServer is the streaming server serves container streaming request.
 	streamServer streaming.Server
 	// eventMonitor is the monitor monitors containerd events.

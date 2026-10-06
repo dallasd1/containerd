@@ -182,7 +182,11 @@ func (s *Store) getImage(ctx context.Context, i images.Image) (*Image, error) {
 	for label := range info.Labels {
 		const prefix = "containerd.io/gc.ref.snapshot."
 		if strings.HasPrefix(label, prefix) {
-			snapshotters[label[len(prefix):]] = struct{}{}
+			snapshotter := label[len(prefix):]
+			if separator := strings.IndexByte(snapshotter, '/'); separator >= 0 {
+				snapshotter = snapshotter[:separator]
+			}
+			snapshotters[snapshotter] = struct{}{}
 		}
 	}
 

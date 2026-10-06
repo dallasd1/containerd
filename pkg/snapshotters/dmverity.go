@@ -37,6 +37,15 @@ const (
 	dmverityReferrerSignatureDigestLabel = "containerd.io/snapshot/erofs.dmverity.signature-digest"
 )
 
+// DmveritySnapshotKey derives the signed snapshot key for an OCI ChainID.
+func DmveritySnapshotKey(chainID string) (string, error) {
+	chainDigest, err := digest.Parse(chainID)
+	if err != nil {
+		return "", fmt.Errorf("parse OCI ChainID %q: %w", chainID, err)
+	}
+	return chainDigest.String() + "-dmverity", nil
+}
+
 // DmverityTarget is the trusted layer annotation. Payload descriptors are
 // resolved from the selected referrer in the local content store.
 type DmverityTarget struct {
@@ -94,8 +103,8 @@ func validateRootHash(rootHash string) error {
 
 // DmveritySnapshotLabels returns identity labels for a signed referrer materialization.
 func DmveritySnapshotLabels(desc ocispec.Descriptor) (map[string]string, error) {
-	targetValue := desc.Annotations[TargetLayerDmverityLabel]
-	if targetValue == "" {
+	targetValue, exists := desc.Annotations[TargetLayerDmverityLabel]
+	if !exists {
 		return nil, nil
 	}
 	target, err := ParseDmverityTarget(targetValue)
@@ -103,22 +112,18 @@ func DmveritySnapshotLabels(desc ocispec.Descriptor) (map[string]string, error) 
 		return nil, fmt.Errorf("layer %s has an invalid dm-verity target: %w", desc.Digest, err)
 	}
 
-	if err := validateRootHash(target.RootHash); err != nil {
-		return nil, err
-	}
-	if _, err := digest.Parse(target.Signature.Digest.String()); err != nil {
-		return nil, fmt.Errorf("invalid dm-verity signature digest: %w", err)
-	}
-
-	// Persist the identity checked when an existing ChainID is reused.
-	return map[string]string{
+	labels := map[string]string{
 		dmverityReferrerRootHashLabel:        target.RootHash,
 		dmverityReferrerSignatureDigestLabel: target.Signature.Digest.String(),
-	}, nil
+	}
+	if _, _, _, err := GetDmveritySnapshotIdentity(labels); err != nil {
+		return nil, fmt.Errorf("layer %s has an invalid dm-verity target: %w", desc.Digest, err)
+	}
+	return labels, nil
 }
 
-// DmveritySnapshotIdentity returns the signed identity recorded on a snapshot.
-func DmveritySnapshotIdentity(labels map[string]string) (rootHash, signatureDigest string, signed bool, err error) {
+// GetDmveritySnapshotIdentity returns the signed identity recorded on a snapshot.
+func GetDmveritySnapshotIdentity(labels map[string]string) (rootHash, signatureDigest string, signed bool, err error) {
 	rootHash = labels[dmverityReferrerRootHashLabel]
 	signatureDigest = labels[dmverityReferrerSignatureDigestLabel]
 	if rootHash == "" && signatureDigest == "" {
@@ -138,11 +143,15 @@ func DmveritySnapshotIdentity(labels map[string]string) (rootHash, signatureDige
 
 // ValidateDmveritySnapshot rejects a snapshot that lacks the selected signed identity.
 func ValidateDmveritySnapshot(existing, expected map[string]string) error {
-	expectedRootHash, _, expectedSigned, err := DmveritySnapshotIdentity(expected)
+	expectedRootHash, _, expectedSigned, err := GetDmveritySnapshotIdentity(expected)
 	if err != nil {
 		return fmt.Errorf("invalid expected dm-verity snapshot identity: %w", err)
 	}
-	existingRootHash, _, existingSigned, err := DmveritySnapshotIdentity(existing)
+	return validateDmveritySnapshot(existing, expectedRootHash, expectedSigned)
+}
+
+func validateDmveritySnapshot(existing map[string]string, expectedRootHash string, expectedSigned bool) error {
+	existingRootHash, _, existingSigned, err := GetDmveritySnapshotIdentity(existing)
 	if err != nil {
 		return fmt.Errorf("invalid existing dm-verity snapshot identity: %w", err)
 	}

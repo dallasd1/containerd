@@ -20,6 +20,7 @@ package erofs
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"os"
@@ -27,6 +28,7 @@ import (
 	"testing"
 
 	"github.com/containerd/containerd/v2/core/images/imagetest"
+	"github.com/containerd/containerd/v2/core/mount"
 	"github.com/containerd/containerd/v2/internal/dmverity"
 	snpkg "github.com/containerd/containerd/v2/pkg/snapshotters"
 	"github.com/containerd/log/logtest"
@@ -172,4 +174,39 @@ func TestApplySignedTarIndexArtifacts(t *testing.T) {
 	require.Equal(t, signatureBytes, signature)
 	_, err = os.Stat(layerPath + ".hashtree")
 	require.ErrorIs(t, err, os.ErrNotExist)
+}
+
+func TestApplySignedArtifactsBeforeLocalTarIndex(t *testing.T) {
+	ctx := logtest.WithT(context.Background(), t)
+	store := imagetest.NewContentStore(ctx, t)
+	target := snpkg.DmverityTarget{
+		RootHash:  digest.FromString("root").Encoded(),
+		Metadata:  store.Blob("application/vnd.containerd.erofs.metadata.v1", []byte("erofs metadata")).Descriptor,
+		Tree:      store.Blob("application/vnd.containerd.erofs.dmverity.merkle-tree.v1", []byte("verity tree")).Descriptor,
+		Signature: store.Blob("application/vnd.containerd.erofs.dmverity.layer-signature.v1+pkcs7", []byte("signature")).Descriptor,
+	}
+	annotation, err := json.Marshal(target)
+	require.NoError(t, err)
+
+	var compressed bytes.Buffer
+	gz := gzip.NewWriter(&compressed)
+	_, err = gz.Write([]byte("signed tar payload"))
+	require.NoError(t, err)
+	require.NoError(t, gz.Close())
+	desc := store.Blob(ocispec.MediaTypeImageLayerGzip, compressed.Bytes()).Descriptor
+	desc.Annotations = map[string]string{snpkg.TargetLayerDmverityLabel: string(annotation)}
+
+	layerDir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(layerDir, ".erofslayer"), nil, 0644))
+	differ := erofsDiff{
+		store:          store.Store,
+		enableTarIndex: true,
+	}
+	_, err = differ.Apply(ctx, desc, []mount.Mount{{
+		Type:   "bind",
+		Source: filepath.Join(layerDir, "layer.erofs"),
+	}})
+	require.NoError(t, err)
+	require.FileExists(t, filepath.Join(layerDir, "layer.erofs.dmverity"))
+	require.FileExists(t, filepath.Join(layerDir, "layer.erofs.sig"))
 }

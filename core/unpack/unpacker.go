@@ -25,6 +25,7 @@ import (
 	"fmt"
 	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -83,6 +84,11 @@ type Platform struct {
 
 	Applier   diff.Applier
 	ApplyOpts []diff.ApplyOpt
+
+	// PrepareLayer derives a layer's snapshot key, GC qualifier, labels, and
+	// validator from its descriptor and OCI ChainID before locking.
+	// A nil callback preserves ordinary unpack behavior.
+	PrepareLayer func(context.Context, ocispec.Descriptor, string) (snapshots.LayerPreparation, error)
 
 	// ConfigType is the supported config type to be considered for unpacking
 	// Defaults to OCI image config
@@ -371,6 +377,27 @@ func (u *Unpacker) unpack(
 	copy(chainIDs, diffIDs)
 	chainIDs = identity.ChainIDs(chainIDs)
 
+	preparations := make([]snapshots.LayerPreparation, len(chainIDs))
+	for i, chainID := range chainIDs {
+		selected := snapshots.LayerPreparation{Key: chainID.String()}
+		if unpack.PrepareLayer != nil {
+			selected, err = unpack.PrepareLayer(ctx, layers[i], chainID.String())
+			if err != nil {
+				return fmt.Errorf("prepare layer policy for %s: %w", layers[i].Digest, err)
+			}
+			if selected.Key == "" {
+				return fmt.Errorf("prepare layer policy for %s returned an empty snapshot key", layers[i].Digest)
+			}
+			if strings.ContainsAny(selected.GCQualifier, "/\\") || selected.GCQualifier == "." || selected.GCQualifier == ".." {
+				return fmt.Errorf("prepare layer policy for %s returned invalid GC label qualifier %q", layers[i].Digest, selected.GCQualifier)
+			}
+			if selected.Key != chainID.String() && selected.GCQualifier == "" {
+				return fmt.Errorf("alternate snapshot key %q for layer %s requires a GC label qualifier", selected.Key, layers[i].Digest)
+			}
+		}
+		preparations[i] = selected
+	}
+
 	topHalf := func(i int, desc ocispec.Descriptor, span *tracing.Span, startAt time.Time) (<-chan *unpackStatus, error) {
 		var (
 			err     error
@@ -378,11 +405,12 @@ func (u *Unpacker) unpack(
 			chainID string
 		)
 		if i > 0 && !parallel {
-			parent = chainIDs[i-1].String()
+			parent = preparations[i-1].Key
 		}
 		chainID = chainIDs[i].String()
+		prepared := preparations[i]
 
-		unlock, err := u.lockSnChainID(ctx, chainID, unpack.SnapshotterKey)
+		unlock, err := u.lockSnChainID(ctx, prepared.Key, unpack.SnapshotterKey)
 		if err != nil {
 			return nil, err
 		}
@@ -397,11 +425,15 @@ func (u *Unpacker) unpack(
 		if snapshotLabels == nil {
 			snapshotLabels = make(map[string]string)
 		}
-		snapshotLabels[labelSnapshotRef] = chainID
+		snapshotLabels[labelSnapshotRef] = prepared.Key
 		snapshotLabels[labelSnapshotDiffID] = diffIDs[i].String()
 		if i > 0 {
-			snapshotLabels[labelSnapshotParent] = chainIDs[i-1].String()
+			snapshotLabels[labelSnapshotParent] = preparations[i-1].Key
 		}
+		for key, value := range prepared.Labels {
+			snapshotLabels[key] = value
+		}
+		validateExistingSnapshot := prepared.ValidateExisting
 
 		var (
 			key    string
@@ -411,17 +443,22 @@ func (u *Unpacker) unpack(
 
 		for try := 1; try <= 3; try++ {
 			// Prepare snapshot with from parent, label as root
-			key = fmt.Sprintf(snapshots.UnpackKeyFormat, uniquePart(), chainID)
+			key = fmt.Sprintf(snapshots.UnpackKeyFormat, uniquePart(), prepared.Key)
 			mounts, err = sn.Prepare(ctx, key, parent, opts...)
 			if err != nil {
 				if errdefs.IsAlreadyExists(err) {
-					if snInfo, err := sn.Stat(ctx, chainID); err != nil {
+					if snInfo, err := sn.Stat(ctx, prepared.Key); err != nil {
 						if !errdefs.IsNotFound(err) {
-							return nil, fmt.Errorf("failed to stat snapshot %s: %w", chainID, err)
+							return nil, fmt.Errorf("failed to stat snapshot %s: %w", prepared.Key, err)
 						}
 						// Try again, this should be rare, log it
-						log.G(ctx).WithField("key", key).WithField("chainid", chainID).Debug("extraction snapshot already exists, chain id not found")
+						log.G(ctx).WithField("key", key).WithField("chainid", chainID).Debug("extraction snapshot already exists, selected key not found")
 					} else {
+						if validateExistingSnapshot != nil {
+							if err := validateExistingSnapshot(snInfo); err != nil {
+								return nil, fmt.Errorf("existing snapshot %s violates layer policy: %w", prepared.Key, err)
+							}
+						}
 						log.G(ctx).Debugf("snapshot %s with chainID %s already exists skip fetch blob %q ", snInfo.Name, chainID, desc.Digest)
 						// no need to handle, snapshot now found with chain id
 						return nil, nil
@@ -488,12 +525,21 @@ func (u *Unpacker) unpack(
 					}
 
 					if i > 0 && parallel {
-						parent = chainIDs[i-1].String()
+						parent = preparations[i-1].Key
 						opts = append(opts, snapshots.WithParent(parent))
 					}
-					if err = sn.Commit(ctx, chainID, key, opts...); err != nil {
+					if err = sn.Commit(ctx, prepared.Key, key, opts...); err != nil {
 						cleanup.Do(ctx, abort)
 						if errdefs.IsAlreadyExists(err) {
+							if validateExistingSnapshot != nil {
+								info, statErr := sn.Stat(ctx, prepared.Key)
+								if statErr != nil {
+									return fmt.Errorf("failed to stat concurrently committed snapshot %s: %w", prepared.Key, statErr)
+								}
+								if policyErr := validateExistingSnapshot(info); policyErr != nil {
+									return fmt.Errorf("concurrently committed snapshot %s violates layer policy: %w", prepared.Key, policyErr)
+								}
+							}
 							return nil
 						}
 						return fmt.Errorf("failed to commit snapshot %s: %w", key, err)
@@ -583,7 +629,10 @@ func (u *Unpacker) unpack(
 		return err
 	}
 
-	var statusChans []<-chan *unpackStatus
+	var (
+		statusChans []<-chan *unpackStatus
+		errs        error
+	)
 
 	for i, desc := range layers {
 		_, layerSpan := tracing.StartSpan(ctx, tracing.Name(unpackSpanPrefix, "unpackLayer"))
@@ -596,6 +645,10 @@ func (u *Unpacker) unpack(
 		statusCh, err := topHalf(i, desc, layerSpan, unpackLayerStart)
 		if err != nil {
 			if parallel {
+				// Report the failure instead of committing a partial chain.
+				errs = err
+				layerSpan.SetStatus(err)
+				layerSpan.End()
 				break
 			} else {
 				layerSpan.SetStatus(err)
@@ -619,7 +672,6 @@ func (u *Unpacker) unpack(
 
 	// In parallel mode, snapshots still need to be committed and rebased sequentially
 	if parallel {
-		var errs error
 		for _, sc := range statusChans {
 			if err := bottomHalf(<-sc, errs); err != nil {
 				errs = errors.Join(errs, err)
@@ -631,22 +683,31 @@ func (u *Unpacker) unpack(
 	}
 
 	var chainID string
+	gcLabel := ""
+	gcSnapshotKey := ""
 	if len(chainIDs) > 0 {
 		chainID = chainIDs[len(chainIDs)-1].String()
+		gcLabel = preparations[len(preparations)-1].GCQualifier
+		gcSnapshotKey = preparations[len(preparations)-1].Key
+	}
+	gcRef := fmt.Sprintf("containerd.io/gc.ref.snapshot.%s", unpack.SnapshotterKey)
+	if gcLabel != "" {
+		gcRef += "/" + gcLabel
 	}
 	cinfo := content.Info{
 		Digest: config.Digest,
 		Labels: map[string]string{
-			fmt.Sprintf("containerd.io/gc.ref.snapshot.%s", unpack.SnapshotterKey): chainID,
+			gcRef: gcSnapshotKey,
 		},
 	}
-	_, err = cs.Update(ctx, cinfo, fmt.Sprintf("labels.containerd.io/gc.ref.snapshot.%s", unpack.SnapshotterKey))
+	_, err = cs.Update(ctx, cinfo, "labels."+gcRef)
 	if err != nil {
 		return err
 	}
 	log.G(ctx).WithFields(log.Fields{
 		"config":   config.Digest,
 		"chainID":  chainID,
+		"snapshot": gcSnapshotKey,
 		"parallel": parallel,
 		"duration": time.Since(unpackStart),
 	}).Debug("image unpacked")
