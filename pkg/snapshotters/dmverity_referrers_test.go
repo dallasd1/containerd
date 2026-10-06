@@ -19,6 +19,7 @@ package snapshotters
 import (
 	"context"
 	"fmt"
+	"maps"
 	"strings"
 	"sync"
 	"testing"
@@ -34,6 +35,75 @@ import (
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/stretchr/testify/require"
 )
+
+func TestSanitizeDmverityImageLayersReservedAnnotations(t *testing.T) {
+	reserved := []string{TargetLayerDmverityLabel, dmverityReferrerRootHashLabel, dmverityReferrerSignatureDigestLabel}
+	for _, mediaType := range []string{ocispec.MediaTypeImageLayer, ocispec.MediaTypeImageConfig} {
+		for _, keys := range [][]string{nil, reserved[:1], reserved[1:2], reserved[2:], reserved} {
+			t.Run(fmt.Sprintf("%s/%v", mediaType, keys), func(t *testing.T) {
+				annotations := map[string]string{"example.org/keep": "value"}
+				for _, key := range keys {
+					annotations[key] = ""
+				}
+				original := maps.Clone(annotations)
+				desc := ocispec.Descriptor{
+					MediaType:   mediaType,
+					Digest:      digest.FromString("layer"),
+					Annotations: annotations,
+				}
+				children := []ocispec.Descriptor{desc}
+				layers := sanitizeDmverityImageLayers(children)
+				require.Equal(t, original, annotations)
+				require.Equal(t, map[string]string{"example.org/keep": "value"}, children[0].Annotations)
+				for _, key := range reserved {
+					require.NotContains(t, snapshots.FilterInheritedLabels(children[0].Annotations), key)
+				}
+				_, included := layers[desc.Digest.String()]
+				require.Equal(t, images.IsLayerType(mediaType), included)
+				if len(keys) > 0 {
+					children[0].Annotations["example.org/keep"] = "changed"
+					require.Equal(t, "value", annotations["example.org/keep"])
+				}
+			})
+		}
+	}
+}
+
+func TestSanitizedDmverityLayerPreparation(t *testing.T) {
+	ctx := t.Context()
+	desc := ocispec.Descriptor{
+		MediaType: ocispec.MediaTypeImageLayer,
+		Digest:    digest.FromString("layer"),
+		Annotations: map[string]string{
+			TargetLayerDmverityLabel:             "untrusted",
+			dmverityReferrerRootHashLabel:        "untrusted",
+			dmverityReferrerSignatureDigestLabel: "untrusted",
+		},
+	}
+	children := []ocispec.Descriptor{desc}
+	sanitizeDmverityImageLayers(children)
+	chainID := digest.FromString("chain").String()
+	unsigned, err := PrepareDmverityLayer(ctx, children[0], chainID)
+	require.NoError(t, err)
+	require.Empty(t, unsigned.Labels)
+	require.NoError(t, unsigned.ValidateExisting(snapshots.Info{}))
+
+	target := &DmverityTarget{
+		RootHash:  digest.FromString("trusted-root").Encoded(),
+		Metadata:  ocispec.Descriptor{Digest: digest.FromString("metadata")},
+		Tree:      ocispec.Descriptor{Digest: digest.FromString("tree")},
+		Signature: ocispec.Descriptor{Digest: digest.FromString("signature")},
+	}
+	children, err = annotateDmverityTargets(children, map[string]*DmverityTarget{desc.Digest.String(): target})
+	require.NoError(t, err)
+	signed, err := PrepareDmverityLayer(ctx, children[0], chainID)
+	require.NoError(t, err)
+	require.Equal(t, target.RootHash, signed.Labels[dmverityReferrerRootHashLabel])
+	require.Equal(t, target.Signature.Digest.String(), signed.Labels[dmverityReferrerSignatureDigestLabel])
+	require.NoError(t, signed.ValidateExisting(snapshots.Info{Labels: signed.Labels}))
+	require.Error(t, signed.ValidateExisting(snapshots.Info{}))
+	require.Equal(t, "untrusted", desc.Annotations[TargetLayerDmverityLabel])
+}
 
 func TestImageHasDmverityReferrerForSelectedPlatform(t *testing.T) {
 	ctx := t.Context()

@@ -504,9 +504,14 @@ func ImageHasDmverityReferrer(
 func sanitizeDmverityImageLayers(children []ocispec.Descriptor) map[string]struct{} {
 	imageLayers := make(map[string]struct{})
 	for i := range children {
-		if _, ok := children[i].Annotations[TargetLayerDmverityLabel]; ok {
+		_, hasTarget := children[i].Annotations[TargetLayerDmverityLabel]
+		_, hasRootHash := children[i].Annotations[dmverityReferrerRootHashLabel]
+		_, hasSignatureDigest := children[i].Annotations[dmverityReferrerSignatureDigestLabel]
+		if hasTarget || hasRootHash || hasSignatureDigest {
 			children[i].Annotations = maps.Clone(children[i].Annotations)
 			delete(children[i].Annotations, TargetLayerDmverityLabel)
+			delete(children[i].Annotations, dmverityReferrerRootHashLabel)
+			delete(children[i].Annotations, dmverityReferrerSignatureDigestLabel)
 		}
 		if images.IsLayerType(children[i].MediaType) {
 			imageLayers[children[i].Digest.String()] = struct{}{}

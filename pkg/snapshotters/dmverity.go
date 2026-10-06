@@ -102,6 +102,8 @@ func validateRootHash(rootHash string) error {
 }
 
 // DmveritySnapshotLabels returns identity labels for a signed referrer materialization.
+// Callers must persist these labels during snapshot preparation and commit,
+// and use ValidateDmveritySnapshot on cache hits.
 func DmveritySnapshotLabels(desc ocispec.Descriptor) (map[string]string, error) {
 	targetValue, exists := desc.Annotations[TargetLayerDmverityLabel]
 	if !exists {
