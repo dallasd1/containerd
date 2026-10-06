@@ -26,7 +26,6 @@ import (
 	coreimages "github.com/containerd/containerd/v2/core/images"
 	"github.com/containerd/containerd/v2/core/images/imagetest"
 	"github.com/containerd/containerd/v2/core/introspection"
-	"github.com/containerd/containerd/v2/core/mount"
 	"github.com/containerd/containerd/v2/core/snapshots"
 	"github.com/containerd/containerd/v2/pkg/namespaces"
 	snpkg "github.com/containerd/containerd/v2/pkg/snapshotters"
@@ -58,10 +57,6 @@ type dmverityReadinessSnapshotter struct {
 func (s *dmverityReadinessSnapshotter) Stat(_ context.Context, key string) (snapshots.Info, error) {
 	s.keys = append(s.keys, key)
 	return snapshots.Info{}, nil
-}
-
-func (s *dmverityReadinessSnapshotter) Prepare(context.Context, string, string, ...snapshots.Opt) ([]mount.Mount, error) {
-	return nil, nil
 }
 
 func TestImageReadinessUsesSelectedSnapshotLane(t *testing.T) {

@@ -280,6 +280,16 @@ automatically reads all parameters from the superblock, ensuring that any corrup
 or tampering will be detected at read time. The dm-verity device is then mounted as
 the backing layer in the OverlayFS stack
 
+For signed referrers, replacing a retained bundle requires matching root hashes
+for every image layer. An incompatible replacement fails before publishing the
+new selection, so later cached creation still uses the retained bundle. Same-root
+signature changes are allowed and empty discovery preserves a signed observation.
+
+Mapper activation cleans up only a device it successfully created. A conflicting
+create does not remove another activation's device. This fix is carried locally
+in vendored `go-dmverity` v0.1.0 pending an upstream release. Its mocked regression
+tests run with `go test ./vendor/github.com/containerd/go-dmverity/pkg/verity`.
+
 ## How It Works
 
 For each layer, the EROFS snapshotter prepares a directory containing the

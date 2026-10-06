@@ -119,22 +119,6 @@ func TestRejectSignedImageVolume(t *testing.T) {
 		require.NoError(t, err)
 	})
 
-	t.Run("known unsigned image allowed", func(t *testing.T) {
-		_, err := store.Update(ctx, content.Info{
-			Digest: subject,
-			Labels: map[string]string{
-				"containerd.io/snapshot/erofs.dmverity.no-referrer": "true",
-			},
-		}, "labels")
-		require.NoError(t, err)
-		service := &criService{
-			client:               client,
-			dmverityCapabilities: map[string]bool{"erofs": false},
-		}
-		err = service.rejectSignedImageVolume(ctx, image, "erofs", platforms.Default())
-		require.NoError(t, err)
-	})
-
 	t.Run("ordinary volume does not inspect snapshot identities", func(t *testing.T) {
 		_, err := store.Update(ctx, content.Info{
 			Digest: subject,

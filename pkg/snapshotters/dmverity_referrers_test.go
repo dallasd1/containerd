@@ -27,11 +27,36 @@ import (
 	"github.com/containerd/containerd/v2/core/images"
 	"github.com/containerd/containerd/v2/core/images/imagetest"
 	"github.com/containerd/containerd/v2/core/remotes"
+	"github.com/containerd/containerd/v2/core/snapshots"
 	"github.com/containerd/errdefs"
+	"github.com/containerd/platforms"
 	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/stretchr/testify/require"
 )
+
+func TestImageHasDmverityReferrerForSelectedPlatform(t *testing.T) {
+	ctx := t.Context()
+	store := imagetest.NewContentStore(ctx, t)
+	config := store.JSONObject(ocispec.MediaTypeImageConfig, ocispec.Image{})
+	manifest := store.Manifest(config, store.RandomBlob(ocispec.MediaTypeImageLayer, 16))
+	index := store.Index(imagetest.AddPlatform(manifest, platforms.DefaultSpec()))
+
+	for _, signed := range []bool{true, false} {
+		labels := map[string]string{dmverityNoReferrerLabel: "true"}
+		if signed {
+			labels = map[string]string{dmverityBundleContentLabel: digest.FromString("bundle").String()}
+		}
+		_, err := store.Update(ctx, content.Info{
+			Digest: manifest.Descriptor.Digest,
+			Labels: labels,
+		}, "labels")
+		require.NoError(t, err)
+		got, err := ImageHasDmverityReferrer(ctx, store.Store, index.Descriptor, platforms.Default())
+		require.NoError(t, err)
+		require.Equal(t, signed, got)
+	}
+}
 
 func TestFetchSignaturesDiscovery(t *testing.T) {
 	subject := ocispec.Descriptor{Digest: digest.FromString("subject")}
@@ -169,6 +194,16 @@ func addTestDmverityReferrer(
 	layerDigest digest.Digest,
 	name string,
 ) ocispec.Descriptor {
+	return addTestDmverityReferrerWithRoot(t, store, subject, layerDigest, name, digest.FromString("root-"+name).Encoded())
+}
+
+func addTestDmverityReferrerWithRoot(
+	t *testing.T,
+	store imagetest.ContentStore,
+	subject ocispec.Descriptor,
+	layerDigest digest.Digest,
+	name, root string,
+) ocispec.Descriptor {
 	t.Helper()
 	layerDesc := func(mediaType, suffix string, extra map[string]string) ocispec.Descriptor {
 		labels := map[string]string{sourceLayerDigestAnnotation: layerDigest.String()}
@@ -188,7 +223,7 @@ func addTestDmverityReferrer(
 			layerDesc(erofsMetadataArtifactMediaType, "-meta", nil),
 			layerDesc(merkleTreeArtifactMediaType, "-tree", nil),
 			layerDesc(layerSignatureMediaType, "-sig", map[string]string{
-				layerRootHashAnnotation: digest.FromString("root-" + name).Encoded(),
+				layerRootHashAnnotation: root,
 			}),
 		},
 	}
@@ -273,8 +308,10 @@ func TestDmverityObservationReplacesSignedBundleButKeepsAbsenceSticky(t *testing
 	ctx := t.Context()
 	store := imagetest.NewContentStore(ctx, t)
 	subject := store.Blob(ocispec.MediaTypeImageManifest, []byte("{}")).Descriptor.Digest
-	first := digest.FromString("first referrer")
-	second := digest.FromString("replacement referrer")
+	layer := digest.FromString("layer")
+	root := digest.FromString("root").Encoded()
+	first := addTestDmverityReferrerWithRoot(t, store, ocispec.Descriptor{Digest: subject}, layer, "first", root).Digest
+	second := addTestDmverityReferrerWithRoot(t, store, ocispec.Descriptor{Digest: subject}, layer, "replacement", root).Digest
 
 	for _, transition := range []struct {
 		referrer digest.Digest
@@ -285,7 +322,7 @@ func TestDmverityObservationReplacesSignedBundleButKeepsAbsenceSticky(t *testing
 		{second, second},
 		{"", second},
 	} {
-		signed, err := recordDmverityObservation(ctx, store.Store, subject, transition.referrer)
+		signed, err := recordDmverityObservation(ctx, store.Store, subject, transition.referrer, map[string]struct{}{layer.String(): {}})
 		require.NoError(t, err)
 		require.True(t, signed)
 
@@ -301,7 +338,7 @@ func TestDmverityObservationRecordsNoReferrerWithoutDemotingKnownSigned(t *testi
 	store := imagetest.NewContentStore(ctx, t)
 	subject := store.Blob(ocispec.MediaTypeImageManifest, []byte("{}")).Descriptor.Digest
 
-	signed, err := recordDmverityObservation(ctx, store.Store, subject, "")
+	signed, err := recordDmverityObservation(ctx, store.Store, subject, "", nil)
 	require.NoError(t, err)
 	require.False(t, signed)
 
@@ -328,7 +365,7 @@ func TestDmverityObservationConcurrentSameBundleIsIdempotent(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			_, err := recordDmverityObservation(ctx, store.Store, subject, referrer)
+			_, err := recordDmverityObservation(ctx, store.Store, subject, referrer, nil)
 			errs <- err
 		}()
 	}
@@ -341,4 +378,109 @@ func TestDmverityObservationConcurrentSameBundleIsIdempotent(t *testing.T) {
 	info, err := store.Store.Info(ctx, subject)
 	require.NoError(t, err)
 	require.Equal(t, referrer.String(), info.Labels[dmverityBundleContentLabel])
+}
+
+func TestConflictingReferrerPreservesCachedSignedIdentity(t *testing.T) {
+	ctx := t.Context()
+	store := imagetest.NewContentStore(ctx, t)
+	layer := store.Blob(ocispec.MediaTypeImageLayer, []byte("layer")).Descriptor
+	subject := store.JSONObject(ocispec.MediaTypeImageManifest, ocispec.Manifest{
+		MediaType: ocispec.MediaTypeImageManifest,
+		Layers:    []ocispec.Descriptor{layer},
+	}).Descriptor
+	first := addTestDmverityReferrer(t, store, subject, layer.Digest, "first")
+	conflict := addTestDmverityReferrer(t, store, subject, layer.Digest, "conflict")
+	base := images.HandlerFunc(func(context.Context, ocispec.Descriptor) ([]ocispec.Descriptor, error) {
+		return []ocispec.Descriptor{layer}, nil
+	})
+	pull := func(ref ocispec.Descriptor) ([]ocispec.Descriptor, error) {
+		return AppendSignatureHandlerWrapper(referrerTestFetcher{referrers: []ocispec.Descriptor{ref}}, store.Store)(base).Handle(ctx, subject)
+	}
+	children, err := pull(first)
+	require.NoError(t, err)
+	committed, err := DmveritySnapshotLabels(children[0])
+	require.NoError(t, err)
+
+	_, err = pull(conflict)
+	require.ErrorContains(t, err, "changes root hash")
+	info, err := store.Store.Info(ctx, subject.Digest)
+	require.NoError(t, err)
+	require.Equal(t, first.Digest.String(), info.Labels[dmverityBundleContentLabel])
+
+	cached, err := AppendCachedSignatureHandlerWrapper(store.Store)(base).Handle(ctx, subject)
+	require.NoError(t, err)
+	preparation, err := PrepareDmverityLayer(ctx, cached[0], digest.FromString("chain").String())
+	require.NoError(t, err)
+	require.NoError(t, preparation.ValidateExisting(snapshots.Info{Labels: committed}))
+
+	replacement := addTestDmverityReferrerWithRoot(t, store, subject, layer.Digest, "new-signature", digest.FromString("root-first").Encoded())
+	_, err = pull(replacement)
+	require.NoError(t, err)
+	info, err = store.Store.Info(ctx, subject.Digest)
+	require.NoError(t, err)
+	require.Equal(t, replacement.Digest.String(), info.Labels[dmverityBundleContentLabel])
+	cached, err = AppendCachedSignatureHandlerWrapper(store.Store)(base).Handle(ctx, subject)
+	require.NoError(t, err)
+	replacedLabels, err := DmveritySnapshotLabels(cached[0])
+	require.NoError(t, err)
+	require.NotEqual(t, committed[dmverityReferrerSignatureDigestLabel], replacedLabels[dmverityReferrerSignatureDigestLabel])
+	preparation, err = PrepareDmverityLayer(ctx, cached[0], digest.FromString("chain").String())
+	require.NoError(t, err)
+	require.NoError(t, preparation.ValidateExisting(snapshots.Info{Labels: committed}))
+
+	target, err := ParseDmverityTarget(cached[0].Annotations[TargetLayerDmverityLabel])
+	require.NoError(t, err)
+	require.NoError(t, store.Store.Delete(ctx, target.Tree.Digest))
+	next := addTestDmverityReferrerWithRoot(t, store, subject, layer.Digest, "another-signature", target.RootHash)
+	_, err = pull(next)
+	require.ErrorContains(t, err, "read retained dm-verity payload")
+	info, err = store.Store.Info(ctx, subject.Digest)
+	require.NoError(t, err)
+	require.Equal(t, replacement.Digest.String(), info.Labels[dmverityBundleContentLabel])
+}
+
+func TestConcurrentConflictingObservationsPreserveWinner(t *testing.T) {
+	ctx := t.Context()
+	store := imagetest.NewContentStore(ctx, t)
+	subject := store.Blob(ocispec.MediaTypeImageManifest, []byte("{}")).Descriptor
+	layer := digest.FromString("layer")
+	layers := map[string]struct{}{layer.String(): {}}
+	refs := []ocispec.Descriptor{
+		addTestDmverityReferrer(t, store, subject, layer, "a"),
+		addTestDmverityReferrer(t, store, subject, layer, "b"),
+	}
+	type result struct {
+		index int
+		err   error
+	}
+	results := make(chan result, 2)
+	var wg sync.WaitGroup
+	for i := range refs {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			_, err := recordDmverityObservation(ctx, store.Store, subject.Digest, refs[i].Digest, layers)
+			results <- result{index: i, err: err}
+		}(i)
+	}
+	wg.Wait()
+	close(results)
+	winner, successes := -1, 0
+	for r := range results {
+		if r.err == nil {
+			winner = r.index
+			successes++
+		} else {
+			require.ErrorContains(t, r.err, "changes root hash")
+		}
+	}
+	require.Equal(t, 1, successes)
+	info, err := store.Store.Info(ctx, subject.Digest)
+	require.NoError(t, err)
+	require.Equal(t, refs[winner].Digest.String(), info.Labels[dmverityBundleContentLabel])
+	_, err = recordDmverityObservation(ctx, store.Store, subject.Digest, "", layers)
+	require.NoError(t, err)
+	info, err = store.Store.Info(ctx, subject.Digest)
+	require.NoError(t, err)
+	require.Equal(t, refs[winner].Digest.String(), info.Labels[dmverityBundleContentLabel])
 }

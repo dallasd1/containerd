@@ -100,41 +100,6 @@ func (noOpDiffService) Apply(_ context.Context, desc ocispec.Descriptor, _ []mou
 	return desc, nil
 }
 
-func TestHasSignedDmverityManifestForSelectedPlatform(t *testing.T) {
-	ctx := namespaces.WithNamespace(context.Background(), "test")
-	store := imagetest.NewContentStore(ctx, t)
-	config := store.JSONObject(ocispec.MediaTypeImageConfig, ocispec.Image{})
-	layer := store.RandomBlob(ocispec.MediaTypeImageLayer, 16)
-	manifest := store.Manifest(config, layer)
-	index := store.Index(imagetest.AddPlatform(manifest, platforms.DefaultSpec()))
-
-	client, err := containerd.New("", containerd.WithServices(containerd.WithContentStore(store.Store)))
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, client.Close()) })
-	image := containerd.NewImageWithPlatform(client, images.Image{
-		Name:   "test-image",
-		Target: index.Descriptor,
-	}, platforms.Default())
-
-	_, err = store.Update(ctx, content.Info{
-		Digest: manifest.Descriptor.Digest,
-		Labels: map[string]string{"containerd.io/gc.ref.content.dmverity": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
-	}, "labels")
-	require.NoError(t, err)
-	signed, err := snpkg.ImageHasDmverityReferrer(ctx, image.ContentStore(), image.Target(), platforms.Default())
-	require.NoError(t, err)
-	require.True(t, signed)
-
-	_, err = store.Update(ctx, content.Info{
-		Digest: manifest.Descriptor.Digest,
-		Labels: map[string]string{"containerd.io/snapshot/erofs.dmverity.no-referrer": "true"},
-	}, "labels")
-	require.NoError(t, err)
-	signed, err = snpkg.ImageHasDmverityReferrer(ctx, image.ContentStore(), image.Target(), platforms.Default())
-	require.NoError(t, err)
-	require.False(t, signed)
-}
-
 func TestWithNewSnapshotValidatesKnownSignedImageBeforeSnapshotCreation(t *testing.T) {
 	ctx := leases.WithLease(namespaces.WithNamespace(context.Background(), "test"), "test-lease")
 	store := imagetest.NewContentStore(ctx, t)
@@ -193,40 +158,6 @@ func TestWithNewSnapshotUnsignedImageDoesNotRequireIntrospection(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, 1, snapshotter.prepares)
 	require.Equal(t, 1, introspectionCalls, "only the underlying snapshot option resolution should introspect")
-}
-
-func TestNewSnapshotParentResolverSelectsSignedLane(t *testing.T) {
-	ctx := leases.WithLease(namespaces.WithNamespace(context.Background(), "test"), "test-lease")
-	store := imagetest.NewContentStore(ctx, t)
-	diffIDs := []digest.Digest{digest.FromString("base diff"), digest.FromString("layer diff")}
-	chainID := identity.ChainID(diffIDs).String()
-	config := store.JSONObject(ocispec.MediaTypeImageConfig, ocispec.Image{
-		RootFS: ocispec.RootFS{Type: "layers", DiffIDs: diffIDs},
-	})
-	layer := store.RandomBlob(ocispec.MediaTypeImageLayer, 16)
-	manifest := store.Manifest(config, store.RandomBlob(ocispec.MediaTypeImageLayer, 16), layer)
-	snapshotter := &preflightSnapshotter{}
-	client, err := containerd.New("", containerd.WithServices(
-		containerd.WithContentStore(store.Store),
-		containerd.WithSnapshotters(map[string]snapshots.Snapshotter{"erofs": snapshotter}),
-		containerd.WithIntrospectionService(signedDmverityIntrospection{}),
-	))
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, client.Close()) })
-	image := containerd.NewImageWithPlatform(client, images.Image{
-		Name:   "signed-image",
-		Target: manifest.Descriptor,
-	}, platforms.Default())
-
-	err = containerd.WithNewSnapshotParentResolver("container-id", image, func(_ context.Context, parent string) (string, error) {
-		require.Equal(t, chainID, parent)
-		return snpkg.DmveritySnapshotKey(parent)
-	})(ctx, client, &containers.Container{Snapshotter: "erofs"})
-	require.NoError(t, err)
-	expected, err := snpkg.DmveritySnapshotKey(chainID)
-	require.NoError(t, err)
-	require.Equal(t, expected, snapshotter.parent)
-	require.NotEqual(t, chainID, snapshotter.parent)
 }
 
 func TestWithNewSnapshotPreflightsAndCreatesFromSignedLane(t *testing.T) {

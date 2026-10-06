@@ -43,7 +43,7 @@ import (
 )
 
 func TestLayerPolicyCallbacks(t *testing.T) {
-	for _, mode := range []string{"nil", "new snapshot", "prepare error", "cache hit", "concurrent commit"} {
+	for _, mode := range []string{"new snapshot", "prepare error", "cache hit", "concurrent commit"} {
 		t.Run(mode, func(t *testing.T) {
 			ctx := t.Context()
 			store := imagetest.NewContentStore(ctx, t)
@@ -61,40 +61,34 @@ func TestLayerPolicyCallbacks(t *testing.T) {
 			lockKey := "sn://test/" + selectedKey
 			preparations := 0
 			validations := 0
-			if mode != "nil" {
-				up.PrepareLayer = func(_ context.Context, _ ocispec.Descriptor, chainID string) (snapshots.LayerPreparation, error) {
-					preparations++
-					require.Equal(t, diffID.String(), chainID)
-					require.False(t, locker.isHeld(lockKey), "policy must be derived before locking")
-					if mode == "prepare error" {
-						return snapshots.LayerPreparation{}, sentinel
-					}
-					return snapshots.LayerPreparation{
-						Key:         selectedKey,
-						GCQualifier: "policy",
-						Labels:      map[string]string{"test.policy": "selected"},
-						ValidateExisting: func(info snapshots.Info) error {
-							validations++
-							require.True(t, locker.isHeld(lockKey), "validation must hold the selected key's lock")
-							require.Equal(t, "old", info.Labels["test.policy"])
-							return sentinel
-						},
-					}, nil
+			up.PrepareLayer = func(_ context.Context, _ ocispec.Descriptor, chainID string) (snapshots.LayerPreparation, error) {
+				preparations++
+				require.Equal(t, diffID.String(), chainID)
+				require.False(t, locker.isHeld(lockKey), "policy must be derived before locking")
+				if mode == "prepare error" {
+					return snapshots.LayerPreparation{}, sentinel
 				}
-				if mode == "cache hit" || mode == "concurrent commit" {
-					sn.committed[selectedKey] = snapshots.Info{Labels: map[string]string{"test.policy": "old"}}
-				}
-				sn.alreadyExistsOnCommit = mode == "concurrent commit"
+				return snapshots.LayerPreparation{
+					Key:         selectedKey,
+					GCQualifier: "policy",
+					Labels:      map[string]string{"test.policy": "selected"},
+					ValidateExisting: func(info snapshots.Info) error {
+						validations++
+						require.True(t, locker.isHeld(lockKey), "validation must hold the selected key's lock")
+						require.Equal(t, "old", info.Labels["test.policy"])
+						return sentinel
+					},
+				}, nil
 			}
+			if mode == "cache hit" || mode == "concurrent commit" {
+				sn.committed[selectedKey] = snapshots.Info{Labels: map[string]string{"test.policy": "old"}}
+			}
+			sn.alreadyExistsOnCommit = mode == "concurrent commit"
 			u, err := NewUnpacker(ctx, store.Store, WithUnpackPlatform(up), WithDuplicationSuppressor(locker))
 			require.NoError(t, err)
 			require.NoError(t, images.Dispatch(ctx, u.Unpack(images.ChildrenHandler(store.Store)), nil, manifest.Descriptor))
 			_, err = u.Wait()
-			if mode == "nil" {
-				require.NoError(t, err)
-				require.Contains(t, sn.committed, diffID.String())
-				require.Zero(t, preparations)
-			} else if mode == "new snapshot" {
+			if mode == "new snapshot" {
 				require.NoError(t, err)
 				require.Equal(t, "selected", sn.committed[selectedKey].Labels["test.policy"])
 				require.Equal(t, selectedKey, sn.committed[selectedKey].Labels[labelSnapshotRef])
@@ -105,9 +99,7 @@ func TestLayerPolicyCallbacks(t *testing.T) {
 			} else {
 				require.ErrorIs(t, err, sentinel)
 			}
-			if mode != "nil" {
-				require.Equal(t, 1, preparations)
-			}
+			require.Equal(t, 1, preparations)
 			require.False(t, locker.isHeld(lockKey))
 			if mode == "cache hit" || mode == "concurrent commit" {
 				require.Equal(t, 1, validations)
@@ -650,72 +642,50 @@ func TestUnpackRequiresValidatedReferrersForSignedIdentity(t *testing.T) {
 	}
 }
 
-func TestUnpackRejectsConflictingSignedIdentityInSignedLane(t *testing.T) {
-	ctx := context.Background()
-	store := imagetest.NewContentStore(ctx, t)
-
-	rootHashes := []string{
-		"b4e1c9f30a5d7e2186c4fb0937ad5e2c81f6b3a4d9c0e7182b5a6f3c4d9e0a71",
-		"c5f2dae41b6e8f3297d50ac1a48be6f3d20a7c4b5eadf8293c6b7a4d5eaf1b82",
-	}
-
-	var sn *recordingSnapshotter
-	for i, rootHash := range rootHashes {
-		manifest, layer, diffID, _ := signedImageFixture(t, store, rootHash)
-		if sn == nil {
-			sn = &recordingSnapshotter{committed: map[string]snapshots.Info{}}
-		}
-		u, err := NewUnpacker(ctx, store.Store, WithUnpackPlatform(Platform{
-			SnapshotterKey:          "erofs",
-			Snapshotter:             sn,
-			SnapshotterCapabilities: []string{plugins.CapabilityDmverityReferrers},
-			Applier:                 diffIDApplier{layer.Digest: diffID},
-			PrepareLayer:            snpkg.PrepareDmverityLayer,
-		}))
-		require.NoError(t, err)
-
-		handler := snpkg.AppendCachedSignatureHandlerWrapper(store.Store)(
-			images.ChildrenHandler(store.Store))
-		require.NoError(t, images.Dispatch(ctx, u.Unpack(handler), nil, manifest.Descriptor))
-		_, err = u.Wait()
-		if i == 0 {
-			require.NoError(t, err)
-			key, keyErr := snpkg.DmveritySnapshotKey(identity.ChainID([]digest.Digest{diffID}).String())
-			require.NoError(t, keyErr)
-			require.Contains(t, sn.committed, key)
-		} else {
-			require.ErrorContains(t, err, "violates layer policy")
-		}
-	}
-}
-
-func TestUnpackReusesSameRootHashWithNewSignatureWithoutMutatingSnapshot(t *testing.T) {
-	ctx := context.Background()
-	store := imagetest.NewContentStore(ctx, t)
-	rootHash := "b4e1c9f30a5d7e2186c4fb0937ad5e2c81f6b3a4d9c0e7182b5a6f3c4d9e0a71"
-	sn := &recordingSnapshotter{committed: map[string]snapshots.Info{}}
-
-	for i, signatureText := range []string{"old signature", "new signature"} {
-		manifest, layer, diffID, signatureDigest := signedImageFixture(t, store, rootHash, signatureText)
-		u, err := NewUnpacker(ctx, store.Store, WithUnpackPlatform(Platform{
-			SnapshotterKey:          "erofs",
-			Snapshotter:             sn,
-			SnapshotterCapabilities: []string{plugins.CapabilityDmverityReferrers},
-			Applier:                 diffIDApplier{layer.Digest: diffID},
-			PrepareLayer:            snpkg.PrepareDmverityLayer,
-		}))
-		require.NoError(t, err)
-		handler := snpkg.AppendCachedSignatureHandlerWrapper(store.Store)(images.ChildrenHandler(store.Store))
-		require.NoError(t, images.Dispatch(ctx, u.Unpack(handler), nil, manifest.Descriptor))
-		_, err = u.Wait()
-		require.NoError(t, err)
-		key, keyErr := snpkg.DmveritySnapshotKey(identity.ChainID([]digest.Digest{diffID}).String())
-		require.NoError(t, keyErr)
-		if i == 0 {
-			require.Equal(t, signatureDigest.String(), sn.committed[key].Labels["containerd.io/snapshot/erofs.dmverity.signature-digest"])
-		} else {
-			require.NotEqual(t, signatureDigest.String(), sn.committed[key].Labels["containerd.io/snapshot/erofs.dmverity.signature-digest"])
-		}
+func TestUnpackSignedSnapshotCachePolicy(t *testing.T) {
+	const originalRoot = "b4e1c9f30a5d7e2186c4fb0937ad5e2c81f6b3a4d9c0e7182b5a6f3c4d9e0a71"
+	for _, tc := range []struct {
+		name     string
+		rootHash string
+		wantErr  bool
+	}{
+		{name: "different root rejected", rootHash: "c5f2dae41b6e8f3297d50ac1a48be6f3d20a7c4b5eadf8293c6b7a4d5eaf1b82", wantErr: true},
+		{name: "same root keeps original signature", rootHash: originalRoot},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := t.Context()
+			store := imagetest.NewContentStore(ctx, t)
+			sn := &recordingSnapshotter{committed: map[string]snapshots.Info{}}
+			for i, signatureText := range []string{"old signature", "new signature"} {
+				rootHash := originalRoot
+				if i > 0 {
+					rootHash = tc.rootHash
+				}
+				manifest, layer, diffID, _ := signedImageFixture(t, store, rootHash, signatureText)
+				u, err := NewUnpacker(ctx, store.Store, WithUnpackPlatform(Platform{
+					SnapshotterKey:          "erofs",
+					Snapshotter:             sn,
+					SnapshotterCapabilities: []string{plugins.CapabilityDmverityReferrers},
+					Applier:                 diffIDApplier{layer.Digest: diffID},
+					PrepareLayer:            snpkg.PrepareDmverityLayer,
+				}))
+				require.NoError(t, err)
+				handler := snpkg.AppendCachedSignatureHandlerWrapper(store.Store)(images.ChildrenHandler(store.Store))
+				require.NoError(t, images.Dispatch(ctx, u.Unpack(handler), nil, manifest.Descriptor))
+				_, err = u.Wait()
+				if i > 0 && tc.wantErr {
+					require.ErrorContains(t, err, "violates layer policy")
+				} else {
+					require.NoError(t, err)
+				}
+				key, err := snpkg.DmveritySnapshotKey(identity.ChainID([]digest.Digest{diffID}).String())
+				require.NoError(t, err)
+				require.Contains(t, sn.committed, key)
+				require.Len(t, sn.committed, 1)
+				require.Equal(t, originalRoot, sn.committed[key].Labels["containerd.io/snapshot/erofs.dmverity.root-hash"])
+				require.Equal(t, digest.FromString("old signature").String(), sn.committed[key].Labels["containerd.io/snapshot/erofs.dmverity.signature-digest"])
+			}
+		})
 	}
 }
 
@@ -764,11 +734,12 @@ func TestUnpackValidatesConcurrentChainIDCommit(t *testing.T) {
 func TestOrdinaryUnpackDoesNotInspectSeparateSignedLane(t *testing.T) {
 	ctx := context.Background()
 	store := imagetest.NewContentStore(ctx, t)
-	manifest, layer, diffID, _ := signedImageFixture(
-		t,
-		store,
-		"b4e1c9f30a5d7e2186c4fb0937ad5e2c81f6b3a4d9c0e7182b5a6f3c4d9e0a71",
-	)
+	diffID := digest.FromString("uncompressed layer")
+	config := store.JSONObject(ocispec.MediaTypeImageConfig, ocispec.Image{
+		RootFS: ocispec.RootFS{Type: "layers", DiffIDs: []digest.Digest{diffID}},
+	})
+	layer := store.Blob(ocispec.MediaTypeImageLayerGzip, []byte("layer"))
+	manifest := store.Manifest(config, layer)
 	signedKey, err := snpkg.DmveritySnapshotKey(diffID.String())
 	require.NoError(t, err)
 	sn := &recordingSnapshotter{
@@ -780,7 +751,7 @@ func TestOrdinaryUnpackDoesNotInspectSeparateSignedLane(t *testing.T) {
 		SnapshotterKey:          "erofs",
 		Snapshotter:             sn,
 		SnapshotterCapabilities: []string{plugins.CapabilityDmverityReferrers},
-		Applier:                 diffIDApplier{layer.Digest: diffID},
+		Applier:                 diffIDApplier{layer.Descriptor.Digest: diffID},
 		PrepareLayer:            snpkg.PrepareDmverityLayer,
 	}))
 	require.NoError(t, err)

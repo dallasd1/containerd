@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"maps"
+	"strings"
 
 	"github.com/containerd/containerd/v2/core/content"
 	"github.com/containerd/containerd/v2/core/images"
@@ -78,7 +79,6 @@ type dmverityBundle struct {
 	layers map[string]*DmverityTarget
 }
 
-// fetchSignatures also reports whether the fetcher supports referrer discovery.
 func fetchSignatures(
 	ctx context.Context,
 	fetcher remotes.Fetcher,
@@ -130,18 +130,18 @@ func fetchSignatures(
 	if err := remotes.Fetch(ctx, store, fetcher, selected); err != nil && !errdefs.IsAlreadyExists(err) {
 		return nil, true, fmt.Errorf("fetch dm-verity referrer manifest %s: %w", selected.Digest, err)
 	}
-	infos, err := readDmverityBundle(ctx, store, selected, subject, imageLayers)
+	info, err := readDmverityBundle(ctx, store, selected, subject, imageLayers)
 	if err != nil {
 		return nil, true, err
 	}
 	log.G(ctx).WithFields(log.Fields{
 		"bundle":   selected.Digest,
 		"manifest": subject.Digest,
-		"layers":   len(infos),
+		"layers":   len(info),
 	}).Info("Validated signed EROFS dm-verity materialization bundle")
 	return &dmverityBundle{
 		desc:   selected,
-		layers: infos,
+		layers: info,
 	}, true, nil
 }
 
@@ -177,7 +177,7 @@ func readDmverityBundleManifest(
 	}
 
 	// Group the bundle's payloads by the image layer they materialize.
-	infos := make(map[string]*DmverityTarget)
+	infoMap := make(map[string]*DmverityTarget)
 	for _, layer := range manifest.Layers {
 		switch layer.MediaType {
 		case erofsMetadataArtifactMediaType, merkleTreeArtifactMediaType, layerSignatureMediaType:
@@ -196,10 +196,10 @@ func readDmverityBundleManifest(
 			return nil, fmt.Errorf("bundle descriptor %s has invalid payload size %d", layer.Digest, layer.Size)
 		}
 
-		info := infos[sourceDigest]
+		info := infoMap[sourceDigest]
 		if info == nil {
 			info = &DmverityTarget{}
-			infos[sourceDigest] = info
+			infoMap[sourceDigest] = info
 		}
 		switch layer.MediaType {
 		case erofsMetadataArtifactMediaType:
@@ -227,7 +227,7 @@ func readDmverityBundleManifest(
 
 	// Require all three payloads for every selected image layer before using the bundle.
 	for sourceDigest := range imageLayers {
-		info := infos[sourceDigest]
+		info := infoMap[sourceDigest]
 		if info == nil ||
 			info.Metadata.Digest == "" ||
 			info.Tree.Digest == "" ||
@@ -235,7 +235,7 @@ func readDmverityBundleManifest(
 			return nil, fmt.Errorf("incomplete dm-verity artifacts for layer %s", sourceDigest)
 		}
 	}
-	return infos, nil
+	return infoMap, nil
 }
 
 // AppendSignatureHandlerWrapper fetches, validates, and retains the dm-verity referrer for an image manifest.
@@ -280,7 +280,7 @@ func (h *dmverityHandler) Handle(
 			return nil, err
 		}
 		if discovered && selected == nil {
-			signed, err := recordDmverityObservation(ctx, h.store, desc.Digest, "")
+			signed, err := recordDmverityObservation(ctx, h.store, desc.Digest, "", imageLayers)
 			if err != nil {
 				return nil, fmt.Errorf("record absence of dm-verity referrer for %s: %w", desc.Digest, err)
 			}
@@ -294,7 +294,7 @@ func (h *dmverityHandler) Handle(
 			if err := persistSignatureReferrer(ctx, h.handler, h.store, selected); err != nil {
 				return nil, err
 			}
-			_, err := recordDmverityObservation(ctx, h.store, desc.Digest, selected.desc.Digest)
+			_, err := recordDmverityObservation(ctx, h.store, desc.Digest, selected.desc.Digest, imageLayers)
 			if err != nil {
 				return nil, fmt.Errorf("record dm-verity referrer for %s: %w", desc.Digest, err)
 			}
@@ -302,23 +302,24 @@ func (h *dmverityHandler) Handle(
 		}
 	}
 
-	infos, observed, err := loadRetainedDmverityBundle(ctx, h.store, desc, imageLayers)
+	info, observed, err := loadRetainedDmverityBundle(ctx, h.store, desc, imageLayers)
 	if err != nil {
 		return nil, err
 	}
-	if !observed || infos == nil {
+	if !observed || info == nil {
 		if requireSigned {
 			return nil, fmt.Errorf("manifest %s retained a signed observation without a usable bundle", desc.Digest)
 		}
 		return children, nil
 	}
-	return annotateDmverityTargets(children, infos)
+	return annotateDmverityTargets(children, info)
 }
 
 func recordDmverityObservation(
 	ctx context.Context,
 	store content.Store,
 	subject, referrer digest.Digest,
+	imageLayers map[string]struct{},
 ) (bool, error) {
 	if err := dmverityObservationLocks.Lock(ctx, subject.String()); err != nil {
 		return false, err
@@ -347,6 +348,21 @@ func recordDmverityObservation(
 	if currentSigned {
 		if currentDigest == referrer {
 			return true, nil
+		}
+		subjectDesc := ocispec.Descriptor{Digest: subject}
+		retained, _, err := loadRetainedDmverityBundle(ctx, store, subjectDesc, imageLayers)
+		if err != nil {
+			return false, err
+		}
+		replacement, err := readDmverityBundle(ctx, store, ocispec.Descriptor{Digest: referrer}, subjectDesc, imageLayers)
+		if err != nil {
+			return false, err
+		}
+		for layerDigest, target := range retained {
+			next := replacement[layerDigest]
+			if next == nil || !strings.EqualFold(target.RootHash, next.RootHash) {
+				return false, fmt.Errorf("dm-verity referrer replacement for manifest %s changes root hash for layer %s", subject, layerDigest)
+			}
 		}
 	}
 
@@ -414,11 +430,11 @@ func loadRetainedDmverityBundle(
 	if noReferrer {
 		return nil, true, nil
 	}
-	infos, err := readDmverityBundle(ctx, store, ocispec.Descriptor{Digest: referrerDigest}, subject, imageLayers)
+	targets, err := readDmverityBundle(ctx, store, ocispec.Descriptor{Digest: referrerDigest}, subject, imageLayers)
 	if err != nil {
 		return nil, true, fmt.Errorf("read retained signed dm-verity bundle for manifest %s: %w", subject.Digest, err)
 	}
-	for layerDigest, target := range infos {
+	for layerDigest, target := range targets {
 		for _, payload := range []ocispec.Descriptor{target.Metadata, target.Tree, target.Signature} {
 			payloadInfo, err := store.Info(ctx, payload.Digest)
 			if err != nil {
@@ -440,7 +456,7 @@ func loadRetainedDmverityBundle(
 			}
 		}
 	}
-	return infos, true, nil
+	return targets, true, nil
 }
 
 // DmverityManifestHasSignedReferrer reports whether discovery retained a
@@ -501,14 +517,14 @@ func sanitizeDmverityImageLayers(children []ocispec.Descriptor) map[string]struc
 
 func annotateDmverityTargets(
 	children []ocispec.Descriptor,
-	infos map[string]*DmverityTarget,
+	infoMap map[string]*DmverityTarget,
 ) ([]ocispec.Descriptor, error) {
 	for i := range children {
 		child := &children[i]
 		if !images.IsLayerType(child.MediaType) {
 			continue
 		}
-		info := infos[child.Digest.String()]
+		info := infoMap[child.Digest.String()]
 		target, err := targetAnnotation(info)
 		if err != nil {
 			return nil, err

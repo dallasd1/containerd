@@ -415,17 +415,6 @@ func Open(params *Params, name, dataDevice, hashDevice string, rootHash []byte, 
 	}
 	defer c.Close()
 
-	created := false
-	defer func() {
-		if !created {
-			_ = c.RemoveDevice(name)
-		}
-	}()
-
-	if _, err := c.CreateDevice(name); err != nil {
-		return "", err
-	}
-
 	target := dm.Target{
 		SectorStart: 0,
 		Length:      lengthSectors,
@@ -433,20 +422,13 @@ func Open(params *Params, name, dataDevice, hashDevice string, rootHash []byte, 
 		Params:      targetParams,
 	}
 
-	if err := c.LoadTable(name, []dm.Target{target}); err != nil {
-		_ = c.RemoveDevice(name)
-		return "", fmt.Errorf("load table: %w", err)
-	}
-
-	if err := c.SuspendDevice(name, false); err != nil {
-		_ = c.RemoveDevice(name)
+	if err := activateDevice(c, name, target); err != nil {
 		if signatureFile != "" && errors.Is(err, unix.EKEYREJECTED) {
-			return "", fmt.Errorf("signature verification failed: key rejected by kernel (check trusted keyring)")
+			return "", fmt.Errorf("signature verification failed: key rejected by kernel (check trusted keyring): %w", err)
 		}
-		return "", fmt.Errorf("resume device: %w", err)
+		return "", err
 	}
 
-	created = true
 	devPath := "/dev/mapper/" + name
 
 	for i := 0; i < 50; i++ {
@@ -457,6 +439,33 @@ func Open(params *Params, name, dataDevice, hashDevice string, rootHash []byte, 
 	}
 
 	return devPath, nil
+}
+
+type deviceActivator interface {
+	CreateDevice(string) (uint64, error)
+	LoadTable(string, []dm.Target) error
+	SuspendDevice(string, bool) error
+	RemoveDevice(string) error
+}
+
+func activateDevice(c deviceActivator, name string, target dm.Target) (retErr error) {
+	if _, err := c.CreateDevice(name); err != nil {
+		return err
+	}
+	defer func() {
+		if retErr != nil {
+			if err := c.RemoveDevice(name); err != nil {
+				retErr = errors.Join(retErr, fmt.Errorf("remove failed activation %q: %w", name, err))
+			}
+		}
+	}()
+	if err := c.LoadTable(name, []dm.Target{target}); err != nil {
+		return fmt.Errorf("load table: %w", err)
+	}
+	if err := c.SuspendDevice(name, false); err != nil {
+		return fmt.Errorf("resume device: %w", err)
+	}
+	return nil
 }
 
 func Close(name string) error {
