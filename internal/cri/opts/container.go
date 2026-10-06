@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"slices"
 	"strings"
 
 	"github.com/containerd/continuity/fs"
@@ -37,13 +38,33 @@ import (
 	"github.com/containerd/containerd/v2/core/snapshots"
 	"github.com/containerd/containerd/v2/core/unpack"
 	snpkg "github.com/containerd/containerd/v2/pkg/snapshotters"
+	"github.com/containerd/containerd/v2/plugins"
 )
 
 // WithNewSnapshot wraps `containerd.WithNewSnapshot` so that if creating the
 // snapshot fails we make sure the image is actually unpacked and retry.
 func WithNewSnapshot(id string, i containerd.Image, appendSnapshotLabels bool, opts ...snapshots.Opt) containerd.NewContainerOpts {
-	f := containerd.WithNewSnapshot(id, i, opts...)
 	return func(ctx context.Context, client *containerd.Client, c *containers.Container) error {
+		f := containerd.WithNewSnapshot(id, i, opts...)
+		signed, err := snpkg.ImageHasDmverityReferrer(ctx, i.ContentStore(), i.Target(), platforms.Default())
+		if err != nil {
+			return fmt.Errorf("failed to inspect signed dm-verity image: %w", err)
+		}
+		if signed {
+			capabilities, err := client.GetSnapshotterCapabilities(ctx, c.Snapshotter)
+			if err != nil {
+				return fmt.Errorf("failed to get capabilities of snapshotter %q: %w", c.Snapshotter, err)
+			}
+			if slices.Contains(capabilities, plugins.CapabilityDmverityReferrers) {
+				if err := unpackImage(ctx, client, i, c.Snapshotter, appendSnapshotLabels); err != nil {
+					return fmt.Errorf("signed dm-verity image preflight failed: %w", err)
+				}
+				f = containerd.WithNewSnapshotParentResolver(id, i, func(_ context.Context, chainID string) (string, error) {
+					return snpkg.DmveritySnapshotKey(chainID)
+				}, opts...)
+			}
+		}
+
 		if err := f(ctx, client, c); err != nil {
 			if !errdefs.IsNotFound(err) {
 				return err
@@ -72,16 +93,20 @@ func unpackImage(ctx context.Context, client *containerd.Client, i containerd.Im
 		return err
 	}
 
-	u, err := unpack.NewUnpacker(
-		ctx,
-		i.ContentStore(),
-		unpack.WithUnpackPlatform(unpack.Platform{
-			Platform:                matcher,
-			SnapshotterKey:          snapshotter,
-			Snapshotter:             client.SnapshotService(snapshotter),
-			Applier:                 client.DiffService(),
-			SnapshotterCapabilities: capabilities,
-		}),
+	signedDmverity := slices.Contains(capabilities, plugins.CapabilityDmverityReferrers)
+
+	up := unpack.Platform{
+		Platform:                matcher,
+		SnapshotterKey:          snapshotter,
+		Snapshotter:             client.SnapshotService(snapshotter),
+		Applier:                 client.DiffService(),
+		SnapshotterCapabilities: capabilities,
+	}
+	if signedDmverity {
+		up.PrepareLayer = snpkg.PrepareDmverityLayer
+	}
+	u, err := unpack.NewUnpacker(ctx, i.ContentStore(),
+		unpack.WithUnpackPlatform(up),
 		unpack.WithUnpackLimiter(semaphore.NewWeighted(3)),
 	)
 	if err != nil {
@@ -95,6 +120,9 @@ func unpackImage(ctx context.Context, client *containerd.Client, i containerd.Im
 	var h images.Handler = childrenHandler
 	if appendSnapshotLabels {
 		h = snpkg.AppendInfoHandlerWrapper(i.Name())(h)
+	}
+	if signedDmverity {
+		h = snpkg.AppendCachedSignatureHandlerWrapper(i.ContentStore())(h)
 	}
 
 	if err := images.Dispatch(ctx, u.Unpack(h), nil, i.Target()); err != nil {

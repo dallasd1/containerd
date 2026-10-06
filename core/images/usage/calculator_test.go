@@ -20,8 +20,10 @@ import (
 	"context"
 	"testing"
 
+	"github.com/containerd/containerd/v2/core/content"
 	"github.com/containerd/containerd/v2/core/images"
 	"github.com/containerd/containerd/v2/core/images/imagetest"
+	"github.com/containerd/containerd/v2/core/snapshots"
 	"github.com/containerd/log/logtest"
 	"github.com/containerd/platforms"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
@@ -96,4 +98,45 @@ func TestUsageCalculation(t *testing.T) {
 		})
 	}
 
+}
+
+type qualifiedReferenceSnapshotter struct {
+	snapshots.Snapshotter
+	key string
+}
+
+func (s *qualifiedReferenceSnapshotter) Usage(_ context.Context, key string) (snapshots.Usage, error) {
+	s.key = key
+	return snapshots.Usage{Size: 10}, nil
+}
+
+func TestUsageCalculationUsesQualifiedSnapshotReference(t *testing.T) {
+	ctx := context.Background()
+	cs := imagetest.NewContentStore(ctx, t)
+	target := imagetest.SimpleManifest(50)(cs)
+	key := "dmverity-0123456789"
+	_, err := cs.Store.Update(ctx, content.Info{
+		Digest: target.Children[0].Descriptor.Digest,
+		Labels: map[string]string{
+			"containerd.io/gc.ref.snapshot.erofs/dmverity": key,
+		},
+	}, "labels.containerd.io/gc.ref.snapshot.erofs/dmverity")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	snapshotter := &qualifiedReferenceSnapshotter{}
+	img := images.Image{Name: "qualified", Target: target.Descriptor}
+	_, err = CalculateImageUsage(ctx, img, cs, WithSnapshotters(func(name string) snapshots.Snapshotter {
+		if name != "erofs" {
+			t.Errorf("snapshotter lookup received %q, want erofs", name)
+		}
+		return snapshotter
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshotter.key != key {
+		t.Fatalf("snapshot usage used key %q, want %q", snapshotter.key, key)
+	}
 }

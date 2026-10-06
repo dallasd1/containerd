@@ -25,6 +25,7 @@ import (
 	"net/http"
 	"net/url"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -54,6 +55,7 @@ import (
 	"github.com/containerd/containerd/v2/internal/cri/util"
 	snpkg "github.com/containerd/containerd/v2/pkg/snapshotters"
 	"github.com/containerd/containerd/v2/pkg/tracing"
+	"github.com/containerd/containerd/v2/plugins"
 )
 
 // For image management:
@@ -184,6 +186,14 @@ func (c *CRIImageService) PullImage(ctx context.Context, name string, credential
 	// TODO: Add support for DisableSnapshotAnnotations, DiscardUnpackedLayers, ImagePullWithSyncFs and unpackDuplicationSuppressor
 	var image containerd.Image
 	if c.config.UseLocalImagePull {
+		// Local pull is currently unsupported with dm-verity referrers.
+		capabilities, capErr := c.client.GetSnapshotterCapabilities(ctx, snapshotter)
+		if capErr != nil {
+			return "", fmt.Errorf("failed to get capabilities of snapshotter %q: %w", snapshotter, capErr)
+		}
+		if slices.Contains(capabilities, plugins.CapabilityDmverityReferrers) {
+			return "", fmt.Errorf("snapshotter %q requires the transfer service for dm-verity referrers, disable local image pull: %w", snapshotter, errdefs.ErrNotImplemented)
+		}
 		image, err = c.pullImageWithLocalPull(ctx, ref, credentials, snapshotter, labels, imagePullProgressTimeout)
 	} else {
 		image, err = c.pullImageWithTransferService(ctx, ref, credentials, snapshotter, labels, imagePullProgressTimeout)

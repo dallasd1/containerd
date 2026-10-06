@@ -189,6 +189,7 @@ func (ts *localTransferService) pull(ctx context.Context, ir transfer.ImageFetch
 
 	// First find suitable platforms to unpack into
 	// If image storer is also an unpacker type, i.e implemented UnpackPlatforms() func
+	var matchedPlatforms []unpack.Platform
 	if iu, ok := is.(transfer.ImageUnpacker); ok {
 		unpacks := iu.UnpackPlatforms()
 		if len(unpacks) > 0 {
@@ -205,6 +206,7 @@ func (ts *localTransferService) pull(ctx context.Context, ir transfer.ImageFetch
 						mu.ApplyOpts = append(mu.ApplyOpts, diff.WithProgress(progressTracker.ExtractProgress))
 					}
 					uopts = append(uopts, unpack.WithUnpackPlatform(mu))
+					matchedPlatforms = append(matchedPlatforms, mu)
 				} else {
 					log.G(ctx).WithFields(log.Fields{
 						"platform":    platforms.FormatAll(u.Platform),
@@ -229,8 +231,20 @@ func (ts *localTransferService) pull(ctx context.Context, ir transfer.ImageFetch
 			if err != nil {
 				return fmt.Errorf("unable to initialize unpacker: %w", err)
 			}
-			handler = unpacker.Unpack(handler)
 		}
+	}
+
+	if ts.config.PullHandlerWrapper != nil {
+		wrapper, err := ts.config.PullHandlerWrapper(ctx, fetcher, store, unpacker != nil, matchedPlatforms)
+		if err != nil {
+			return fmt.Errorf("create pull handler wrapper: %w", err)
+		}
+		if wrapper != nil {
+			handler = wrapper(handler)
+		}
+	}
+	if unpacker != nil {
+		handler = unpacker.Unpack(handler)
 	}
 
 	if err := images.Dispatch(ctx, handler, nil, desc); err != nil {

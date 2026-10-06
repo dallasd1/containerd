@@ -208,13 +208,6 @@ func (s erofsDiff) Apply(ctx context.Context, desc ocispec.Descriptor, mounts []
 			return emptyDesc, err
 		}
 		log.G(ctx).WithField("path", layerBlobPath).Debug("Applied layer with compressed EROFS blob")
-	} else if s.enableTarIndex {
-		// Use the tar index method: generate tar index and append tar
-		err = erofsutils.GenerateTarIndexAndAppendTar(ctx, rc, layerBlobPath, u.String(), s.mkfsExtraOpts)
-		if err != nil {
-			return emptyDesc, fmt.Errorf("failed to generate tar index: %w", err)
-		}
-		log.G(ctx).WithField("path", layerBlobPath).Debug("Applied layer using tar index mode")
 	} else if dmverityReferrersPresent {
 		if err := s.applySignedTarIndexArtifacts(ctx, desc, layerBlobPath, rc); err != nil {
 			return emptyDesc, err
@@ -224,6 +217,13 @@ func (s erofsDiff) Apply(ctx context.Context, desc ocispec.Descriptor, mounts []
 			Size:      rc.c,
 			Digest:    digester.Digest(),
 		}, nil
+	} else if s.enableTarIndex {
+		// Use the tar index method: generate tar index and append tar
+		err = erofsutils.GenerateTarIndexAndAppendTar(ctx, rc, layerBlobPath, u.String(), s.mkfsExtraOpts)
+		if err != nil {
+			return emptyDesc, fmt.Errorf("failed to generate tar index: %w", err)
+		}
+		log.G(ctx).WithField("path", layerBlobPath).Debug("Applied layer using tar index mode")
 	} else {
 		// Use the tar method: fully convert tar to EROFS
 		err = erofsutils.ConvertTarErofs(ctx, rc, layerBlobPath, u.String(), s.mkfsExtraOpts)
