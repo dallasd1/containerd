@@ -327,6 +327,32 @@ In other words, the EROFS differ can only be used with the EROFS snapshotter;
 otherwise, it will skip to the next differ.  The EROFS snapshotter can work
 with or without the EROFS differ.
 
+## Signed Snapshot Identities
+
+For signed dm-verity referrers, the unpack policy derives each snapshot key as:
+
+```
+sha256("erofs-dmverity-v2\n" + selectedParentKey + "\n" +
+       ordinaryChainID + "\n" + lowercaseRootHash) + "-dmverity-v2"
+```
+
+The first layer has an empty parent key. This keeps signed materializations with
+different roots separate, including descendants whose own root is unchanged but
+whose selected parent differs. Unsigned snapshots retain their ordinary OCI
+ChainIDs. A replacement signature for the same root reuses the existing snapshot
+and its original signature; it does not overwrite cached signature identity.
+
+CRI snapshot creation and unpack readiness resolve this same chain from the
+selected platform manifest and its retained referrer bundle. Each signed top key
+gets a distinct config GC reference
+`containerd.io/gc.ref.snapshot.<snapshotter>/dmverity-<sha256(topKey)>`,
+alongside any plain reference, so variants sharing a config remain reachable.
+
+Legacy `<ChainID>-dmverity` snapshots and their references are left untouched.
+They are not selected by the new policy: a subsequent signed unpack materializes
+the versioned chain alongside them. Existing containers can keep their original
+snapshot parents; no snapshot deletion is required.
+
 ## Tar Index Mode
 
 The EROFS differ also supports a "tar index" mode that offers a unique approach to handling OCI image layers:

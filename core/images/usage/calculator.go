@@ -127,8 +127,13 @@ func CalculateImageUsage(ctx context.Context, i images.Image, provider content.I
 						if !strings.HasPrefix(k, prefix) {
 							continue
 						}
-
-						sn := config.snapshots(k[len(prefix):])
+						
+						// Snapshotter names can now be in the form of <snapshotter>/<snapshot>. For example, "erofs/dmverity".
+						snapshotterName := k[len(prefix):]
+						if separator := strings.IndexByte(snapshotterName, '/'); separator >= 0 {
+							snapshotterName = snapshotterName[:separator]
+						}
+						sn := config.snapshots(snapshotterName)
 						if sn == nil {
 							continue
 						}
