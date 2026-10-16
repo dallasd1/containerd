@@ -59,8 +59,8 @@ func WithNewSnapshot(id string, i containerd.Image, appendSnapshotLabels bool, o
 				if err := unpackImage(ctx, client, i, c.Snapshotter, appendSnapshotLabels); err != nil {
 					return fmt.Errorf("signed dm-verity image preflight failed: %w", err)
 				}
-				f = containerd.WithNewSnapshotParentResolver(id, i, func(_ context.Context, chainID string) (string, error) {
-					return snpkg.DmveritySnapshotKey(chainID)
+				f = containerd.WithNewSnapshotParentResolver(id, i, func(ctx context.Context, _ string) (string, error) {
+					return snpkg.DmverityImageSnapshotKey(ctx, i.ContentStore(), i.Target(), platforms.Default())
 				}, opts...)
 			}
 		}

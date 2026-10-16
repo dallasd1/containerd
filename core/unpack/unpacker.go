@@ -86,9 +86,9 @@ type Platform struct {
 	ApplyOpts []diff.ApplyOpt
 
 	// PrepareLayer derives a layer's snapshot key, GC qualifier, labels, and
-	// validator from its descriptor and OCI ChainID before locking.
+	// validator from its descriptor, OCI ChainID, and selected parent before locking.
 	// A nil callback preserves ordinary unpack behavior.
-	PrepareLayer func(context.Context, ocispec.Descriptor, string) (snapshots.LayerPreparation, error)
+	PrepareLayer func(context.Context, ocispec.Descriptor, string, string) (snapshots.LayerPreparation, error)
 
 	// ConfigType is the supported config type to be considered for unpacking
 	// Defaults to OCI image config
@@ -381,7 +381,11 @@ func (u *Unpacker) unpack(
 	for i, chainID := range chainIDs {
 		selected := snapshots.LayerPreparation{Key: chainID.String()}
 		if unpack.PrepareLayer != nil {
-			selected, err = unpack.PrepareLayer(ctx, layers[i], chainID.String())
+			var parent string
+			if i > 0 {
+				parent = preparations[i-1].Key
+			}
+			selected, err = unpack.PrepareLayer(ctx, layers[i], chainID.String(), parent)
 			if err != nil {
 				return fmt.Errorf("prepare layer policy for %s: %w", layers[i].Digest, err)
 			}

@@ -155,21 +155,30 @@ func TestValidateDmveritySnapshotIdentity(t *testing.T) {
 
 func TestDmveritySnapshotKey(t *testing.T) {
 	chainID := digest.FromString("chain").String()
-	key, err := DmveritySnapshotKey(chainID)
+	root := digest.FromString("root").Encoded()
+	key, err := DmveritySnapshotKey(chainID, "", root)
 	require.NoError(t, err)
-	require.Equal(t, chainID+"-dmverity", key)
+	require.NotEqual(t, chainID+"-dmverity", key)
+	parentKey, err := DmveritySnapshotKey(chainID, key, root)
+	require.NoError(t, err)
+	require.NotEqual(t, key, parentKey)
+	uppercaseKey, err := DmveritySnapshotKey(chainID, "", strings.ToUpper(root))
+	require.NoError(t, err)
+	require.Equal(t, key, uppercaseKey)
+	_, err = DmveritySnapshotKey(chainID, "", "bad-root")
+	require.ErrorContains(t, err, "root hash")
 
 	for _, invalid := range []string{"", "not-a-digest", "sha256:bad", key} {
-		got, err := DmveritySnapshotKey(invalid)
+		got, err := DmveritySnapshotKey(invalid, "", root)
 		require.ErrorContains(t, err, "parse OCI ChainID")
 		require.Empty(t, got)
 	}
 }
 
-func TestPrepareDmverityLayerUsesStableSignedLane(t *testing.T) {
+func TestPrepareDmverityLayerSelectsSignedRepresentation(t *testing.T) {
 	chainID := digest.FromString("chain").String()
 	desc := imagespec.Descriptor{}
-	unsigned, err := PrepareDmverityLayer(t.Context(), desc, chainID)
+	unsigned, err := PrepareDmverityLayer(t.Context(), desc, chainID, "")
 	require.NoError(t, err)
 	require.Equal(t, chainID, unsigned.Key)
 	require.Empty(t, unsigned.GCQualifier)
@@ -178,7 +187,7 @@ func TestPrepareDmverityLayerUsesStableSignedLane(t *testing.T) {
 	require.NoError(t, unsigned.ValidateExisting(snapshots.Info{}))
 
 	desc.Annotations = map[string]string{TargetLayerDmverityLabel: ""}
-	_, err = PrepareDmverityLayer(t.Context(), desc, chainID)
+	_, err = PrepareDmverityLayer(t.Context(), desc, chainID, "")
 	require.ErrorContains(t, err, "parse dm-verity target")
 
 	target := &DmverityTarget{
@@ -189,11 +198,11 @@ func TestPrepareDmverityLayerUsesStableSignedLane(t *testing.T) {
 	}
 	desc.Annotations[TargetLayerDmverityLabel], err = targetAnnotation(target)
 	require.NoError(t, err)
-	signed, err := PrepareDmverityLayer(t.Context(), desc, chainID)
+	signed, err := PrepareDmverityLayer(t.Context(), desc, chainID, "")
 	require.NoError(t, err)
 	require.NotEqual(t, chainID, signed.Key)
-	require.Equal(t, "dmverity", signed.GCQualifier)
-	expectedKey, err := DmveritySnapshotKey(chainID)
+	require.NotEmpty(t, signed.GCQualifier)
+	expectedKey, err := DmveritySnapshotKey(chainID, "", target.RootHash)
 	require.NoError(t, err)
 	require.Equal(t, expectedKey, signed.Key)
 	require.Equal(t, map[string]string{
@@ -208,7 +217,7 @@ func TestPrepareDmverityLayerUsesStableSignedLane(t *testing.T) {
 	target.Signature.Digest = digest.FromString("replacement signature")
 	desc.Annotations[TargetLayerDmverityLabel], err = targetAnnotation(target)
 	require.NoError(t, err)
-	replacedSignature, err := PrepareDmverityLayer(t.Context(), desc, chainID)
+	replacedSignature, err := PrepareDmverityLayer(t.Context(), desc, chainID, "")
 	require.NoError(t, err)
 	require.Equal(t, signed.Key, replacedSignature.Key)
 	require.Equal(t, target.Signature.Digest.String(), replacedSignature.Labels[dmverityReferrerSignatureDigestLabel])
@@ -217,9 +226,16 @@ func TestPrepareDmverityLayerUsesStableSignedLane(t *testing.T) {
 	target.RootHash = digest.FromString("different root").Encoded()
 	desc.Annotations[TargetLayerDmverityLabel], err = targetAnnotation(target)
 	require.NoError(t, err)
-	replacedRoot, err := PrepareDmverityLayer(t.Context(), desc, chainID)
+	replacedRoot, err := PrepareDmverityLayer(t.Context(), desc, chainID, "")
 	require.NoError(t, err)
-	require.Equal(t, signed.Key, replacedRoot.Key)
+	require.NotEqual(t, signed.Key, replacedRoot.Key)
+	require.NotEqual(t, signed.GCQualifier, replacedRoot.GCQualifier)
 	require.Equal(t, target.RootHash, replacedRoot.Labels[dmverityReferrerRootHashLabel])
 	require.ErrorContains(t, replacedRoot.ValidateExisting(snapshots.Info{Labels: signed.Labels}), "different signed dm-verity root hash")
+
+	withParent, err := PrepareDmverityLayer(t.Context(), desc, chainID, signed.Key)
+	require.NoError(t, err)
+	require.NotEqual(t, replacedRoot.Key, withParent.Key)
+	require.ErrorContains(t, withParent.ValidateExisting(snapshots.Info{Labels: withParent.Labels}), "parent")
+	require.NoError(t, withParent.ValidateExisting(snapshots.Info{Parent: signed.Key, Labels: withParent.Labels}))
 }

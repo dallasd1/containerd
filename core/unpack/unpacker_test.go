@@ -61,7 +61,7 @@ func TestLayerPolicyCallbacks(t *testing.T) {
 			lockKey := "sn://test/" + selectedKey
 			preparations := 0
 			validations := 0
-			up.PrepareLayer = func(_ context.Context, _ ocispec.Descriptor, chainID string) (snapshots.LayerPreparation, error) {
+			up.PrepareLayer = func(_ context.Context, _ ocispec.Descriptor, chainID, _ string) (snapshots.LayerPreparation, error) {
 				preparations++
 				require.Equal(t, diffID.String(), chainID)
 				require.False(t, locker.isHeld(lockKey), "policy must be derived before locking")
@@ -137,7 +137,7 @@ func TestLayerPreparationRejectsInvalidSnapshotIdentity(t *testing.T) {
 			u, err := NewUnpacker(ctx, store.Store, WithUnpackPlatform(Platform{
 				Snapshotter: sn,
 				Applier:     diffIDApplier{layer.Descriptor.Digest: diffID},
-				PrepareLayer: func(context.Context, ocispec.Descriptor, string) (snapshots.LayerPreparation, error) {
+				PrepareLayer: func(context.Context, ocispec.Descriptor, string, string) (snapshots.LayerPreparation, error) {
 					return tc.prepared, nil
 				},
 			}))
@@ -168,7 +168,7 @@ func TestLayerPolicyIsPlatformScoped(t *testing.T) {
 		WithUnpackPlatform(Platform{
 			Platform: platforms.Only(other), Snapshotter: sn,
 			Applier: diffIDApplier{layer.Descriptor.Digest: diffID},
-			PrepareLayer: func(context.Context, ocispec.Descriptor, string) (snapshots.LayerPreparation, error) {
+			PrepareLayer: func(context.Context, ocispec.Descriptor, string, string) (snapshots.LayerPreparation, error) {
 				t.Error("unmatched platform policy invoked")
 				return snapshots.LayerPreparation{}, errors.New("wrong platform")
 			},
@@ -216,7 +216,7 @@ func TestStableSnapshotLanesCoexistInEitherOrder(t *testing.T) {
 						layers[0].Descriptor.Digest: diffIDs[0],
 						layers[1].Descriptor.Digest: diffIDs[1],
 					},
-					PrepareLayer: func(_ context.Context, desc ocispec.Descriptor, chainID string) (snapshots.LayerPreparation, error) {
+					PrepareLayer: func(_ context.Context, desc ocispec.Descriptor, chainID, _ string) (snapshots.LayerPreparation, error) {
 						if _, signed := desc.Annotations["test.signed"]; signed {
 							return snapshots.LayerPreparation{Key: "signed-" + chainID, GCQualifier: "dmverity"}, nil
 						}
@@ -623,9 +623,9 @@ func TestUnpackRequiresValidatedReferrersForSignedIdentity(t *testing.T) {
 			require.NoError(t, err)
 
 			if tc.wantSigned {
-				key, err := snpkg.DmveritySnapshotKey(identity.ChainID([]digest.Digest{diffID}).String())
+				key, err := snpkg.DmveritySnapshotKey(identity.ChainID([]digest.Digest{diffID}).String(), "", rootHash)
 				require.NoError(t, err)
-				require.Contains(t, sn.committed, key, "signed layer must use the stable signed lane")
+				require.Contains(t, sn.committed, key, "signed layer must use the selected signed variant")
 				require.NotContains(t, sn.committed, diffID.String())
 				require.Len(t, sn.committed, 1)
 				for _, info := range sn.committed {
@@ -647,9 +647,8 @@ func TestUnpackSignedSnapshotCachePolicy(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
 		rootHash string
-		wantErr  bool
 	}{
-		{name: "different root rejected", rootHash: "c5f2dae41b6e8f3297d50ac1a48be6f3d20a7c4b5eadf8293c6b7a4d5eaf1b82", wantErr: true},
+		{name: "different roots coexist", rootHash: "c5f2dae41b6e8f3297d50ac1a48be6f3d20a7c4b5eadf8293c6b7a4d5eaf1b82"},
 		{name: "same root keeps original signature", rootHash: originalRoot},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -673,17 +672,28 @@ func TestUnpackSignedSnapshotCachePolicy(t *testing.T) {
 				handler := snpkg.AppendCachedSignatureHandlerWrapper(store.Store)(images.ChildrenHandler(store.Store))
 				require.NoError(t, images.Dispatch(ctx, u.Unpack(handler), nil, manifest.Descriptor))
 				_, err = u.Wait()
-				if i > 0 && tc.wantErr {
-					require.ErrorContains(t, err, "violates layer policy")
-				} else {
-					require.NoError(t, err)
-				}
-				key, err := snpkg.DmveritySnapshotKey(identity.ChainID([]digest.Digest{diffID}).String())
+				require.NoError(t, err)
+				key, err := snpkg.DmveritySnapshotKey(identity.ChainID([]digest.Digest{diffID}).String(), "", originalRoot)
 				require.NoError(t, err)
 				require.Contains(t, sn.committed, key)
-				require.Len(t, sn.committed, 1)
+				expectedCount := 1
+				if i > 0 && tc.rootHash != originalRoot {
+					expectedCount = 2
+				}
+				require.Len(t, sn.committed, expectedCount)
 				require.Equal(t, originalRoot, sn.committed[key].Labels["containerd.io/snapshot/erofs.dmverity.root-hash"])
 				require.Equal(t, digest.FromString("old signature").String(), sn.committed[key].Labels["containerd.io/snapshot/erofs.dmverity.signature-digest"])
+				selectedKey, err := snpkg.DmverityImageSnapshotKey(ctx, store.Store, manifest.Descriptor, platforms.Default())
+				require.NoError(t, err)
+				require.Contains(t, sn.committed, selectedKey)
+				require.Equal(t, rootHash, sn.committed[selectedKey].Labels["containerd.io/snapshot/erofs.dmverity.root-hash"])
+				selectedManifest, err := images.Manifest(ctx, store.Store, manifest.Descriptor, platforms.Default())
+				require.NoError(t, err)
+				configInfo, err := store.Info(ctx, selectedManifest.Config.Digest)
+				require.NoError(t, err)
+				for cachedKey := range sn.committed {
+					require.Contains(t, configInfo.Labels, "containerd.io/gc.ref.snapshot.erofs/dmverity-"+digest.FromString(cachedKey).Encoded())
+				}
 			}
 		})
 	}
@@ -700,7 +710,7 @@ func TestUnpackValidatesConcurrentChainIDCommit(t *testing.T) {
 			if mismatch {
 				existingRoot = "c5f2dae41b6e8f3297d50ac1a48be6f3d20a7c4b5eadf8293c6b7a4d5eaf1b82"
 			}
-			key, err := snpkg.DmveritySnapshotKey(identity.ChainID([]digest.Digest{diffID}).String())
+			key, err := snpkg.DmveritySnapshotKey(identity.ChainID([]digest.Digest{diffID}).String(), "", rootHash)
 			require.NoError(t, err)
 			sn := &recordingSnapshotter{
 				committed: map[string]snapshots.Info{
@@ -731,6 +741,117 @@ func TestUnpackValidatesConcurrentChainIDCommit(t *testing.T) {
 	}
 }
 
+func TestSignedVariantsRetainDistinctParentChains(t *testing.T) {
+	for _, parallel := range []bool{false, true} {
+		for _, reverse := range []bool{false, true} {
+			t.Run(fmt.Sprintf("parallel=%t/reverse=%t", parallel, reverse), func(t *testing.T) {
+				ctx := t.Context()
+				store := imagetest.NewContentStore(ctx, t)
+				diffIDs := []digest.Digest{digest.FromString("base diff"), digest.FromString("top diff")}
+				chainIDs := identity.ChainIDs(append([]digest.Digest(nil), diffIDs...))
+				config := store.JSONObject(ocispec.MediaTypeImageConfig, ocispec.Image{
+					Platform: platforms.DefaultSpec(),
+					RootFS:   ocispec.RootFS{Type: "layers", DiffIDs: diffIDs},
+				})
+				layers := []imagetest.Content{
+					store.Blob(ocispec.MediaTypeImageLayerGzip, []byte("base layer")),
+					store.Blob(ocispec.MediaTypeImageLayerGzip, []byte("top layer")),
+				}
+				plainManifest := store.Manifest(config, layers...)
+				sn := &recordingSnapshotter{committed: make(map[string]snapshots.Info)}
+				legacyKey := chainIDs[1].String() + "-dmverity"
+				legacy := snapshots.Info{Name: legacyKey, Labels: map[string]string{"legacy": "preserve"}}
+				sn.committed[legacyKey] = legacy
+				platform := Platform{
+					SnapshotterKey: "erofs", Snapshotter: sn,
+					PrepareLayer: snpkg.PrepareDmverityLayer,
+					Applier: diffIDApplier{
+						layers[0].Descriptor.Digest: diffIDs[0],
+						layers[1].Descriptor.Digest: diffIDs[1],
+					},
+				}
+				if parallel {
+					platform.SnapshotterCapabilities = []string{"rebase"}
+				}
+				unpack := func(manifest ocispec.Descriptor, signed bool) {
+					opts := []UnpackerOpt{WithUnpackPlatform(platform)}
+					if parallel {
+						opts = append(opts, WithUnpackLimiter(semaphore.NewWeighted(3)))
+					}
+					u, err := NewUnpacker(ctx, store.Store, opts...)
+					require.NoError(t, err)
+					var handler images.Handler = images.ChildrenHandler(store.Store)
+					if signed {
+						handler = snpkg.AppendCachedSignatureHandlerWrapper(store.Store)(handler)
+					}
+					require.NoError(t, images.Dispatch(ctx, u.Unpack(handler), nil, manifest))
+					_, err = u.Wait()
+					require.NoError(t, err)
+				}
+				unpack(plainManifest.Descriptor, false)
+				variants := []string{"A", "B"}
+				if reverse {
+					variants[0], variants[1] = variants[1], variants[0]
+				}
+				topKeys := make(map[string]string)
+				for _, variant := range variants {
+					// Different subjects share the same config and layers.
+					manifest, err := images.Manifest(ctx, store.Store, plainManifest.Descriptor, platforms.Default())
+					require.NoError(t, err)
+					manifest.Annotations = map[string]string{"test.variant": variant}
+					subject := store.JSONObject(ocispec.MediaTypeImageManifest, manifest).Descriptor
+					roots := []string{digest.FromString("base root " + variant).Encoded(), digest.FromString("shared top root").Encoded()}
+					var payloads []ocispec.Descriptor
+					for i, layer := range layers {
+						for _, mediaType := range []string{
+							"application/vnd.containerd.erofs.metadata.v1",
+							"application/vnd.containerd.erofs.dmverity.merkle-tree.v1",
+							"application/vnd.containerd.erofs.dmverity.layer-signature.v1+pkcs7",
+						} {
+							payload := store.Blob(mediaType, []byte(roots[i]+mediaType)).Descriptor
+							payload.Annotations = map[string]string{
+								"io.containerd.erofs.v1/dmverity.source-layer-digest": layer.Descriptor.Digest.String(),
+								"io.containerd.erofs.v1/dmverity.root-hash":           roots[i],
+							}
+							payloads = append(payloads, payload)
+						}
+					}
+					referrer := store.JSONObject(ocispec.MediaTypeImageManifest, ocispec.Manifest{
+						MediaType: ocispec.MediaTypeImageManifest, ArtifactType: "application/vnd.containerd.erofs.dmverity.v1",
+						Config: ocispec.DescriptorEmptyJSON, Subject: &subject, Layers: payloads,
+					})
+					_, err = store.Update(ctx, content.Info{
+						Digest: subject.Digest,
+						Labels: map[string]string{"containerd.io/gc.ref.content.dmverity": referrer.Descriptor.Digest.String()},
+					}, "labels.containerd.io/gc.ref.content.dmverity")
+					require.NoError(t, err)
+					unpack(subject, true)
+					unpack(subject, true) // Exercise parent validation on cache reuse.
+					baseKey, err := snpkg.DmveritySnapshotKey(chainIDs[0].String(), "", roots[0])
+					require.NoError(t, err)
+					topKey, err := snpkg.DmveritySnapshotKey(chainIDs[1].String(), baseKey, roots[1])
+					require.NoError(t, err)
+					topKeys[variant] = topKey
+					require.Equal(t, baseKey, sn.committed[topKey].Parent)
+					index := store.Index(imagetest.AddPlatform(imagetest.Content{Descriptor: subject}, platforms.DefaultSpec()))
+					resolved, err := snpkg.DmverityImageSnapshotKey(ctx, store.Store, index.Descriptor, platforms.Default())
+					require.NoError(t, err)
+					require.Equal(t, topKey, resolved)
+				}
+				require.NotEqual(t, topKeys["A"], topKeys["B"], "the same upper root must not alias distinct signed parents")
+				require.Len(t, sn.committed, 7, "plain, two signed chains, and untouched legacy entry")
+				require.Equal(t, legacy, sn.committed[legacyKey])
+				info, err := store.Info(ctx, config.Descriptor.Digest)
+				require.NoError(t, err)
+				require.Equal(t, chainIDs[1].String(), info.Labels["containerd.io/gc.ref.snapshot.erofs"])
+				for _, key := range topKeys {
+					require.Equal(t, key, info.Labels["containerd.io/gc.ref.snapshot.erofs/dmverity-"+digest.FromString(key).Encoded()])
+				}
+			})
+		}
+	}
+}
+
 func TestOrdinaryUnpackDoesNotInspectSeparateSignedLane(t *testing.T) {
 	ctx := context.Background()
 	store := imagetest.NewContentStore(ctx, t)
@@ -740,7 +861,7 @@ func TestOrdinaryUnpackDoesNotInspectSeparateSignedLane(t *testing.T) {
 	})
 	layer := store.Blob(ocispec.MediaTypeImageLayerGzip, []byte("layer"))
 	manifest := store.Manifest(config, layer)
-	signedKey, err := snpkg.DmveritySnapshotKey(diffID.String())
+	signedKey, err := snpkg.DmveritySnapshotKey(diffID.String(), "", digest.FromString("root").Encoded())
 	require.NoError(t, err)
 	sn := &recordingSnapshotter{
 		committed: map[string]snapshots.Info{

@@ -37,13 +37,18 @@ const (
 	dmverityReferrerSignatureDigestLabel = "containerd.io/snapshot/erofs.dmverity.signature-digest"
 )
 
-// DmveritySnapshotKey derives the signed snapshot key for an OCI ChainID.
-func DmveritySnapshotKey(chainID string) (string, error) {
+// DmveritySnapshotKey binds a signed layer to its root and selected parent.
+// Signature replacement for the same root preserves the existing materialization.
+func DmveritySnapshotKey(chainID, parent, rootHash string) (string, error) {
 	chainDigest, err := digest.Parse(chainID)
 	if err != nil {
 		return "", fmt.Errorf("parse OCI ChainID %q: %w", chainID, err)
 	}
-	return chainDigest.String() + "-dmverity", nil
+	if err := validateRootHash(rootHash); err != nil {
+		return "", err
+	}
+	key := digest.FromString("erofs-dmverity-v2\n" + parent + "\n" + chainDigest.String() + "\n" + strings.ToLower(rootHash))
+	return key.String() + "-dmverity-v2", nil
 }
 
 // DmverityTarget is the trusted layer annotation. Payload descriptors are

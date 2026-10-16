@@ -29,7 +29,6 @@ import (
 	"github.com/containerd/errdefs"
 	"github.com/containerd/log"
 	"github.com/containerd/platforms"
-	"github.com/opencontainers/image-spec/identity"
 )
 
 // CheckImages checks all existing images to ensure they are ready to
@@ -91,11 +90,7 @@ func (c *CRIImageService) imageIsUnpacked(ctx context.Context, i containerd.Imag
 			return false, fmt.Errorf("get snapshotter %q capabilities: %w", snapshotter, err)
 		}
 		if slices.Contains(capabilities, plugins.CapabilityDmverityReferrers) {
-			diffIDs, err := i.RootFS(ctx)
-			if err != nil {
-				return false, fmt.Errorf("get image rootfs for %q: %w", i.Name(), err)
-			}
-			key, err := snpkg.DmveritySnapshotKey(identity.ChainID(diffIDs).String())
+			key, err := snpkg.DmverityImageSnapshotKey(ctx, i.ContentStore(), i.Target(), platforms.Default())
 			if err != nil {
 				return false, err
 			}

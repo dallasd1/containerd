@@ -83,7 +83,7 @@ func TestSanitizedDmverityLayerPreparation(t *testing.T) {
 	children := []ocispec.Descriptor{desc}
 	sanitizeDmverityImageLayers(children)
 	chainID := digest.FromString("chain").String()
-	unsigned, err := PrepareDmverityLayer(ctx, children[0], chainID)
+	unsigned, err := PrepareDmverityLayer(ctx, children[0], chainID, "")
 	require.NoError(t, err)
 	require.Empty(t, unsigned.Labels)
 	require.NoError(t, unsigned.ValidateExisting(snapshots.Info{}))
@@ -96,7 +96,7 @@ func TestSanitizedDmverityLayerPreparation(t *testing.T) {
 	}
 	children, err = annotateDmverityTargets(children, map[string]*DmverityTarget{desc.Digest.String(): target})
 	require.NoError(t, err)
-	signed, err := PrepareDmverityLayer(ctx, children[0], chainID)
+	signed, err := PrepareDmverityLayer(ctx, children[0], chainID, "")
 	require.NoError(t, err)
 	require.Equal(t, target.RootHash, signed.Labels[dmverityReferrerRootHashLabel])
 	require.Equal(t, target.Signature.Digest.String(), signed.Labels[dmverityReferrerSignatureDigestLabel])
@@ -125,6 +125,72 @@ func TestImageHasDmverityReferrerForSelectedPlatform(t *testing.T) {
 		got, err := ImageHasDmverityReferrer(ctx, store.Store, index.Descriptor, platforms.Default())
 		require.NoError(t, err)
 		require.Equal(t, signed, got)
+	}
+}
+
+func TestDmverityImageSnapshotKeyUsesRetainedSelection(t *testing.T) {
+	for _, mode := range []string{"selected platform", "no signed observation", "missing bundle", "missing payload", "wrong subject", "wrong diffID count"} {
+		t.Run(mode, func(t *testing.T) {
+			ctx := t.Context()
+			store := imagetest.NewContentStore(ctx, t)
+			diffID := digest.FromString("diffID")
+			diffIDs := []digest.Digest{diffID}
+			if mode == "wrong diffID count" {
+				diffIDs = nil
+			}
+			config := store.JSONObject(ocispec.MediaTypeImageConfig, ocispec.Image{
+				Platform: platforms.DefaultSpec(),
+				RootFS:   ocispec.RootFS{Type: "layers", DiffIDs: diffIDs},
+			})
+			layer := store.Blob(ocispec.MediaTypeImageLayer, []byte("layer"))
+			manifest := store.Manifest(config, layer)
+			subject := manifest.Descriptor
+			if mode == "wrong subject" {
+				subject.Digest = digest.FromString("different subject")
+			}
+			root := digest.FromString("root").Encoded()
+			bundle := addTestDmverityReferrerWithRoot(t, store, subject, layer.Descriptor.Digest, "selected", root)
+			_, err := store.Update(ctx, content.Info{
+				Digest: manifest.Descriptor.Digest,
+				Labels: map[string]string{dmverityBundleContentLabel: bundle.Digest.String()},
+			}, "labels."+dmverityBundleContentLabel)
+			require.NoError(t, err)
+			if mode == "no signed observation" {
+				_, err = store.Update(ctx, content.Info{Digest: manifest.Descriptor.Digest}, "labels."+dmverityBundleContentLabel)
+				require.NoError(t, err)
+			}
+			if mode == "missing bundle" {
+				require.NoError(t, store.Delete(ctx, bundle.Digest))
+			}
+			if mode == "missing payload" {
+				require.NoError(t, store.Delete(ctx, digest.FromString("selected-tree")))
+			}
+			// Neither unrelated GC pointers nor an unselected platform determine
+			// the signed parent. The other manifest deliberately has no bundle.
+			_, err = store.Update(ctx, content.Info{
+				Digest: config.Descriptor.Digest,
+				Labels: map[string]string{"containerd.io/gc.ref.snapshot.erofs/dmverity": "wrong-key"},
+			}, "labels.containerd.io/gc.ref.snapshot.erofs/dmverity")
+			require.NoError(t, err)
+			otherPlatform := platforms.DefaultSpec()
+			otherPlatform.Architecture = "unsupported"
+			otherConfig := store.JSONObject(ocispec.MediaTypeImageConfig, ocispec.Image{Platform: otherPlatform})
+			otherManifest := store.Manifest(otherConfig, layer)
+			index := store.Index(
+				imagetest.AddPlatform(otherManifest, otherPlatform),
+				imagetest.AddPlatform(manifest, platforms.DefaultSpec()),
+			)
+			key, err := DmverityImageSnapshotKey(ctx, store.Store, index.Descriptor, platforms.Default())
+			if mode == "selected platform" {
+				require.NoError(t, err)
+				expected, err := DmveritySnapshotKey(diffID.String(), "", root)
+				require.NoError(t, err)
+				require.Equal(t, expected, key)
+			} else {
+				require.Error(t, err)
+				require.Empty(t, key)
+			}
+		})
 	}
 }
 
@@ -479,7 +545,7 @@ func TestConflictingReferrerPreservesCachedSignedIdentity(t *testing.T) {
 
 	cached, err := AppendCachedSignatureHandlerWrapper(store.Store)(base).Handle(ctx, subject)
 	require.NoError(t, err)
-	preparation, err := PrepareDmverityLayer(ctx, cached[0], digest.FromString("chain").String())
+	preparation, err := PrepareDmverityLayer(ctx, cached[0], digest.FromString("chain").String(), "")
 	require.NoError(t, err)
 	require.NoError(t, preparation.ValidateExisting(snapshots.Info{Labels: committed}))
 
@@ -494,7 +560,7 @@ func TestConflictingReferrerPreservesCachedSignedIdentity(t *testing.T) {
 	replacedLabels, err := DmveritySnapshotLabels(cached[0])
 	require.NoError(t, err)
 	require.NotEqual(t, committed[dmverityReferrerSignatureDigestLabel], replacedLabels[dmverityReferrerSignatureDigestLabel])
-	preparation, err = PrepareDmverityLayer(ctx, cached[0], digest.FromString("chain").String())
+	preparation, err = PrepareDmverityLayer(ctx, cached[0], digest.FromString("chain").String(), "")
 	require.NoError(t, err)
 	require.NoError(t, preparation.ValidateExisting(snapshots.Info{Labels: committed}))
 

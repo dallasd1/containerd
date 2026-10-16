@@ -32,6 +32,7 @@ import (
 	"github.com/containerd/log"
 	"github.com/containerd/platforms"
 	"github.com/opencontainers/go-digest"
+	"github.com/opencontainers/image-spec/identity"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
@@ -50,7 +51,7 @@ const (
 var dmverityObservationLocks = kmutex.New()
 
 // PrepareDmverityLayer selects the snapshot key and identity policy for a layer.
-func PrepareDmverityLayer(_ context.Context, desc ocispec.Descriptor, chainID string) (snapshots.LayerPreparation, error) {
+func PrepareDmverityLayer(_ context.Context, desc ocispec.Descriptor, chainID, parent string) (snapshots.LayerPreparation, error) {
 	labels, err := DmveritySnapshotLabels(desc)
 	if err != nil {
 		return snapshots.LayerPreparation{}, err
@@ -61,17 +62,69 @@ func PrepareDmverityLayer(_ context.Context, desc ocispec.Descriptor, chainID st
 		Key:    chainID,
 		Labels: labels,
 		ValidateExisting: func(info snapshots.Info) error {
+			if expectedSigned && info.Parent != parent {
+				return fmt.Errorf("existing signed snapshot has parent %q, expected %q", info.Parent, parent)
+			}
 			return validateDmveritySnapshot(info.Labels, expectedRootHash, expectedSigned)
 		},
 	}
 	if len(labels) > 0 {
-		preparation.Key, err = DmveritySnapshotKey(chainID)
+		preparation.Key, err = DmveritySnapshotKey(chainID, parent, expectedRootHash)
 		if err != nil {
 			return snapshots.LayerPreparation{}, err
 		}
-		preparation.GCQualifier = "dmverity"
+		// Keep each signed variant reachable even when manifests share a config.
+		preparation.GCQualifier = "dmverity-" + digest.FromString(preparation.Key).Encoded()
 	}
 	return preparation, nil
+}
+
+// DmverityImageSnapshotKey resolves the selected signed chain from retained
+// artifacts, using the same preparation policy as unpack. Legacy signed keys
+// are not adopted or modified; the selected chain is materialized alongside them.
+func DmverityImageSnapshotKey(ctx context.Context, store content.Store, target ocispec.Descriptor, platform platforms.MatchComparer) (string, error) {
+	children := images.LimitManifests(images.FilterPlatforms(images.ChildrenHandler(store), platform), platform, 1)
+	cached := AppendCachedSignatureHandlerWrapper(store)(children)
+	var key string
+	handler := images.HandlerFunc(func(ctx context.Context, desc ocispec.Descriptor) ([]ocispec.Descriptor, error) {
+		selected, err := cached.Handle(ctx, desc)
+		if err != nil {
+			return nil, err
+		}
+		if !images.IsManifestType(desc.MediaType) {
+			return selected, nil
+		}
+		// ChildrenHandler returns the config followed by the ordered layers.
+		if len(selected) == 0 {
+			return nil, fmt.Errorf("manifest %s has no image config", desc.Digest)
+		}
+		layers := selected[1:]
+		diffIDs, err := images.RootFS(ctx, store, selected[0])
+		if err != nil {
+			return nil, err
+		}
+		if len(diffIDs) != len(layers) {
+			return nil, fmt.Errorf("manifest %s has %d layers but %d diffIDs", desc.Digest, len(layers), len(diffIDs))
+		}
+		for i, chainID := range identity.ChainIDs(diffIDs) {
+			if _, signed := layers[i].Annotations[TargetLayerDmverityLabel]; !signed {
+				return nil, fmt.Errorf("manifest %s has no retained signed dm-verity target for layer %s", desc.Digest, layers[i].Digest)
+			}
+			prepared, err := PrepareDmverityLayer(ctx, layers[i], chainID.String(), key)
+			if err != nil {
+				return nil, err
+			}
+			key = prepared.Key
+		}
+		return nil, nil
+	})
+	if err := images.Walk(ctx, handler, target); err != nil {
+		return "", err
+	}
+	if key == "" {
+		return "", fmt.Errorf("image %s has no selected signed snapshot chain", target.Digest)
+	}
+	return key, nil
 }
 
 type dmverityBundle struct {
