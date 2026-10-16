@@ -193,6 +193,7 @@ func configureUnpackPlatforms(ic *plugin.InitContext, ms *metadata.DB, config *t
 		// Set the optional dm-verity prepare layer if the snapshotter supports it.
 		if slices.Contains(snCapabilities, plugins.CapabilityDmverityReferrers) {
 			up.PrepareLayer = snpkg.PrepareDmverityLayer
+			up.ApplyOpts = append(up.ApplyOpts, snpkg.WithDmverityReferrers())
 		}
 		lc.UnpackPlatforms = append(lc.UnpackPlatforms, up)
 	}

@@ -18,6 +18,7 @@ package snapshotters
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"maps"
 	"strings"
@@ -321,6 +322,46 @@ func TestFetchSignaturesDeduplicatesSameReferrerDigest(t *testing.T) {
 		referrers: []ocispec.Descriptor{referrer, conflict},
 	}, store.Store, subject, map[string]struct{}{layerDigest.String(): {}})
 	require.NoError(t, err)
+}
+
+func TestFetchSignaturesRejectsMalformedBundles(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		mutate func(*ocispec.Manifest)
+		want   string
+	}{
+		{"missing subject", func(m *ocispec.Manifest) { m.Subject = nil }, "subject does not match"},
+		{"wrong subject", func(m *ocispec.Manifest) {
+			m.Subject = &ocispec.Descriptor{Digest: digest.FromString("other subject")}
+		}, "subject does not match"},
+		{"missing metadata", func(m *ocispec.Manifest) { m.Layers = m.Layers[1:] }, "incomplete dm-verity artifacts"},
+		{"missing tree", func(m *ocispec.Manifest) { m.Layers = append(m.Layers[:1], m.Layers[2:]...) }, "incomplete dm-verity artifacts"},
+		{"missing signature", func(m *ocispec.Manifest) { m.Layers = m.Layers[:2] }, "incomplete dm-verity artifacts"},
+		{"duplicate metadata", func(m *ocispec.Manifest) { m.Layers = append(m.Layers, m.Layers[0]) }, "duplicate EROFS metadata"},
+		{"duplicate tree", func(m *ocispec.Manifest) { m.Layers = append(m.Layers, m.Layers[1]) }, "duplicate Merkle-tree"},
+		{"duplicate signature", func(m *ocispec.Manifest) { m.Layers = append(m.Layers, m.Layers[2]) }, "duplicate signature"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := t.Context()
+			store := imagetest.NewContentStore(ctx, t)
+			subject := ocispec.Descriptor{Digest: digest.FromString("subject")}
+			source := digest.FromString("layer")
+			valid := addTestDmverityReferrer(t, store, subject, source, "valid")
+			data, err := content.ReadBlob(ctx, store.Store, valid)
+			require.NoError(t, err)
+			var manifest ocispec.Manifest
+			require.NoError(t, json.Unmarshal(data, &manifest))
+			tc.mutate(&manifest)
+			referrer := store.JSONObject(ocispec.MediaTypeImageManifest, manifest).Descriptor
+			referrer.ArtifactType = signatureArtifactType
+			bundle, discovered, err := fetchSignatures(ctx,
+				referrerTestFetcher{referrers: []ocispec.Descriptor{referrer}},
+				store.Store, subject, map[string]struct{}{source.String(): {}})
+			require.ErrorContains(t, err, tc.want)
+			require.True(t, discovered, "malformed signed content must not become unsigned absence")
+			require.Nil(t, bundle)
+		})
+	}
 }
 
 func addTestDmverityReferrer(

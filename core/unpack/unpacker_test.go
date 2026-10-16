@@ -618,7 +618,20 @@ func TestUnpackRequiresValidatedReferrersForSignedIdentity(t *testing.T) {
 
 			handler := snpkg.AppendCachedSignatureHandlerWrapper(store.Store)(
 				images.ChildrenHandler(store.Store))
-			require.NoError(t, images.Dispatch(ctx, u.Unpack(handler), nil, manifest.Descriptor))
+			sourceLabels := images.HandlerFunc(func(ctx context.Context, desc ocispec.Descriptor) ([]ocispec.Descriptor, error) {
+				children, err := handler.Handle(ctx, desc)
+				for i := range children {
+					if images.IsLayerType(children[i].MediaType) {
+						if children[i].Annotations == nil {
+							children[i].Annotations = make(map[string]string)
+						}
+						children[i].Annotations["containerd.io/snapshot/erofs.dmverity.root-hash"] = "untrusted"
+						children[i].Annotations["containerd.io/snapshot/erofs.dmverity.signature-digest"] = "untrusted"
+					}
+				}
+				return children, err
+			})
+			require.NoError(t, images.Dispatch(ctx, u.Unpack(sourceLabels), nil, manifest.Descriptor))
 			_, err = u.Wait()
 			require.NoError(t, err)
 

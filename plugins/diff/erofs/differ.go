@@ -151,8 +151,11 @@ func (s erofsDiff) Apply(ctx context.Context, desc ocispec.Descriptor, mounts []
 		return emptyDesc, err
 	}
 
-	// The target is supplied by the referrer handler.
-	dmverityReferrersPresent := desc.Annotations[snpkg.TargetLayerDmverityLabel] != ""
+	target, err := snpkg.DmverityApplyTarget(config)
+	if err != nil {
+		return emptyDesc, err
+	}
+	dmverityReferrersPresent := target != nil
 	if native && dmverityReferrersPresent {
 		return emptyDesc, fmt.Errorf("signed native EROFS layers are unsupported; layer %s must use a tar layer", desc.Digest)
 	}
@@ -209,7 +212,7 @@ func (s erofsDiff) Apply(ctx context.Context, desc ocispec.Descriptor, mounts []
 		}
 		log.G(ctx).WithField("path", layerBlobPath).Debug("Applied layer with compressed EROFS blob")
 	} else if dmverityReferrersPresent {
-		if err := s.applySignedTarIndexArtifacts(ctx, desc, layerBlobPath, rc); err != nil {
+		if err := s.applySignedTarIndexArtifacts(ctx, desc, *target, layerBlobPath, rc); err != nil {
 			return emptyDesc, err
 		}
 		return ocispec.Descriptor{

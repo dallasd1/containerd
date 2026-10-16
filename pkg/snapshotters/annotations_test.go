@@ -23,12 +23,51 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/containerd/containerd/v2/core/diff"
 	"github.com/containerd/containerd/v2/core/snapshots"
+	"github.com/containerd/typeurl/v2"
 	digest "github.com/opencontainers/go-digest"
 	imagespec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/types/known/anypb"
 )
+
+func TestDmverityApplyRequiresExplicitPayload(t *testing.T) {
+	target := DmverityTarget{
+		RootHash:  digest.FromString("root").Encoded(),
+		Metadata:  imagespec.Descriptor{Digest: digest.FromString("metadata")},
+		Tree:      imagespec.Descriptor{Digest: digest.FromString("tree")},
+		Signature: imagespec.Descriptor{Digest: digest.FromString("signature")},
+	}
+	value, err := targetAnnotation(&target)
+	require.NoError(t, err)
+	desc := imagespec.Descriptor{Annotations: map[string]string{TargetLayerDmverityLabel: value}}
+	config := diff.ApplyConfig{}
+	got, err := DmverityApplyTarget(config)
+	require.NoError(t, err)
+	require.Nil(t, got, "descriptor annotations cannot authorize signed assembly")
+	require.NoError(t, WithDmverityReferrers()(t.Context(), desc, &config))
+	// Simulate the diff service's protobuf transport.
+	config.ProcessorPayloads[TargetLayerDmverityLabel] = typeurl.MarshalProto(config.ProcessorPayloads[TargetLayerDmverityLabel])
+	got, err = DmverityApplyTarget(config)
+	require.NoError(t, err)
+	require.Equal(t, target, *got)
+	config.ProcessorPayloads[TargetLayerDmverityLabel] = &anypb.Any{TypeUrl: "invalid", Value: []byte("invalid")}
+	_, err = DmverityApplyTarget(config)
+	require.Error(t, err)
+}
+
+func TestSourceAnnotationsCannotSetSignedSnapshotIdentity(t *testing.T) {
+	source := map[string]string{
+		dmverityReferrerRootHashLabel:        "untrusted",
+		dmverityReferrerSignatureDigestLabel: "untrusted",
+		"containerd.io/snapshot/example":     "preserved",
+	}
+	labels := snapshots.FilterImageInheritedLabels(source)
+	require.Equal(t, map[string]string{"containerd.io/snapshot/example": "preserved"}, labels)
+	require.Equal(t, source, snapshots.FilterInheritedLabels(source), "local snapshot metadata must retain signed identity")
+}
 
 func TestImageLayersLabel(t *testing.T) {
 	sampleKey := "sampleKey"

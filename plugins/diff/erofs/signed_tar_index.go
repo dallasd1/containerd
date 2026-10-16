@@ -39,15 +39,10 @@ const (
 func (s erofsDiff) applySignedTarIndexArtifacts(
 	ctx context.Context,
 	sourceDesc ocispec.Descriptor,
+	target snpkg.DmverityTarget,
 	layerBlobPath string,
 	sourceTar io.Reader,
 ) error {
-	targetValue := sourceDesc.Annotations[snpkg.TargetLayerDmverityLabel]
-	target, err := snpkg.ParseDmverityTarget(targetValue)
-	if err != nil {
-		return err
-	}
-
 	if err := copyContentDescriptor(
 		ctx,
 		s.store,

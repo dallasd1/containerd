@@ -133,12 +133,17 @@ func TestWithNewSnapshotValidatesKnownSignedImageBeforeSnapshotCreation(t *testi
 	require.Zero(t, snapshotter.prepares, "snapshot creation must not precede signed-chain validation")
 }
 
-func TestWithNewSnapshotUnsignedImageDoesNotRequireIntrospection(t *testing.T) {
+func TestWithNewSnapshotIgnoresReferrerStateOnOrdinarySnapshotter(t *testing.T) {
 	ctx := leases.WithLease(namespaces.WithNamespace(context.Background(), "test"), "test-lease")
 	store := imagetest.NewContentStore(ctx, t)
 	config := store.JSONObject(ocispec.MediaTypeImageConfig, ocispec.Image{})
 	layer := store.RandomBlob(ocispec.MediaTypeImageLayer, 16)
 	manifest := store.Manifest(config, layer)
+	_, err := store.Update(ctx, content.Info{
+		Digest: manifest.Descriptor.Digest,
+		Labels: map[string]string{"containerd.io/gc.ref.content.dmverity": "invalid"},
+	}, "labels")
+	require.NoError(t, err)
 
 	snapshotter := &preflightSnapshotter{}
 	introspectionCalls := 0
@@ -157,7 +162,7 @@ func TestWithNewSnapshotUnsignedImageDoesNotRequireIntrospection(t *testing.T) {
 	err = WithNewSnapshot("container-id", image, false)(ctx, client, &containers.Container{Snapshotter: "overlayfs"})
 	require.NoError(t, err)
 	require.Equal(t, 1, snapshotter.prepares)
-	require.Equal(t, 1, introspectionCalls, "only the underlying snapshot option resolution should introspect")
+	require.Equal(t, 2, introspectionCalls, "capability gating must precede any referrer inspection")
 }
 
 func TestWithNewSnapshotPreflightsAndCreatesFromSignedLane(t *testing.T) {

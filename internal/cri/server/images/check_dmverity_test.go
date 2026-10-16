@@ -40,13 +40,18 @@ import (
 
 type dmverityReadinessIntrospection struct {
 	introspection.Service
+	disabled bool
 }
 
-func (dmverityReadinessIntrospection) Plugins(context.Context, ...string) (*introspectionapi.PluginsResponse, error) {
+func (i dmverityReadinessIntrospection) Plugins(context.Context, ...string) (*introspectionapi.PluginsResponse, error) {
+	var capabilities []string
+	if !i.disabled {
+		capabilities = []string{plugins.CapabilityDmverityReferrers}
+	}
 	return &introspectionapi.PluginsResponse{Plugins: []*introspectionapi.Plugin{{
 		Type:         string(plugins.SnapshotPlugin),
 		ID:           "erofs",
-		Capabilities: []string{plugins.CapabilityDmverityReferrers},
+		Capabilities: capabilities,
 	}}}, nil
 }
 
@@ -69,10 +74,12 @@ func TestImageReadinessUsesSelectedSnapshotLane(t *testing.T) {
 		name       string
 		signed     bool
 		legacyOnly bool
+		disabled   bool
 	}{
 		{name: "unsigned"},
 		{name: "signed", signed: true},
 		{name: "signed legacy cache needs new unpack", signed: true, legacyOnly: true},
+		{name: "disabled ignores invalid observation", disabled: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := namespaces.WithNamespace(context.Background(), "test")
@@ -84,6 +91,13 @@ func TestImageReadinessUsesSelectedSnapshotLane(t *testing.T) {
 			layer := store.RandomBlob(ocispec.MediaTypeImageLayer, 16)
 			manifest := store.Manifest(config, layer)
 			rootHash := digest.FromString("root").Encoded()
+			if tc.disabled {
+				_, err := store.Update(ctx, content.Info{
+					Digest: manifest.Descriptor.Digest,
+					Labels: map[string]string{"containerd.io/gc.ref.content.dmverity": "invalid"},
+				}, "labels")
+				require.NoError(t, err)
+			}
 			if tc.signed {
 				payload := func(mediaType string) ocispec.Descriptor {
 					desc := store.Blob(mediaType, []byte(mediaType)).Descriptor
@@ -131,7 +145,7 @@ func TestImageReadinessUsesSelectedSnapshotLane(t *testing.T) {
 			client, err := containerd.New("", containerd.WithServices(
 				containerd.WithContentStore(store.Store),
 				containerd.WithSnapshotters(map[string]snapshots.Snapshotter{"erofs": snapshotter}),
-				containerd.WithIntrospectionService(dmverityReadinessIntrospection{}),
+				containerd.WithIntrospectionService(dmverityReadinessIntrospection{disabled: tc.disabled}),
 			))
 			require.NoError(t, err)
 			t.Cleanup(func() { require.NoError(t, client.Close()) })

@@ -404,6 +404,16 @@ func FilterInheritedLabels(labels map[string]string) map[string]string {
 	return filtered
 }
 
+// FilterImageInheritedLabels excludes locally assigned signed identity from
+// publisher annotations. FilterInheritedLabels still preserves that identity
+// when metadata is passed to the snapshotter.
+func FilterImageInheritedLabels(labels map[string]string) map[string]string {
+	filtered := FilterInheritedLabels(labels)
+	delete(filtered, "containerd.io/snapshot/erofs.dmverity.root-hash")
+	delete(filtered, "containerd.io/snapshot/erofs.dmverity.signature-digest")
+	return filtered
+}
+
 // WithParent sets the parent of a snapshot
 func WithParent(parent string) Opt {
 	return func(info *Info) error {

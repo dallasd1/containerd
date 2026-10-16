@@ -17,15 +17,60 @@
 package snapshotters
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"strings"
 
+	"github.com/containerd/containerd/v2/core/diff"
+	"github.com/containerd/typeurl/v2"
 	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+	"google.golang.org/protobuf/types/known/wrapperspb"
 )
+
+// WithDmverityReferrers forwards targets selected by the validating referrer
+// handler through the diff API, rather than trusting descriptor annotations
+// in an ordinary apply request.
+func WithDmverityReferrers() diff.ApplyOpt {
+	return func(_ context.Context, desc ocispec.Descriptor, config *diff.ApplyConfig) error {
+		value := desc.Annotations[TargetLayerDmverityLabel]
+		if value == "" {
+			return nil
+		}
+		payload, err := typeurl.MarshalAny(wrapperspb.String(value))
+		if err != nil {
+			return err
+		}
+		config.ProcessorPayloads = maps.Clone(config.ProcessorPayloads)
+		if config.ProcessorPayloads == nil {
+			config.ProcessorPayloads = make(map[string]typeurl.Any)
+		}
+		config.ProcessorPayloads[TargetLayerDmverityLabel] = payload
+		return nil
+	}
+}
+
+// DmverityApplyTarget reads explicitly supplied signed apply input. A registry
+// descriptor alone cannot opt an ordinary apply request into signed assembly.
+func DmverityApplyTarget(config diff.ApplyConfig) (*DmverityTarget, error) {
+	payload := config.ProcessorPayloads[TargetLayerDmverityLabel]
+	if payload == nil {
+		return nil, nil
+	}
+	value := &wrapperspb.StringValue{}
+	if err := typeurl.UnmarshalTo(payload, value); err != nil {
+		return nil, fmt.Errorf("decode dm-verity apply target: %w", err)
+	}
+	target, err := ParseDmverityTarget(value.Value)
+	if err != nil {
+		return nil, err
+	}
+	return &target, nil
+}
 
 const (
 	erofsAnnotationPrefix = "io.containerd.erofs.v1/"

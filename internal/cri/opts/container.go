@@ -46,16 +46,16 @@ import (
 func WithNewSnapshot(id string, i containerd.Image, appendSnapshotLabels bool, opts ...snapshots.Opt) containerd.NewContainerOpts {
 	return func(ctx context.Context, client *containerd.Client, c *containers.Container) error {
 		f := containerd.WithNewSnapshot(id, i, opts...)
-		signed, err := snpkg.ImageHasDmverityReferrer(ctx, i.ContentStore(), i.Target(), platforms.Default())
+		capabilities, err := client.GetSnapshotterCapabilities(ctx, c.Snapshotter)
 		if err != nil {
-			return fmt.Errorf("failed to inspect signed dm-verity image: %w", err)
+			return fmt.Errorf("failed to get capabilities of snapshotter %q: %w", c.Snapshotter, err)
 		}
-		if signed {
-			capabilities, err := client.GetSnapshotterCapabilities(ctx, c.Snapshotter)
+		if slices.Contains(capabilities, plugins.CapabilityDmverityReferrers) {
+			signed, err := snpkg.ImageHasDmverityReferrer(ctx, i.ContentStore(), i.Target(), platforms.Default())
 			if err != nil {
-				return fmt.Errorf("failed to get capabilities of snapshotter %q: %w", c.Snapshotter, err)
+				return fmt.Errorf("failed to inspect signed dm-verity image: %w", err)
 			}
-			if slices.Contains(capabilities, plugins.CapabilityDmverityReferrers) {
+			if signed {
 				if err := unpackImage(ctx, client, i, c.Snapshotter, appendSnapshotLabels); err != nil {
 					return fmt.Errorf("signed dm-verity image preflight failed: %w", err)
 				}
@@ -104,6 +104,7 @@ func unpackImage(ctx context.Context, client *containerd.Client, i containerd.Im
 	}
 	if signedDmverity {
 		up.PrepareLayer = snpkg.PrepareDmverityLayer
+		up.ApplyOpts = append(up.ApplyOpts, snpkg.WithDmverityReferrers())
 	}
 	u, err := unpack.NewUnpacker(ctx, i.ContentStore(),
 		unpack.WithUnpackPlatform(up),

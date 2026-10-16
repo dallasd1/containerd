@@ -156,7 +156,7 @@ func TestApplySignedTarIndexArtifacts(t *testing.T) {
 	layerPath := filepath.Join(t.TempDir(), "layer.erofs")
 
 	differ := erofsDiff{store: store.Store}
-	require.NoError(t, differ.applySignedTarIndexArtifacts(ctx, desc, layerPath, bytes.NewReader(tarBytes)))
+	require.NoError(t, differ.applySignedTarIndexArtifacts(ctx, desc, target, layerPath, bytes.NewReader(tarBytes)))
 
 	data, err := os.ReadFile(layerPath)
 	require.NoError(t, err)
@@ -185,6 +185,7 @@ func TestApplySignedArtifactsBeforeLocalTarIndex(t *testing.T) {
 		Tree:      store.Blob("application/vnd.containerd.erofs.dmverity.merkle-tree.v1", []byte("verity tree")).Descriptor,
 		Signature: store.Blob("application/vnd.containerd.erofs.dmverity.layer-signature.v1+pkcs7", []byte("signature")).Descriptor,
 	}
+
 	annotation, err := json.Marshal(target)
 	require.NoError(t, err)
 
@@ -205,8 +206,29 @@ func TestApplySignedArtifactsBeforeLocalTarIndex(t *testing.T) {
 	_, err = differ.Apply(ctx, desc, []mount.Mount{{
 		Type:   "bind",
 		Source: filepath.Join(layerDir, "layer.erofs"),
-	}})
+	}}, snpkg.WithDmverityReferrers())
 	require.NoError(t, err)
 	require.FileExists(t, filepath.Join(layerDir, "layer.erofs.dmverity"))
 	require.FileExists(t, filepath.Join(layerDir, "layer.erofs.sig"))
+}
+
+func TestOrdinaryNativeApplyIgnoresSignedTargetAnnotation(t *testing.T) {
+	ctx := t.Context()
+	store := imagetest.NewContentStore(ctx, t)
+	data := []byte("native EROFS layer bytes")
+	desc := store.Blob("application/vnd.erofs.layer.v1", data).Descriptor
+	desc.Annotations = map[string]string{snpkg.TargetLayerDmverityLabel: "untrusted"}
+	layerDir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(layerDir, ".erofslayer"), nil, 0644))
+	differ := erofsDiff{store: store.Store}
+	result, err := differ.Apply(ctx, desc, []mount.Mount{{
+		Type: "bind", Source: filepath.Join(layerDir, "layer.erofs"),
+	}})
+	require.NoError(t, err)
+	require.Equal(t, desc.Digest, result.Digest)
+	actual, err := os.ReadFile(filepath.Join(layerDir, "layer.erofs"))
+	require.NoError(t, err)
+	require.Equal(t, data, actual)
+	require.NoFileExists(t, filepath.Join(layerDir, "layer.erofs.sig"))
+	require.NoFileExists(t, filepath.Join(layerDir, "layer.erofs.dmverity"))
 }

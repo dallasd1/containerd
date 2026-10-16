@@ -80,16 +80,16 @@ func (c *CRIImageService) CheckImages(ctx context.Context) error {
 }
 
 func (c *CRIImageService) imageIsUnpacked(ctx context.Context, i containerd.Image, snapshotter string) (bool, error) {
-	signed, err := snpkg.ImageHasDmverityReferrer(ctx, i.ContentStore(), i.Target(), platforms.Default())
+	capabilities, err := c.client.GetSnapshotterCapabilities(ctx, snapshotter)
 	if err != nil {
-		return false, fmt.Errorf("inspect signed dm-verity image %q: %w", i.Name(), err)
+		return false, fmt.Errorf("get snapshotter %q capabilities: %w", snapshotter, err)
 	}
-	if signed {
-		capabilities, err := c.client.GetSnapshotterCapabilities(ctx, snapshotter)
+	if slices.Contains(capabilities, plugins.CapabilityDmverityReferrers) {
+		signed, err := snpkg.ImageHasDmverityReferrer(ctx, i.ContentStore(), i.Target(), platforms.Default())
 		if err != nil {
-			return false, fmt.Errorf("get snapshotter %q capabilities: %w", snapshotter, err)
+			return false, fmt.Errorf("inspect signed dm-verity image %q: %w", i.Name(), err)
 		}
-		if slices.Contains(capabilities, plugins.CapabilityDmverityReferrers) {
+		if signed {
 			key, err := snpkg.DmverityImageSnapshotKey(ctx, i.ContentStore(), i.Target(), platforms.Default())
 			if err != nil {
 				return false, err

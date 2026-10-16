@@ -425,7 +425,7 @@ func (u *Unpacker) unpack(
 		}()
 
 		// inherits annotations which are provided as snapshot labels.
-		snapshotLabels := snapshots.FilterInheritedLabels(desc.Annotations)
+		snapshotLabels := snapshots.FilterImageInheritedLabels(desc.Annotations)
 		if snapshotLabels == nil {
 			snapshotLabels = make(map[string]string)
 		}
