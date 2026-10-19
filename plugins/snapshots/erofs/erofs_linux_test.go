@@ -900,6 +900,56 @@ func TestMountsWithMergedFsMeta(t *testing.T) {
 // fsmeta is valid for the topmost parent, so it is the only lower. Since
 // overlayfs rejects a lowerdir with no upperdir, this collapses to a plain
 // bind mount instead.
+func TestMountsWithMixedSignedParentsAndMergedFsMeta(t *testing.T) {
+	for _, signedIndex := range []int{0, 1, 3} {
+		t.Run(fmt.Sprintf("signed-parent-%d", signedIndex), func(t *testing.T) {
+			root := t.TempDir()
+			s := &snapshotter{root: root, enableDmverityReferrers: true, dmverityMode: "auto"}
+			parents := []string{"p0", "p1", "p2", "p3"}
+			parentInfo := make([]snapshots.Info, len(parents))
+			for _, id := range parents {
+				require.NoError(t, os.MkdirAll(filepath.Join(root, "snapshots", id), 0755))
+				require.NoError(t, os.WriteFile(s.layerBlobPath(id), []byte("layer"), 0644))
+				// Every cutoff is available, including ones that would hide the signed parent.
+				require.NoError(t, os.WriteFile(s.fsMetaPath(id), []byte("merged"), 0644))
+			}
+			rootHash := strings.Repeat("a", 64)
+			signature := digest.FromString("signature").String()
+			parentInfo[signedIndex].Labels = map[string]string{
+				"containerd.io/snapshot/erofs.dmverity.root-hash":        rootHash,
+				"containerd.io/snapshot/erofs.dmverity.signature-digest": signature,
+			}
+			mounts, err := s.mounts(storage.Snapshot{
+				Kind: snapshots.KindView, ParentIDs: parents,
+			}, snapshots.Info{}, parentInfo)
+			require.NoError(t, err)
+
+			lowers := signedIndex + 1
+			if lowers < len(parents) {
+				lowers++
+			}
+			require.Len(t, mounts, lowers+1)
+			for i := 0; i <= signedIndex; i++ {
+				require.Equal(t, "erofs", mounts[i].Type)
+				require.Equal(t, s.layerBlobPath(parents[i]), mounts[i].Source)
+			}
+			require.Contains(t, mounts[signedIndex].Options, "X-containerd.dmverity.root-hash="+rootHash)
+			require.Contains(t, mounts[signedIndex].Options, "X-containerd.dmverity.signature-digest="+signature)
+			if signedIndex+1 < len(parents) {
+				cutoff := signedIndex + 1
+				require.Equal(t, s.fsMetaPath(parents[cutoff]), mounts[cutoff].Source)
+				expected := []string{"ro", "loop"}
+				for i := len(parents) - 1; i >= cutoff; i-- {
+					expected = append(expected, "device="+s.layerBlobPath(parents[i]))
+				}
+				require.Equal(t, expected, mounts[cutoff].Options)
+			}
+			require.Equal(t, "format/mkdir/overlay", mounts[lowers].Type)
+			require.Contains(t, mounts[lowers].Options, fmt.Sprintf("lowerdir={{ overlay 0 %d }}", lowers-1))
+		})
+	}
+}
+
 func TestMountsWithMergedFsMetaOnTopParent(t *testing.T) {
 	root := t.TempDir()
 	s := &snapshotter{root: root}

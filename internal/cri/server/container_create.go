@@ -29,6 +29,7 @@ import (
 	"github.com/containerd/platforms"
 	"github.com/containerd/typeurl/v2"
 	"github.com/davecgh/go-spew/spew"
+	docker "github.com/distribution/reference"
 	imagespec "github.com/opencontainers/image-spec/specs-go/v1"
 	runtimespec "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/opencontainers/selinux/go-selinux"
@@ -43,6 +44,7 @@ import (
 	crilabels "github.com/containerd/containerd/v2/internal/cri/labels"
 	customopts "github.com/containerd/containerd/v2/internal/cri/opts"
 	containerstore "github.com/containerd/containerd/v2/internal/cri/store/container"
+	imagestore "github.com/containerd/containerd/v2/internal/cri/store/image"
 	sandboxstore "github.com/containerd/containerd/v2/internal/cri/store/sandbox"
 	"github.com/containerd/containerd/v2/internal/cri/util"
 	"github.com/containerd/containerd/v2/internal/registrar"
@@ -192,7 +194,20 @@ func (c *criService) CreateContainer(ctx context.Context, r *runtime.CreateConta
 	if err != nil {
 		return nil, fmt.Errorf("failed to resolve image %q: %w", config.GetImage().GetImage(), err)
 	}
-	containerdImage, err := c.toContainerdImage(ctx, image)
+	ociRuntime, err := c.getPodSandboxRuntime(sandboxID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get sandbox runtime: %w", err)
+	}
+	capable, err := c.dmverityReferrersEnabled(ctx, c.RuntimeSnapshotter(ctx, ociRuntime))
+	if err != nil {
+		return nil, err
+	}
+	var containerdImage containerd.Image
+	if capable {
+		containerdImage, err = c.dmverityContainerImage(ctx, image, config.GetImage())
+	} else {
+		containerdImage, err = c.toContainerdImage(ctx, image)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to get image from containerd %q: %w", image.ID, err)
 	}
@@ -1232,6 +1247,48 @@ func (c *criService) linuxContainerMounts(sandboxID string, config *runtime.Cont
 		}
 	}
 	return mounts
+}
+
+// dmverityContainerImage preserves the requested manifest when config-sharing
+// aliases can select different signed materializations.
+func (c *criService) dmverityContainerImage(ctx context.Context, image imagestore.Image, spec *runtime.ImageSpec) (containerd.Image, error) {
+	isID := func(ref string) bool {
+		// LocalResolve tries named references before abbreviated IDs.
+		if ref != image.ID {
+			if normalized, err := docker.ParseDockerRef(ref); err == nil {
+				for _, alias := range image.References {
+					if normalized.String() == alias {
+						return false
+					}
+				}
+			}
+		}
+		return ref != "" && (strings.HasPrefix(image.ID, ref) ||
+			strings.HasPrefix(strings.TrimPrefix(image.ID, "sha256:"), ref))
+	}
+	requested := spec.GetImage()
+	if isID(requested) {
+		requested = spec.GetUserSpecifiedImage()
+	}
+	if requested == "" || isID(requested) {
+		return nil, fmt.Errorf("image ID %q requires an explicit image reference or UserSpecifiedImage on a dm-verity-referrer snapshotter", image.ID)
+	}
+	normalized, err := docker.ParseDockerRef(requested)
+	if err != nil {
+		return nil, fmt.Errorf("invalid requested image reference %q: %w", requested, err)
+	}
+	selected, err := c.client.GetImage(ctx, normalized.String())
+	if err != nil {
+		return nil, err
+	}
+	config, err := selected.Config(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("read config for image reference %q: %w", requested, err)
+	}
+	if config.Digest.String() != image.ID {
+		return nil, fmt.Errorf("image reference %q resolves to config %s, expected %s", requested, config.Digest, image.ID)
+	}
+	return selected, nil
 }
 
 func (c *criService) runtimeInfo(ctx context.Context, id string) (string, typeurl.Any, error) {
