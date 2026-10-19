@@ -28,8 +28,52 @@ import (
 	"github.com/containerd/containerd/v2/internal/fsmount"
 	"github.com/containerd/containerd/v2/pkg/testutil"
 	snapshotserofs "github.com/containerd/containerd/v2/plugins/snapshots/erofs"
+	"github.com/containerd/go-dmverity/pkg/verity"
 	"golang.org/x/sys/unix"
 )
+
+func TestDmveritySignatureFileBounds(t *testing.T) {
+	source := filepath.Join(t.TempDir(), "layer.erofs")
+	signaturePath := source + ".sig"
+
+	for _, tc := range []struct {
+		name    string
+		data    []byte
+		wantErr string
+		missing bool
+	}{
+		{name: "valid", data: []byte("signature")},
+		{name: "at maximum", data: make([]byte, verity.MaxSignatureSize)},
+		{name: "empty", data: nil, wantErr: "cannot be empty"},
+		{name: "oversized", data: make([]byte, verity.MaxSignatureSize+1), wantErr: "exceeds maximum size"},
+		{name: "missing", wantErr: "open signature file", missing: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.missing {
+				if err := os.Remove(signaturePath); err != nil && !os.IsNotExist(err) {
+					t.Fatal(err)
+				}
+			} else {
+				if err := os.WriteFile(signaturePath, tc.data, 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			got, err := dmveritySignatureFile(source)
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("expected error containing %q, got %v", tc.wantErr, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("dmveritySignatureFile() error = %v", err)
+			}
+			if got != signaturePath {
+				t.Fatalf("dmveritySignatureFile() = %q, want %q", got, signaturePath)
+			}
+		})
+	}
+}
 
 // TestFsmountLoopDevice tests fsmount with loop device
 func TestFsmountLoopDevice(t *testing.T) {

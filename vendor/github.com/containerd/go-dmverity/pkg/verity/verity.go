@@ -21,6 +21,7 @@ import (
 	"crypto"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"strings"
@@ -32,6 +33,33 @@ import (
 	"github.com/containerd/go-dmverity/pkg/keyring"
 	"github.com/containerd/go-dmverity/pkg/utils"
 )
+
+// MaxSignatureSize bounds signatures loaded into the kernel user keyring.
+// Linux's default per-UID key payload quota is 1 MiB, so a single untrusted
+// signature cannot exceed that kernel-compatible payload limit.
+const MaxSignatureSize = 1 << 20
+
+// ReadSignatureFile reads a nonempty dm-verity signature without allowing an
+// untrusted file to allocate more than MaxSignatureSize+1 bytes.
+func ReadSignatureFile(path string) ([]byte, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("open signature file: %w", err)
+	}
+	defer f.Close()
+
+	data, err := io.ReadAll(io.LimitReader(f, MaxSignatureSize+1))
+	if err != nil {
+		return nil, fmt.Errorf("read signature file: %w", err)
+	}
+	if len(data) == 0 {
+		return nil, errors.New("signature file cannot be empty")
+	}
+	if len(data) > MaxSignatureSize {
+		return nil, fmt.Errorf("signature file exceeds maximum size of %d bytes", MaxSignatureSize)
+	}
+	return data, nil
+}
 
 func validateParams(params *Params, digestSize int) error {
 	if params == nil {
@@ -355,7 +383,7 @@ func Open(params *Params, name, dataDevice, hashDevice string, rootHash []byte, 
 	}
 
 	if signatureFile != "" {
-		signatureData, err := os.ReadFile(signatureFile)
+		signatureData, err := ReadSignatureFile(signatureFile)
 		if err != nil {
 			return "", fmt.Errorf("failed to read signature file: %w", err)
 		}
@@ -415,17 +443,6 @@ func Open(params *Params, name, dataDevice, hashDevice string, rootHash []byte, 
 	}
 	defer c.Close()
 
-	created := false
-	defer func() {
-		if !created {
-			_ = c.RemoveDevice(name)
-		}
-	}()
-
-	if _, err := c.CreateDevice(name); err != nil {
-		return "", err
-	}
-
 	target := dm.Target{
 		SectorStart: 0,
 		Length:      lengthSectors,
@@ -433,20 +450,13 @@ func Open(params *Params, name, dataDevice, hashDevice string, rootHash []byte, 
 		Params:      targetParams,
 	}
 
-	if err := c.LoadTable(name, []dm.Target{target}); err != nil {
-		_ = c.RemoveDevice(name)
-		return "", fmt.Errorf("load table: %w", err)
-	}
-
-	if err := c.SuspendDevice(name, false); err != nil {
-		_ = c.RemoveDevice(name)
+	if err := activateDevice(c, name, target); err != nil {
 		if signatureFile != "" && errors.Is(err, unix.EKEYREJECTED) {
-			return "", fmt.Errorf("signature verification failed: key rejected by kernel (check trusted keyring)")
+			return "", fmt.Errorf("signature verification failed: key rejected by kernel (check trusted keyring): %w", err)
 		}
-		return "", fmt.Errorf("resume device: %w", err)
+		return "", err
 	}
 
-	created = true
 	devPath := "/dev/mapper/" + name
 
 	for i := 0; i < 50; i++ {
@@ -457,6 +467,33 @@ func Open(params *Params, name, dataDevice, hashDevice string, rootHash []byte, 
 	}
 
 	return devPath, nil
+}
+
+type deviceActivator interface {
+	CreateDevice(string) (uint64, error)
+	LoadTable(string, []dm.Target) error
+	SuspendDevice(string, bool) error
+	RemoveDevice(string) error
+}
+
+func activateDevice(c deviceActivator, name string, target dm.Target) (retErr error) {
+	if _, err := c.CreateDevice(name); err != nil {
+		return err
+	}
+	defer func() {
+		if retErr != nil {
+			if err := c.RemoveDevice(name); err != nil {
+				retErr = errors.Join(retErr, fmt.Errorf("remove failed activation %q: %w", name, err))
+			}
+		}
+	}()
+	if err := c.LoadTable(name, []dm.Target{target}); err != nil {
+		return fmt.Errorf("load table: %w", err)
+	}
+	if err := c.SuspendDevice(name, false); err != nil {
+		return fmt.Errorf("resume device: %w", err)
+	}
+	return nil
 }
 
 func Close(name string) error {
