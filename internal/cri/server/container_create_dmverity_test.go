@@ -125,6 +125,13 @@ func TestDmverityContainerImage(t *testing.T) {
 		{name: "bare ID requires binding", spec: runtime.ImageSpec{Image: id}, wantErr: "requires an explicit image reference"},
 		{name: "bare short ID requires binding", spec: runtime.ImageSpec{Image: config.Descriptor.Digest.Encoded()[:12]}, wantErr: "requires an explicit image reference"},
 		{name: "user image is also an ID", spec: runtime.ImageSpec{Image: id, UserSpecifiedImage: id}, wantErr: "requires an explicit image reference"},
+		{name: "unambiguous ID", spec: runtime.ImageSpec{Image: id}, aliases: []string{plainRef}, want: plainRef},
+		{name: "unambiguous short ID", spec: runtime.ImageSpec{Image: shortID}, aliases: []string{plainRef}, want: plainRef},
+		{name: "unambiguous signed ID", spec: runtime.ImageSpec{Image: id}, aliases: []string{signedRef}, want: signedRef},
+		{name: "no cached aliases", spec: runtime.ImageSpec{Image: id}, aliases: []string{}, wantErr: "has no cached image references"},
+		{name: "aliases of same manifest", spec: runtime.ImageSpec{Image: id}, aliases: []string{signedRef, digestRef}, want: signedRef},
+		{name: "index and manifest aliases", spec: runtime.ImageSpec{Image: id}, aliases: []string{signedRef, "docker.io/library/test:index"}, want: signedRef},
+		{name: "repointed cached alias", spec: runtime.ImageSpec{Image: id}, aliases: []string{"docker.io/library/test:repointed"}, wantErr: "expected " + id},
 		{name: "stock ignores requested signed tag", spec: runtime.ImageSpec{Image: "test:signed"}, stock: true, want: plainRef},
 		{name: "stock ignores unbound user image", spec: runtime.ImageSpec{Image: id, UserSpecifiedImage: "test:repointed"}, stock: true, want: plainRef},
 		{name: "stock does not inspect invalid metadata", spec: runtime.ImageSpec{Image: id}, aliases: []string{"docker.io/library/test:invalid", signedRef}, stock: true, want: "docker.io/library/test:invalid"},
@@ -144,7 +151,7 @@ func TestDmverityContainerImage(t *testing.T) {
 			if tc.stock {
 				actual, err = service.toContainerdImage(ctx, image)
 			} else {
-				actual, err = service.dmverityContainerImage(ctx, image, &tc.spec)
+				actual, err = service.dmverityContainerImage(ctx, image, &tc.spec, nil)
 			}
 			if tc.wantErr != "" {
 				require.ErrorContains(t, err, tc.wantErr)
@@ -153,7 +160,7 @@ func TestDmverityContainerImage(t *testing.T) {
 			}
 			require.NoError(t, err)
 			require.Equal(t, tc.want, actual.Name())
-			// Checkpoint and image-volume callers retain the original conversion.
+			// Checkpoint callers retain the original conversion.
 			original, err := service.toContainerdImage(ctx, image)
 			require.NoError(t, err)
 			require.Equal(t, aliases[0], original.Name())

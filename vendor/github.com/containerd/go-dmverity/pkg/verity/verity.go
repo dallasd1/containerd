@@ -21,6 +21,7 @@ import (
 	"crypto"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"strings"
@@ -32,6 +33,33 @@ import (
 	"github.com/containerd/go-dmverity/pkg/keyring"
 	"github.com/containerd/go-dmverity/pkg/utils"
 )
+
+// MaxSignatureSize bounds signatures loaded into the kernel user keyring.
+// Linux's default per-UID key payload quota is 1 MiB, so a single untrusted
+// signature cannot exceed that kernel-compatible payload limit.
+const MaxSignatureSize = 1 << 20
+
+// ReadSignatureFile reads a nonempty dm-verity signature without allowing an
+// untrusted file to allocate more than MaxSignatureSize+1 bytes.
+func ReadSignatureFile(path string) ([]byte, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("open signature file: %w", err)
+	}
+	defer f.Close()
+
+	data, err := io.ReadAll(io.LimitReader(f, MaxSignatureSize+1))
+	if err != nil {
+		return nil, fmt.Errorf("read signature file: %w", err)
+	}
+	if len(data) == 0 {
+		return nil, errors.New("signature file cannot be empty")
+	}
+	if len(data) > MaxSignatureSize {
+		return nil, fmt.Errorf("signature file exceeds maximum size of %d bytes", MaxSignatureSize)
+	}
+	return data, nil
+}
 
 func validateParams(params *Params, digestSize int) error {
 	if params == nil {
@@ -355,7 +383,7 @@ func Open(params *Params, name, dataDevice, hashDevice string, rootHash []byte, 
 	}
 
 	if signatureFile != "" {
-		signatureData, err := os.ReadFile(signatureFile)
+		signatureData, err := ReadSignatureFile(signatureFile)
 		if err != nil {
 			return "", fmt.Errorf("failed to read signature file: %w", err)
 		}

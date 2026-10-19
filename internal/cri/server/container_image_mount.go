@@ -95,7 +95,16 @@ func (c *criService) mutateImageMount(
 	if err != nil {
 		return fmt.Errorf("failed to resolve image %q: %w", ref, err)
 	}
-	containerdImage, err := c.toContainerdImage(ctx, image)
+	capable, err := c.dmverityReferrersEnabled(ctx, snapshotter)
+	if err != nil {
+		return err
+	}
+	var containerdImage containerd.Image
+	if capable {
+		containerdImage, err = c.dmverityContainerImage(ctx, image, imageSpec, platforms.Only(platform))
+	} else {
+		containerdImage, err = c.toContainerdImage(ctx, image)
+	}
 	if err != nil {
 		return fmt.Errorf("failed to get image from containerd %q: %w", image.ID, err)
 	}
@@ -113,21 +122,19 @@ func (c *criService) mutateImageMount(
 		return fmt.Errorf("failed to ensure %s is mounted: %w", target, err)
 	}
 	if mounted {
-		capable, err := c.dmverityReferrersEnabled(ctx, snapshotter)
-		if err != nil {
-			return err
-		}
 		if !capable {
 			return setImageMountPath(extraMount, target)
 		}
 	}
 
-	img, err := c.client.ImageService().Get(ctx, ref)
-	if err != nil {
-		return fmt.Errorf("failed to get image volume ref %q: %w", ref, err)
+	i := containerdImage
+	if !capable {
+		img, err := c.client.ImageService().Get(ctx, ref)
+		if err != nil {
+			return fmt.Errorf("failed to get image volume ref %q: %w", ref, err)
+		}
+		i = containerd.NewImageWithPlatform(c.client, img, platforms.Only(platform))
 	}
-
-	i := containerd.NewImageWithPlatform(c.client, img, platforms.Only(platform))
 	diffIDs, err := i.RootFS(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to get diff IDs for image volume %q: %w", ref, err)

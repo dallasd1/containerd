@@ -30,6 +30,7 @@ import (
 	"github.com/containerd/typeurl/v2"
 	"github.com/davecgh/go-spew/spew"
 	docker "github.com/distribution/reference"
+	"github.com/opencontainers/go-digest"
 	imagespec "github.com/opencontainers/image-spec/specs-go/v1"
 	runtimespec "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/opencontainers/selinux/go-selinux"
@@ -38,6 +39,7 @@ import (
 
 	containerd "github.com/containerd/containerd/v2/client"
 	"github.com/containerd/containerd/v2/core/containers"
+	"github.com/containerd/containerd/v2/core/images"
 	"github.com/containerd/containerd/v2/internal/cri/annotations"
 	criconfig "github.com/containerd/containerd/v2/internal/cri/config"
 	cio "github.com/containerd/containerd/v2/internal/cri/io"
@@ -204,7 +206,7 @@ func (c *criService) CreateContainer(ctx context.Context, r *runtime.CreateConta
 	}
 	var containerdImage containerd.Image
 	if capable {
-		containerdImage, err = c.dmverityContainerImage(ctx, image, config.GetImage())
+		containerdImage, err = c.dmverityContainerImage(ctx, image, config.GetImage(), nil)
 	} else {
 		containerdImage, err = c.toContainerdImage(ctx, image)
 	}
@@ -1251,7 +1253,13 @@ func (c *criService) linuxContainerMounts(sandboxID string, config *runtime.Cont
 
 // dmverityContainerImage preserves the requested manifest when config-sharing
 // aliases can select different signed materializations.
-func (c *criService) dmverityContainerImage(ctx context.Context, image imagestore.Image, spec *runtime.ImageSpec) (containerd.Image, error) {
+func (c *criService) dmverityContainerImage(ctx context.Context, image imagestore.Image, spec *runtime.ImageSpec, platform platforms.MatchComparer) (containerd.Image, error) {
+	withPlatform := func(selected containerd.Image) containerd.Image {
+		if platform != nil {
+			return containerd.NewImageWithPlatform(c.client, selected.Metadata(), platform)
+		}
+		return selected
+	}
 	isID := func(ref string) bool {
 		// LocalResolve tries named references before abbreviated IDs.
 		if ref != image.ID {
@@ -1271,7 +1279,48 @@ func (c *criService) dmverityContainerImage(ctx context.Context, image imagestor
 		requested = spec.GetUserSpecifiedImage()
 	}
 	if requested == "" || isID(requested) {
-		return nil, fmt.Errorf("image ID %q requires an explicit image reference or UserSpecifiedImage on a dm-verity-referrer snapshotter", image.ID)
+		var selected containerd.Image
+		var manifestDigest digest.Digest
+		for _, ref := range image.References {
+			candidate, err := c.client.GetImage(ctx, ref)
+			if err != nil {
+				return nil, fmt.Errorf("resolve cached image reference %q: %w", ref, err)
+			}
+			config, err := candidate.Config(ctx)
+			if err != nil {
+				return nil, fmt.Errorf("read config for cached image reference %q: %w", ref, err)
+			}
+			if config.Digest.String() != image.ID {
+				return nil, fmt.Errorf("cached image reference %q resolves to config %s, expected %s", ref, config.Digest, image.ID)
+			}
+			candidate = withPlatform(candidate)
+			var currentDigest digest.Digest
+			children := images.LimitManifests(images.FilterPlatforms(
+				images.ChildrenHandler(c.client.ContentStore()), candidate.Platform()), candidate.Platform(), 1)
+			err = images.Walk(ctx, images.HandlerFunc(func(ctx context.Context, desc imagespec.Descriptor) ([]imagespec.Descriptor, error) {
+				if images.IsManifestType(desc.MediaType) {
+					currentDigest = desc.Digest
+					return nil, nil
+				}
+				return children.Handle(ctx, desc)
+			}), candidate.Target())
+			if err != nil {
+				return nil, fmt.Errorf("resolve cached image manifest %q: %w", ref, err)
+			}
+			if currentDigest == "" {
+				return nil, fmt.Errorf("cached image reference %q has no matching manifest", ref)
+			}
+			if selected != nil && manifestDigest != currentDigest {
+				return nil, fmt.Errorf("image ID %q requires an explicit image reference or UserSpecifiedImage to distinguish cached manifests", image.ID)
+			}
+			if selected == nil {
+				selected, manifestDigest = candidate, currentDigest
+			}
+		}
+		if selected == nil {
+			return nil, fmt.Errorf("image ID %q has no cached image references", image.ID)
+		}
+		return selected, nil
 	}
 	normalized, err := docker.ParseDockerRef(requested)
 	if err != nil {
@@ -1288,7 +1337,7 @@ func (c *criService) dmverityContainerImage(ctx context.Context, image imagestor
 	if config.Digest.String() != image.ID {
 		return nil, fmt.Errorf("image reference %q resolves to config %s, expected %s", requested, config.Digest, image.ID)
 	}
-	return selected, nil
+	return withPlatform(selected), nil
 }
 
 func (c *criService) runtimeInfo(ctx context.Context, id string) (string, typeurl.Any, error) {

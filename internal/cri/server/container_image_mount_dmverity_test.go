@@ -28,6 +28,7 @@ import (
 	"github.com/containerd/containerd/v2/core/images/imagetest"
 	"github.com/containerd/containerd/v2/core/introspection"
 	"github.com/containerd/containerd/v2/core/snapshots"
+	imagestore "github.com/containerd/containerd/v2/internal/cri/store/image"
 	"github.com/containerd/containerd/v2/pkg/namespaces"
 	"github.com/containerd/containerd/v2/plugins"
 	"github.com/containerd/errdefs"
@@ -35,12 +36,115 @@ import (
 	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/stretchr/testify/require"
+	runtime "k8s.io/cri-api/pkg/apis/runtime/v1"
 )
+
+type volumeImageService struct {
+	ImageService
+	image imagestore.Image
+}
+
+func (s volumeImageService) LocalResolve(string) (imagestore.Image, error) {
+	return s.image, nil
+}
+
+func TestSignedImageVolumePreservesRequestedManifest(t *testing.T) {
+	ctx := t.Context()
+	store := imagetest.NewContentStore(ctx, t)
+	config := store.JSONObject(ocispec.MediaTypeImageConfig, ocispec.Image{
+		Platform: platforms.DefaultSpec(),
+		RootFS:   ocispec.RootFS{Type: "layers", DiffIDs: []digest.Digest{digest.FromString("layer")}},
+	})
+	layer := store.RandomBlob(ocispec.MediaTypeImageLayer, 16)
+	plain := store.Manifest(config, layer)
+	signed := store.JSONObject(ocispec.MediaTypeImageManifest, ocispec.Manifest{
+		Config: config.Descriptor, Layers: []ocispec.Descriptor{layer.Descriptor},
+		Annotations: map[string]string{"variant": "signed"},
+	})
+	const signedRef = "docker.io/library/test:signed"
+	const plainRef = "docker.io/library/test:plain"
+	id := config.Descriptor.Digest.String()
+	_, err := store.Update(ctx, content.Info{
+		Digest: signed.Descriptor.Digest,
+		Labels: map[string]string{"containerd.io/gc.ref.content.dmverity": digest.FromString("bundle").String()},
+	}, "labels")
+	require.NoError(t, err)
+	client, err := containerd.New("", containerd.WithServices(
+		containerd.WithContentStore(store.Store),
+		containerd.WithImageStore(aliasImageStore{records: map[string]images.Image{
+			plainRef:  {Name: plainRef, Target: plain.Descriptor},
+			signedRef: {Name: signedRef, Target: signed.Descriptor},
+			id:        {Name: id, Target: plain.Descriptor},
+		}}),
+	))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, client.Close()) })
+	service := &criService{
+		client: client, dmverityCapabilities: map[string]bool{"erofs": true},
+		ImageService: volumeImageService{image: imagestore.Image{ID: id, References: []string{plainRef, signedRef}}},
+	}
+	service.config.StateDir = t.TempDir()
+	err = service.mutateImageMount(ctx, &runtime.Mount{
+		Readonly: true, Image: &runtime.ImageSpec{Image: id, UserSpecifiedImage: signedRef},
+	}, "erofs", "sandbox", platforms.DefaultSpec())
+	require.ErrorIs(t, err, errdefs.ErrNotImplemented)
+}
 
 type dmverityVolumeSnapshotter struct {
 	snapshots.Snapshotter
 	info snapshots.Info
 	err  error
+}
+
+func TestSignedImageVolumeUsesSandboxPlatform(t *testing.T) {
+	ctx := t.Context()
+	store := imagetest.NewContentStore(ctx, t)
+	sandboxPlatform := platforms.DefaultSpec()
+	sandboxPlatform.Architecture = "arm64"
+	if platforms.DefaultSpec().Architecture == "arm64" {
+		sandboxPlatform.Architecture = "amd64"
+	}
+	hostConfig := store.JSONObject(ocispec.MediaTypeImageConfig, ocispec.Image{
+		Platform: platforms.DefaultSpec(),
+		RootFS:   ocispec.RootFS{Type: "layers", DiffIDs: []digest.Digest{digest.FromString("host")}},
+	})
+	sandboxConfig := store.JSONObject(ocispec.MediaTypeImageConfig, ocispec.Image{
+		Platform: sandboxPlatform,
+		RootFS:   ocispec.RootFS{Type: "layers", DiffIDs: []digest.Digest{digest.FromString("sandbox")}},
+	})
+	layer := store.RandomBlob(ocispec.MediaTypeImageLayer, 16)
+	hostManifest := store.Manifest(hostConfig, layer)
+	sandboxManifest := store.Manifest(sandboxConfig, layer)
+	index := store.Index(
+		imagetest.AddPlatform(hostManifest, platforms.DefaultSpec()),
+		imagetest.AddPlatform(sandboxManifest, sandboxPlatform),
+	)
+	_, err := store.Update(ctx, content.Info{
+		Digest: sandboxManifest.Descriptor.Digest,
+		Labels: map[string]string{"containerd.io/gc.ref.content.dmverity": digest.FromString("bundle").String()},
+	}, "labels")
+	require.NoError(t, err)
+	const ref = "docker.io/library/test:multi"
+	client, err := containerd.New("", containerd.WithServices(
+		containerd.WithContentStore(store.Store),
+		containerd.WithImageStore(aliasImageStore{records: map[string]images.Image{
+			ref: {Name: ref, Target: index.Descriptor},
+		}}),
+	))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, client.Close()) })
+	id := hostConfig.Descriptor.Digest.String()
+	service := &criService{
+		client: client, dmverityCapabilities: map[string]bool{"erofs": true},
+		ImageService: volumeImageService{image: imagestore.Image{ID: id, References: []string{ref}}},
+	}
+	service.config.StateDir = t.TempDir()
+	for _, spec := range []*runtime.ImageSpec{{Image: ref}, {Image: id}} {
+		err := service.mutateImageMount(ctx, &runtime.Mount{
+			Readonly: true, Image: spec,
+		}, "erofs", "sandbox", sandboxPlatform)
+		require.ErrorIs(t, err, errdefs.ErrNotImplemented)
+	}
 }
 
 type volumeIntrospection struct {

@@ -517,6 +517,7 @@ func TestUnpackConfigSharingManifests(t *testing.T) {
 		order       []ocispec.Descriptor
 		wantFetched []ocispec.Descriptor
 		wantUnpacks int
+		policy      bool
 	}{
 		{
 			name:        "config after both manifests",
@@ -531,6 +532,38 @@ func TestUnpackConfigSharingManifests(t *testing.T) {
 			order:       []ocispec.Descriptor{manifestA, config, manifestB, config},
 			wantFetched: slices.Concat([]ocispec.Descriptor{manifestA, manifestB, config}, layersA, layersB),
 			wantUnpacks: 1,
+		},
+		{
+			name:        "distinct cached chains config after manifests",
+			children:    sharedConfig,
+			order:       []ocispec.Descriptor{manifestA, manifestB, config, config},
+			wantFetched: slices.Concat([]ocispec.Descriptor{manifestA, manifestB, config}, layersA, layersB),
+			wantUnpacks: 2,
+			policy:      true,
+		},
+		{
+			name:        "distinct cached chains config between manifests",
+			children:    sharedConfig,
+			order:       []ocispec.Descriptor{manifestA, config, manifestB, config},
+			wantFetched: slices.Concat([]ocispec.Descriptor{manifestA, manifestB, config}, layersA, layersB),
+			wantUnpacks: 2,
+			policy:      true,
+		},
+		{
+			name:        "distinct cached chains reversed manifests",
+			children:    sharedConfig,
+			order:       []ocispec.Descriptor{manifestB, config, manifestA, config},
+			wantFetched: slices.Concat([]ocispec.Descriptor{manifestA, manifestB, config}, layersA, layersB),
+			wantUnpacks: 2,
+			policy:      true,
+		},
+		{
+			name:        "lone policy manifest with existing snapshots",
+			children:    sharedConfig,
+			order:       []ocispec.Descriptor{manifestA, config},
+			wantFetched: []ocispec.Descriptor{manifestA, config},
+			wantUnpacks: 1,
+			policy:      true,
 		},
 		{
 			name:        "lone manifest with existing snapshots",
@@ -557,10 +590,19 @@ func TestUnpackConfigSharingManifests(t *testing.T) {
 				return tc.children[desc.Digest], nil
 			})
 
-			u, err := NewUnpacker(ctx, cs.Store, WithUnpackPlatform(Platform{
+			up := Platform{
 				Snapshotter: alreadyExistsSnapshotter{},
 				Applier:     failApplier{t},
-			}))
+			}
+			if tc.policy {
+				up.PrepareLayer = func(_ context.Context, desc ocispec.Descriptor, chainID, parent string) (snapshots.LayerPreparation, error) {
+					return snapshots.LayerPreparation{
+						Key:         digest.FromString(parent + chainID + desc.Digest.String()).String(),
+						GCQualifier: "variant",
+					}, nil
+				}
+			}
+			u, err := NewUnpacker(ctx, cs.Store, WithUnpackPlatform(up))
 			require.NoError(t, err)
 
 			wrapped := u.Unpack(h)
@@ -579,6 +621,187 @@ func TestUnpackConfigSharingManifests(t *testing.T) {
 			assert.Equal(t, tc.wantUnpacks, res.Unpacks)
 		})
 	}
+}
+
+func TestOneDispatchUnpacksDistinctPreparedVariants(t *testing.T) {
+	diffIDs := []digest.Digest{digest.FromString("shared base"), digest.FromString("shared top")}
+	chainIDs := identity.ChainIDs(append([]digest.Digest(nil), diffIDs...))
+
+	newVariantLayers := func(layers []imagetest.Content, roots []string) []ocispec.Descriptor {
+		selected := make([]ocispec.Descriptor, len(layers))
+		for i, layer := range layers {
+			selected[i] = layer.Descriptor
+			if roots[i] != "" {
+				selected[i].Annotations = map[string]string{"test.root": roots[i]}
+			}
+		}
+		return selected
+	}
+
+	selectedKey := func(chainID, parent, root string) string {
+		if root == "" {
+			return chainID
+		}
+		key := "signed-" + root + "-" + chainID
+		if parent != "" {
+			key += "-from-" + digest.FromString(parent).Encoded()
+		}
+		return key
+	}
+
+	for _, tc := range []struct {
+		name     string
+		variants []struct {
+			name  string
+			roots []string
+		}
+		wantKeys []string
+	}{
+		{
+			name: "plain and signed",
+			variants: []struct {
+				name  string
+				roots []string
+			}{
+				{name: "plain", roots: []string{"", ""}},
+				{name: "signed", roots: []string{"signed-base", "signed-top"}},
+			},
+			wantKeys: []string{
+				chainIDs[0].String(),
+				chainIDs[1].String(),
+				selectedKey(chainIDs[0].String(), "", "signed-base"),
+				selectedKey(chainIDs[1].String(), selectedKey(chainIDs[0].String(), "", "signed-base"), "signed-top"),
+			},
+		},
+		{
+			name: "different signed roots",
+			variants: []struct {
+				name  string
+				roots []string
+			}{
+				{name: "signed-a", roots: []string{"base-a", "shared-top"}},
+				{name: "signed-b", roots: []string{"base-b", "shared-top"}},
+			},
+			wantKeys: []string{
+				selectedKey(chainIDs[0].String(), "", "base-a"),
+				selectedKey(chainIDs[1].String(), selectedKey(chainIDs[0].String(), "", "base-a"), "shared-top"),
+				selectedKey(chainIDs[0].String(), "", "base-b"),
+				selectedKey(chainIDs[1].String(), selectedKey(chainIDs[0].String(), "", "base-b"), "shared-top"),
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := t.Context()
+			store := imagetest.NewContentStore(ctx, t)
+			config := store.JSONObject(ocispec.MediaTypeImageConfig, ocispec.Image{
+				Platform: platforms.DefaultSpec(),
+				RootFS:   ocispec.RootFS{Type: "layers", DiffIDs: diffIDs},
+			})
+			layers := []imagetest.Content{
+				store.Blob(ocispec.MediaTypeImageLayerGzip, []byte("shared base blob")),
+				store.Blob(ocispec.MediaTypeImageLayerGzip, []byte("shared top blob")),
+			}
+
+			var manifests []imagetest.Content
+			children := map[digest.Digest][]ocispec.Descriptor{}
+			for _, variant := range tc.variants {
+				manifest := store.Manifest(config, layers...)
+				manifest.Descriptor.Digest = digest.FromString("manifest-" + variant.name)
+				manifests = append(manifests, manifest)
+				children[manifest.Descriptor.Digest] = append([]ocispec.Descriptor{config.Descriptor}, newVariantLayers(layers, variant.roots)...)
+			}
+			index := store.Index(manifests...)
+			indexChildren := make([]ocispec.Descriptor, 0, len(manifests))
+			for _, manifest := range manifests {
+				indexChildren = append(indexChildren, manifest.Descriptor)
+			}
+			children[index.Descriptor.Digest] = indexChildren
+
+			handler := images.HandlerFunc(func(_ context.Context, desc ocispec.Descriptor) ([]ocispec.Descriptor, error) {
+				return children[desc.Digest], nil
+			})
+			sn := &recordingSnapshotter{committed: map[string]snapshots.Info{}}
+			applier := &countingDiffIDApplier{mapping: map[digest.Digest]digest.Digest{
+				layers[0].Descriptor.Digest: diffIDs[0],
+				layers[1].Descriptor.Digest: diffIDs[1],
+			}}
+			u, err := NewUnpacker(ctx, store.Store, WithUnpackPlatform(Platform{
+				SnapshotterKey: "erofs",
+				Snapshotter:    sn,
+				Applier:        applier,
+				PrepareLayer: func(_ context.Context, desc ocispec.Descriptor, chainID, parent string) (snapshots.LayerPreparation, error) {
+					root := desc.Annotations["test.root"]
+					key := selectedKey(chainID, parent, root)
+					preparation := snapshots.LayerPreparation{Key: key}
+					if root != "" {
+						preparation.GCQualifier = "variant-" + digest.FromString(key).Encoded()
+					}
+					return preparation, nil
+				},
+			}))
+			require.NoError(t, err)
+
+			require.NoError(t, images.Dispatch(ctx, u.Unpack(handler), nil, index.Descriptor))
+			res, err := u.Wait()
+			require.NoError(t, err)
+			require.Equal(t, len(tc.variants), res.Unpacks)
+			require.Len(t, sn.committed, len(tc.wantKeys))
+			for _, key := range tc.wantKeys {
+				require.Contains(t, sn.committed, key)
+			}
+		})
+	}
+}
+
+func TestOneDispatchDedupsOrdinarySameConfigIdentity(t *testing.T) {
+	ctx := t.Context()
+	store := imagetest.NewContentStore(ctx, t)
+	diffIDs := []digest.Digest{digest.FromString("shared base"), digest.FromString("shared top")}
+	config := store.JSONObject(ocispec.MediaTypeImageConfig, ocispec.Image{
+		Platform: platforms.DefaultSpec(),
+		RootFS:   ocispec.RootFS{Type: "layers", DiffIDs: diffIDs},
+	})
+	layersA := []imagetest.Content{
+		store.Blob(ocispec.MediaTypeImageLayerGzip, []byte("base-a")),
+		store.Blob(ocispec.MediaTypeImageLayerGzip, []byte("top-a")),
+	}
+	layersB := []imagetest.Content{
+		store.Blob(ocispec.MediaTypeImageLayerGzip, []byte("base-b")),
+		store.Blob(ocispec.MediaTypeImageLayerGzip, []byte("top-b")),
+	}
+	manifestA := store.Manifest(config, layersA...)
+	manifestA.Descriptor.Digest = digest.FromString("plain-a")
+	manifestB := store.Manifest(config, layersB...)
+	manifestB.Descriptor.Digest = digest.FromString("plain-b")
+	index := store.Index(manifestA, manifestB)
+	children := map[digest.Digest][]ocispec.Descriptor{
+		index.Descriptor.Digest:     []ocispec.Descriptor{manifestA.Descriptor, manifestB.Descriptor},
+		manifestA.Descriptor.Digest: append([]ocispec.Descriptor{config.Descriptor}, layersA[0].Descriptor, layersA[1].Descriptor),
+		manifestB.Descriptor.Digest: append([]ocispec.Descriptor{config.Descriptor}, layersB[0].Descriptor, layersB[1].Descriptor),
+	}
+
+	handler := images.HandlerFunc(func(_ context.Context, desc ocispec.Descriptor) ([]ocispec.Descriptor, error) {
+		return children[desc.Digest], nil
+	})
+	sn := &recordingSnapshotter{committed: map[string]snapshots.Info{}}
+	applier := countingDiffIDApplier{mapping: map[digest.Digest]digest.Digest{
+		layersA[0].Descriptor.Digest: diffIDs[0],
+		layersA[1].Descriptor.Digest: diffIDs[1],
+		layersB[0].Descriptor.Digest: diffIDs[0],
+		layersB[1].Descriptor.Digest: diffIDs[1],
+	}}
+	u, err := NewUnpacker(ctx, store.Store, WithUnpackPlatform(Platform{
+		Snapshotter: sn,
+		Applier:     &applier,
+	}))
+	require.NoError(t, err)
+
+	require.NoError(t, images.Dispatch(ctx, u.Unpack(handler), nil, index.Descriptor))
+	res, err := u.Wait()
+	require.NoError(t, err)
+	require.Equal(t, 1, res.Unpacks)
+	require.Len(t, sn.committed, len(diffIDs))
+	require.Equal(t, len(diffIDs), applier.calls())
 }
 
 type policyTestLocker struct {
@@ -678,6 +901,25 @@ type diffIDApplier map[digest.Digest]digest.Digest
 
 func (a diffIDApplier) Apply(_ context.Context, desc ocispec.Descriptor, _ []mount.Mount, _ ...diff.ApplyOpt) (ocispec.Descriptor, error) {
 	return ocispec.Descriptor{MediaType: ocispec.MediaTypeImageLayer, Digest: a[desc.Digest]}, nil
+}
+
+type countingDiffIDApplier struct {
+	mu      sync.Mutex
+	count   int
+	mapping map[digest.Digest]digest.Digest
+}
+
+func (a *countingDiffIDApplier) Apply(_ context.Context, desc ocispec.Descriptor, _ []mount.Mount, _ ...diff.ApplyOpt) (ocispec.Descriptor, error) {
+	a.mu.Lock()
+	a.count++
+	a.mu.Unlock()
+	return ocispec.Descriptor{MediaType: ocispec.MediaTypeImageLayer, Digest: a.mapping[desc.Digest]}, nil
+}
+
+func (a *countingDiffIDApplier) calls() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.count
 }
 
 // signedImageFixture stores an image whose layer has a retained signed bundle.

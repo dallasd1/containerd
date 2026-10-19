@@ -26,6 +26,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/containerd/go-dmverity/pkg/verity"
 	"github.com/containerd/log"
 	"github.com/containerd/platforms"
 	"github.com/containerd/plugin"
@@ -284,12 +285,9 @@ func setupSignedDmVerityDevice(ctx context.Context, source, expectedRootHash str
 // dmveritySignatureFile checks readability and nonempty contents before mapper reuse.
 func dmveritySignatureFile(source string) (string, error) {
 	signatureFile := dmverity.SignaturePath(source)
-	signature, err := os.ReadFile(signatureFile)
+	_, err := verity.ReadSignatureFile(signatureFile)
 	if err != nil {
 		return "", fmt.Errorf("read dm-verity signature %q: %w", signatureFile, err)
-	}
-	if len(signature) == 0 {
-		return "", fmt.Errorf("dm-verity signature %q cannot be empty", signatureFile)
 	}
 	return signatureFile, nil
 }

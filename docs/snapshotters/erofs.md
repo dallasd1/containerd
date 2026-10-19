@@ -343,10 +343,23 @@ ChainIDs. A replacement signature for the same root reuses the existing snapshot
 and its original signature; it does not overwrite cached signature identity.
 
 CRI snapshot creation and unpack readiness resolve this same chain from the
-selected platform manifest and its retained referrer bundle. Each signed top key
+selected platform manifest and its retained referrer bundle. Only rootfs layer
+descriptors participate in this chain; non-layer artifacts are excluded, matching
+the image unpacker's layer selection. Each signed top key
 gets a distinct config GC reference
 `containerd.io/gc.ref.snapshot.<snapshotter>/dmverity-<sha256(topKey)>`,
 alongside any plain reference, so variants sharing a config remain reachable.
+Manifests sharing a config are deduplicated for unpack only when they select the
+same prepared snapshot chain. Alternate layer blobs are still fetched, including
+when the selected snapshots are already cached.
+
+Signed unpacking requires the EROFS differ. Before committing a snapshot with a
+signed identity, the snapshotter checks that the EROFS blob, dm-verity metadata,
+and selected signature were materialized and match that identity. A walking
+differ cannot satisfy this contract: the pull fails instead of converting its
+upper directory into an unsigned blob under a signed key. Ordinary unsigned
+EROFS snapshots retain the walking-differ conversion fallback. Kernel signature
+trust is still checked when the signed layer is mounted.
 
 Legacy `<ChainID>-dmverity` snapshots and their references are left untouched.
 They are not selected by the new policy: a subsequent signed unpack materializes

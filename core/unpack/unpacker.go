@@ -209,10 +209,11 @@ func (u *Unpacker) Unpack(h images.Handler) images.Handler {
 		// and so identical configs), which is why one digest can hold the
 		// layers of several manifests.
 		queuedLayers = map[digest.Digest][][]ocispec.Descriptor{}
-		// Maps a config's digest to the layer descriptors selected for unpack.
-		// Once these layers are queued for fetch, the value is set to nil. The key
-		// remains to prevent scheduling another unpack.
-		unpackedLayers = map[digest.Digest][]ocispec.Descriptor{}
+		// Maps a config's digest to the first manifest layers scheduled for each
+		// unpack identity. Once those layers are also queued for fetch, the value
+		// is set to nil to preserve ordinary same-identity dedup while ensuring at
+		// least one set of blobs reaches the content store if unpack hits cache.
+		unpackedLayers = map[digest.Digest]map[string][]ocispec.Descriptor{}
 	)
 
 	var layerTypes map[string]bool
@@ -283,34 +284,83 @@ func (u *Unpacker) Unpack(h images.Handler) images.Handler {
 			lock.Lock()
 			queued := queuedLayers[desc.Digest]
 			delete(queuedLayers, desc.Digest)
-			// Because manifests that share the same config unpack to the same
-			// snapshot chain, we only need to unpack the layers for one
-			// manifest. The layers for any remaining manifests sharing that
-			// config are still fetched to ensure they make it in the content
-			// store.
-			var first []ocispec.Descriptor
-			unpacked, ok := unpackedLayers[desc.Digest]
-			if !ok && len(queued) > 0 {
-				first, queued = queued[0], queued[1:]
-				unpacked = first
-				unpackedLayers[desc.Digest] = first
-			}
-			// Unpack may skip fetching layers whose snapshots already exist.
-			// If another manifest shares this config, explicitly fetch the first
-			// manifest's layers too so every manifest's blobs reach the content
-			// store. For a config used by only one manifest, leave fetching to
-			// unpack.
-			if len(queued) > 0 && len(unpacked) > 0 {
-				queued = append(queued, unpacked)
-				unpackedLayers[desc.Digest] = nil
-			}
 			lock.Unlock()
-			if len(first) > 0 {
+
+			var (
+				identities []string
+				prepared   [][]snapshots.LayerPreparation
+				toUnpack   []int
+				toFetch    [][]ocispec.Descriptor
+			)
+
+			if len(queued) > 0 {
+				cfg, err := u.readUnpackConfig(ctx, desc)
+				if err != nil {
+					u.eg.Go(func() error { return err })
+					return children, nil
+				}
+				unpack := u.selectPlatform(desc, cfg)
+				identities = make([]string, len(queued))
+				prepared = make([][]snapshots.LayerPreparation, len(queued))
+				// Ordinary images retain config-based dedup. Only a layer
+				// policy can select different chains for the same config.
+				if unpack != nil && unpack.PrepareLayer != nil {
+					for i, layers := range queued {
+						_, preparations, err := u.prepareLayers(ctx, unpack, layers, cfg.RootFS.DiffIDs)
+						if err != nil {
+							u.eg.Go(func() error { return err })
+							return children, nil
+						}
+						prepared[i] = preparations
+						identities[i] = layerPreparationIdentity(preparations)
+					}
+				}
+			}
+
+			if len(queued) > 0 {
+				lock.Lock()
+				byIdentity, ok := unpackedLayers[desc.Digest]
+				if !ok {
+					byIdentity = make(map[string][]ocispec.Descriptor)
+					unpackedLayers[desc.Digest] = byIdentity
+				}
+				for i, layers := range queued {
+					id := identities[i]
+					unpacked, ok := byIdentity[id]
+					if !ok {
+						toUnpack = append(toUnpack, i)
+						if len(byIdentity) == 0 {
+							byIdentity[id] = layers
+						} else {
+							// A second manifest needs every set of blobs,
+							// even when distinct chains both hit cache.
+							toFetch = append(toFetch, layers)
+							for priorID, prior := range byIdentity {
+								if len(prior) > 0 {
+									toFetch = append(toFetch, prior)
+									byIdentity[priorID] = nil
+								}
+							}
+							byIdentity[id] = nil
+						}
+						continue
+					}
+					toFetch = append(toFetch, layers)
+					if len(unpacked) > 0 {
+						toFetch = append(toFetch, unpacked)
+						byIdentity[id] = nil
+					}
+				}
+				lock.Unlock()
+			}
+
+			for _, i := range toUnpack {
 				u.eg.Go(func() error {
-					return u.unpack(h, desc, first)
+					return u.unpack(h, desc, queued[i], prepared[i])
 				})
 			}
-			for _, layers := range queued {
+			for _, layers := range toFetch {
+				layers := layers
 				u.eg.Go(func() error {
 					return u.fetch(u.ctx, h, layers, nil)
 				})
@@ -363,54 +413,121 @@ func layerSnapshotLabels(annotations map[string]string) map[string]string {
 	return labels
 }
 
+func (u *Unpacker) readUnpackConfig(ctx context.Context, config ocispec.Descriptor) (unpackConfig, error) {
+	var cfg unpackConfig
+	p, err := content.ReadBlob(ctx, u.content, config)
+	if err != nil {
+		return unpackConfig{}, err
+	}
+	if err := json.Unmarshal(p, &cfg); err != nil {
+		return unpackConfig{}, fmt.Errorf("unmarshal image config: %w", err)
+	}
+	return cfg, nil
+}
+
+func (u *Unpacker) selectPlatform(config ocispec.Descriptor, cfg unpackConfig) *Platform {
+	imgPlatform := platforms.Normalize(cfg.Platform)
+	for _, up := range u.platforms {
+		if up.ConfigType != "" && up.ConfigType != config.MediaType {
+			continue
+		}
+		// "layers" is the only supported rootfs value for OCI images.
+		if (up.ConfigType == "" || images.IsConfigType(up.ConfigType)) && cfg.RootFS.Type != "" && cfg.RootFS.Type != "layers" {
+			continue
+		}
+		if up.Platform.Match(imgPlatform) {
+			return up
+		}
+	}
+	return nil
+}
+
+func (u *Unpacker) prepareLayers(ctx context.Context, unpack *Platform, layers []ocispec.Descriptor, diffIDs []digest.Digest) ([]digest.Digest, []snapshots.LayerPreparation, error) {
+	if len(layers) != len(diffIDs) {
+		return nil, nil, fmt.Errorf("number of layers and diffIDs don't match: %d != %d", len(layers), len(diffIDs))
+	}
+
+	chainIDs := make([]digest.Digest, len(diffIDs))
+	copy(chainIDs, diffIDs)
+	chainIDs = identity.ChainIDs(chainIDs)
+
+	preparations := make([]snapshots.LayerPreparation, len(chainIDs))
+	for i, chainID := range chainIDs {
+		selected := snapshots.LayerPreparation{Key: chainID.String()}
+		if unpack.PrepareLayer != nil {
+			var parent string
+			if i > 0 {
+				parent = preparations[i-1].Key
+			}
+			var err error
+			selected, err = unpack.PrepareLayer(ctx, layers[i], chainID.String(), parent)
+			if err != nil {
+				return nil, nil, fmt.Errorf("prepare layer policy for %s: %w", layers[i].Digest, err)
+			}
+			if selected.Key == "" {
+				return nil, nil, fmt.Errorf("prepare layer policy for %s returned an empty snapshot key", layers[i].Digest)
+			}
+			if strings.ContainsAny(selected.GCQualifier, "/\\") || selected.GCQualifier == "." || selected.GCQualifier == ".." {
+				return nil, nil, fmt.Errorf("prepare layer policy for %s returned invalid GC label qualifier %q", layers[i].Digest, selected.GCQualifier)
+			}
+			if selected.Key != chainID.String() && selected.GCQualifier == "" {
+				return nil, nil, fmt.Errorf("alternate snapshot key %q for layer %s requires a GC label qualifier", selected.Key, layers[i].Digest)
+			}
+		}
+		preparations[i] = selected
+	}
+
+	return chainIDs, preparations, nil
+}
+
+func layerPreparationIdentity(preparations []snapshots.LayerPreparation) string {
+	var b strings.Builder
+	for _, preparation := range preparations {
+		b.WriteString(preparation.Key)
+		b.WriteByte(0)
+	}
+	if len(preparations) > 0 {
+		b.WriteString(preparations[len(preparations)-1].GCQualifier)
+	}
+	return b.String()
+}
+
 func (u *Unpacker) unpack(
 	h images.Handler,
 	config ocispec.Descriptor,
 	layers []ocispec.Descriptor,
+	preparations []snapshots.LayerPreparation,
 ) error {
 	ctx := u.ctx
 	ctx, layerSpan := tracing.StartSpan(ctx, tracing.Name(unpackSpanPrefix, "unpack"))
 	defer layerSpan.End()
 	unpackStart := time.Now()
-	p, err := content.ReadBlob(ctx, u.content, config)
+	cfg, err := u.readUnpackConfig(ctx, config)
 	if err != nil {
 		return err
 	}
 
-	var i unpackConfig
-	if err := json.Unmarshal(p, &i); err != nil {
-		return fmt.Errorf("unmarshal image config: %w", err)
-	}
-
-	diffIDs := i.RootFS.DiffIDs
-	if len(layers) != len(diffIDs) {
-		return fmt.Errorf("number of layers and diffIDs don't match: %d != %d", len(layers), len(diffIDs))
-	}
-
 	// TODO: Support multiple unpacks rather than just first match
-	var unpack *Platform
-
-	imgPlatform := platforms.Normalize(i.Platform)
-	for _, up := range u.platforms {
-		if up.ConfigType != "" && up.ConfigType != config.MediaType {
-			continue
-		}
-		// "layers" is only supported rootfs value for OCI images
-		if (up.ConfigType == "" || images.IsConfigType(up.ConfigType)) && i.RootFS.Type != "" && i.RootFS.Type != "layers" {
-			continue
-		}
-		if up.Platform.Match(imgPlatform) {
-			unpack = up
-			break
-		}
-	}
+	unpack := u.selectPlatform(config, cfg)
 
 	if unpack == nil {
+		imgPlatform := platforms.Normalize(cfg.Platform)
 		log.G(ctx).WithField("image", config.Digest).WithField("platform", platforms.Format(imgPlatform)).Debugf("unpacker does not support platform, only fetching layers")
 		return u.fetch(ctx, h, layers, nil)
 	}
 
+	var chainIDs []digest.Digest
+	if preparations == nil {
+		chainIDs, preparations, err = u.prepareLayers(ctx, unpack, layers, cfg.RootFS.DiffIDs)
+		if err != nil {
+			return err
+		}
+	} else {
+		chainIDs = identity.ChainIDs(append([]digest.Digest(nil), cfg.RootFS.DiffIDs...))
+	}
+
 	u.unpacks.Add(1)
+	diffIDs := cfg.RootFS.DiffIDs
 
 	var (
 		sn = unpack.Snapshotter
@@ -428,36 +545,6 @@ func (u *Unpacker) unpack(
 	// fetches get their context cancelled
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-
-	// pre-calculate chain ids for each layer
-	chainIDs := make([]digest.Digest, len(diffIDs))
-	copy(chainIDs, diffIDs)
-	chainIDs = identity.ChainIDs(chainIDs)
-
-	preparations := make([]snapshots.LayerPreparation, len(chainIDs))
-	for i, chainID := range chainIDs {
-		selected := snapshots.LayerPreparation{Key: chainID.String()}
-		if unpack.PrepareLayer != nil {
-			var parent string
-			if i > 0 {
-				parent = preparations[i-1].Key
-			}
-			selected, err = unpack.PrepareLayer(ctx, layers[i], chainID.String(), parent)
-			if err != nil {
-				return fmt.Errorf("prepare layer policy for %s: %w", layers[i].Digest, err)
-			}
-			if selected.Key == "" {
-				return fmt.Errorf("prepare layer policy for %s returned an empty snapshot key", layers[i].Digest)
-			}
-			if strings.ContainsAny(selected.GCQualifier, "/\\") || selected.GCQualifier == "." || selected.GCQualifier == ".." {
-				return fmt.Errorf("prepare layer policy for %s returned invalid GC label qualifier %q", layers[i].Digest, selected.GCQualifier)
-			}
-			if selected.Key != chainID.String() && selected.GCQualifier == "" {
-				return fmt.Errorf("alternate snapshot key %q for layer %s requires a GC label qualifier", selected.Key, layers[i].Digest)
-			}
-		}
-		preparations[i] = selected
-	}
 
 	topHalf := func(i int, desc ocispec.Descriptor, span *tracing.Span, startAt time.Time) (<-chan *unpackStatus, error) {
 		var (
@@ -758,8 +845,7 @@ func (u *Unpacker) unpack(
 			gcRef: gcSnapshotKey,
 		},
 	}
-	_, err = cs.Update(ctx, cinfo, "labels."+gcRef)
-	if err != nil {
+	if _, err := cs.Update(ctx, cinfo, "labels."+gcRef); err != nil {
 		return err
 	}
 	log.G(ctx).WithFields(log.Fields{

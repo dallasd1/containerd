@@ -29,6 +29,7 @@ import (
 	"github.com/containerd/containerd/v2/core/snapshots"
 	"github.com/containerd/containerd/v2/internal/kmutex"
 	"github.com/containerd/errdefs"
+	"github.com/containerd/go-dmverity/pkg/verity"
 	"github.com/containerd/log"
 	"github.com/containerd/platforms"
 	"github.com/opencontainers/go-digest"
@@ -98,7 +99,12 @@ func DmverityImageSnapshotKey(ctx context.Context, store content.Store, target o
 		if len(selected) == 0 {
 			return nil, fmt.Errorf("manifest %s has no image config", desc.Digest)
 		}
-		layers := selected[1:]
+		var layers []ocispec.Descriptor
+		for _, child := range selected[1:] {
+			if images.IsLayerType(child.MediaType) {
+				layers = append(layers, child)
+			}
+		}
 		diffIDs, err := images.RootFS(ctx, store, selected[0])
 		if err != nil {
 			return nil, err
@@ -266,6 +272,14 @@ func readDmverityBundleManifest(
 			}
 			info.Tree = layer
 		case layerSignatureMediaType:
+			if layer.Size > verity.MaxSignatureSize {
+				return nil, fmt.Errorf(
+					"signature descriptor for layer %s has size %d, maximum is %d bytes",
+					sourceDigest,
+					layer.Size,
+					verity.MaxSignatureSize,
+				)
+			}
 			rootHash := layer.Annotations[layerRootHashAnnotation]
 			if err := validateRootHash(rootHash); err != nil {
 				return nil, fmt.Errorf("signature descriptor for layer %s: %w", sourceDigest, err)

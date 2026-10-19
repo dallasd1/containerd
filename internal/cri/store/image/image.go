@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"strings"
 	"sync"
 
@@ -133,6 +134,9 @@ func (s *Store) update(ref string, img *Image) error {
 	}
 	if oldExist {
 		if oldID == img.ID {
+			if err := s.store.refreshSnapshotters(img.ID, img.Snapshotters); err != nil {
+				return err
+			}
 			if s.store.isPinned(img.ID, ref) == img.Pinned {
 				return nil
 			}
@@ -278,7 +282,20 @@ func (s *store) add(img Image) error {
 	// Or else, merge and sort the references.
 	i.References = docker.Sort(util.MergeStringSlices(i.References, img.References))
 	i.Pinned = i.Pinned || img.Pinned
+	i.Snapshotters = maps.Clone(img.Snapshotters)
 	s.images[img.ID] = i
+	return nil
+}
+
+func (s *store) refreshSnapshotters(id string, snapshotters map[string]struct{}) error {
+	s.lock.Lock()
+	defer s.lock.Unlock()
+	i, ok := s.images[id]
+	if !ok {
+		return errdefs.ErrNotFound
+	}
+	i.Snapshotters = maps.Clone(snapshotters)
+	s.images[id] = i
 	return nil
 }
 

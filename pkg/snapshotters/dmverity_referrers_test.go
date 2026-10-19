@@ -31,6 +31,7 @@ import (
 	"github.com/containerd/containerd/v2/core/remotes"
 	"github.com/containerd/containerd/v2/core/snapshots"
 	"github.com/containerd/errdefs"
+	"github.com/containerd/go-dmverity/pkg/verity"
 	"github.com/containerd/platforms"
 	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
@@ -130,7 +131,7 @@ func TestImageHasDmverityReferrerForSelectedPlatform(t *testing.T) {
 }
 
 func TestDmverityImageSnapshotKeyUsesRetainedSelection(t *testing.T) {
-	for _, mode := range []string{"selected platform", "no signed observation", "missing bundle", "missing payload", "wrong subject", "wrong diffID count"} {
+	for _, mode := range []string{"selected platform", "non-layer artifacts", "no signed observation", "missing bundle", "missing payload", "wrong subject", "wrong diffID count"} {
 		t.Run(mode, func(t *testing.T) {
 			ctx := t.Context()
 			store := imagetest.NewContentStore(ctx, t)
@@ -145,6 +146,11 @@ func TestDmverityImageSnapshotKeyUsesRetainedSelection(t *testing.T) {
 			})
 			layer := store.Blob(ocispec.MediaTypeImageLayer, []byte("layer"))
 			manifest := store.Manifest(config, layer)
+			if mode == "non-layer artifacts" {
+				before := store.Blob("application/vnd.example.before", []byte("before"))
+				after := store.Blob("application/vnd.example.after", []byte("after"))
+				manifest = store.Manifest(config, before, layer, after)
+			}
 			subject := manifest.Descriptor
 			if mode == "wrong subject" {
 				subject.Digest = digest.FromString("different subject")
@@ -182,7 +188,7 @@ func TestDmverityImageSnapshotKeyUsesRetainedSelection(t *testing.T) {
 				imagetest.AddPlatform(manifest, platforms.DefaultSpec()),
 			)
 			key, err := DmverityImageSnapshotKey(ctx, store.Store, index.Descriptor, platforms.Default())
-			if mode == "selected platform" {
+			if mode == "selected platform" || mode == "non-layer artifacts" {
 				require.NoError(t, err)
 				expected, err := DmveritySnapshotKey(diffID.String(), "", root)
 				require.NoError(t, err)
@@ -340,6 +346,7 @@ func TestFetchSignaturesRejectsMalformedBundles(t *testing.T) {
 		{"duplicate metadata", func(m *ocispec.Manifest) { m.Layers = append(m.Layers, m.Layers[0]) }, "duplicate EROFS metadata"},
 		{"duplicate tree", func(m *ocispec.Manifest) { m.Layers = append(m.Layers, m.Layers[1]) }, "duplicate Merkle-tree"},
 		{"duplicate signature", func(m *ocispec.Manifest) { m.Layers = append(m.Layers, m.Layers[2]) }, "duplicate signature"},
+		{"oversized signature", func(m *ocispec.Manifest) { m.Layers[2].Size = verity.MaxSignatureSize + 1 }, "maximum is"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := t.Context()
