@@ -467,6 +467,76 @@ func TestSignedBundleIsRetainedOnSubjectManifest(t *testing.T) {
 	require.ErrorContains(t, err, "read retained dm-verity payload")
 }
 
+func TestMetadataOnlyManifestPreservesDmverityObservation(t *testing.T) {
+	for _, mode := range []string{"same root", "changed root", "unobserved"} {
+		t.Run(mode, func(t *testing.T) {
+			ctx := t.Context()
+			store := imagetest.NewContentStore(ctx, t)
+			platform := ocispec.Platform{OS: "linux", Architecture: "amd64"}
+			config := store.JSONObject(ocispec.MediaTypeImageConfig, ocispec.Image{Platform: platform})
+			layer := store.Blob(ocispec.MediaTypeImageLayer, []byte("layer"))
+			subject := store.Manifest(config, layer).Descriptor
+			subject.Platform = &platform
+			base := images.ChildrenHandler(store.Store)
+			root := digest.FromString("original root").Encoded()
+			original := addTestDmverityReferrerWithRoot(t, store, subject, layer.Descriptor.Digest, "original", root)
+			var selected []ocispec.Descriptor
+			if mode != "unobserved" {
+				var err error
+				selected, err = AppendSignatureHandlerWrapper(
+					referrerTestFetcher{referrers: []ocispec.Descriptor{original}}, store.Store,
+				)(base).Handle(ctx, subject)
+				require.NoError(t, err)
+			}
+			before, err := store.Info(ctx, subject.Digest)
+			require.NoError(t, err)
+			if mode == "changed root" {
+				root = digest.FromString("changed root").Encoded()
+			}
+			replacement := addTestDmverityReferrerWithRoot(t, store, subject, layer.Descriptor.Digest, "replacement", root)
+			require.NoError(t, store.Delete(ctx, digest.FromString("replacement-tree")))
+
+			// WithAllMetadata returns only the config for this non-selected platform.
+			metadataOnly := remotes.FilterManifestByPlatformHandler(base, platforms.Only(
+				ocispec.Platform{OS: "linux", Architecture: "arm64"},
+			))
+			children, err := AppendSignatureHandlerWrapper(
+				referrerTestFetcher{referrers: []ocispec.Descriptor{replacement}}, store.Store,
+			)(metadataOnly).Handle(ctx, subject)
+			require.NoError(t, err)
+			require.Len(t, children, 1)
+			require.Equal(t, config.Descriptor.Digest, children[0].Digest)
+			after, err := store.Info(ctx, subject.Digest)
+			require.NoError(t, err)
+			require.Equal(t, before.Labels, after.Labels)
+
+			children, err = AppendCachedSignatureHandlerWrapper(store.Store)(metadataOnly).Handle(ctx, subject)
+			require.NoError(t, err)
+			require.Len(t, children, 1)
+			if mode != "unobserved" {
+				cached, err := AppendCachedSignatureHandlerWrapper(store.Store)(base).Handle(ctx, subject)
+				require.NoError(t, err)
+				require.Equal(t, selected, cached)
+			}
+		})
+	}
+}
+
+func TestEmptyImageStillRecordsDmverityObservation(t *testing.T) {
+	ctx := t.Context()
+	store := imagetest.NewContentStore(ctx, t)
+	config := store.JSONObject(ocispec.MediaTypeImageConfig, ocispec.Image{})
+	subject := store.Manifest(config).Descriptor
+	children, err := AppendSignatureHandlerWrapper(referrerTestFetcher{}, store.Store)(
+		images.ChildrenHandler(store.Store),
+	).Handle(ctx, subject)
+	require.NoError(t, err)
+	require.Len(t, children, 1)
+	info, err := store.Info(ctx, subject.Digest)
+	require.NoError(t, err)
+	require.Equal(t, "true", info.Labels[dmverityNoReferrerLabel])
+}
+
 func TestKnownSignedManifestWithMissingBundleFailsClosed(t *testing.T) {
 	ctx := t.Context()
 	store := imagetest.NewContentStore(ctx, t)

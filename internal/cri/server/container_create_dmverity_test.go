@@ -65,9 +65,51 @@ func TestDmverityContainerImage(t *testing.T) {
 	}
 	plain := manifest("plain")
 	signed := manifest("selected")
+	compressedLayer := store.Blob(ocispec.MediaTypeImageLayerZstd, []byte("compressed layer"))
+	compressed := store.Manifest(config, compressedLayer).Descriptor
+	equivalentSigned := manifest("equivalent-signed")
+	differentSigned := manifest("different-signed")
+	retainSigned := func(subject ocispec.Descriptor, root string) {
+		t.Helper()
+		payload := func(mediaType string) ocispec.Descriptor {
+			desc := store.Blob(mediaType, []byte(mediaType)).Descriptor
+			desc.Annotations = map[string]string{
+				"io.containerd.erofs.v1/dmverity.source-layer-digest": layer.Descriptor.Digest.String(),
+			}
+			if mediaType == "application/vnd.containerd.erofs.dmverity.layer-signature.v1+pkcs7" {
+				desc.Annotations["io.containerd.erofs.v1/dmverity.root-hash"] = root
+			}
+			return desc
+		}
+		referrer := store.JSONObject(ocispec.MediaTypeImageManifest, ocispec.Manifest{
+			MediaType:    ocispec.MediaTypeImageManifest,
+			ArtifactType: "application/vnd.containerd.erofs.dmverity.v1",
+			Config:       ocispec.DescriptorEmptyJSON,
+			Subject:      &subject,
+			Layers: []ocispec.Descriptor{
+				payload("application/vnd.containerd.erofs.metadata.v1"),
+				payload("application/vnd.containerd.erofs.dmverity.merkle-tree.v1"),
+				payload("application/vnd.containerd.erofs.dmverity.layer-signature.v1+pkcs7"),
+			},
+		})
+		_, err := store.Update(ctx, content.Info{
+			Digest: subject.Digest,
+			Labels: map[string]string{observationLabel: referrer.Descriptor.Digest.String()},
+		}, "labels")
+		require.NoError(t, err)
+	}
+	root := digest.FromString("root").Encoded()
+	retainSigned(signed, root)
+	retainSigned(equivalentSigned, root)
+	retainSigned(differentSigned, digest.FromString("different-root").Encoded())
 	invalid := manifest("invalid-observation")
 	_, err := store.Update(ctx, content.Info{
 		Digest: invalid.Digest, Labels: map[string]string{observationLabel: "not-a-digest"},
+	}, "labels")
+	require.NoError(t, err)
+	missing := manifest("missing-bundle")
+	_, err = store.Update(ctx, content.Info{
+		Digest: missing.Digest, Labels: map[string]string{observationLabel: digest.FromString("missing-bundle").String()},
 	}, "labels")
 	require.NoError(t, err)
 	otherConfig := store.JSONObject(ocispec.MediaTypeImageConfig, ocispec.Image{
@@ -90,8 +132,12 @@ func TestDmverityContainerImage(t *testing.T) {
 	records := map[string]images.Image{}
 	for ref, target := range map[string]ocispec.Descriptor{
 		plainRef: plain, signedRef: signed, digestRef: signed, hexNameRef: signed,
-		"docker.io/library/test:invalid":   invalid,
-		"docker.io/library/test:repointed": repointed, "docker.io/library/test:index": index,
+		"docker.io/library/test:compressed": compressed,
+		"docker.io/library/test:equivalent": equivalentSigned,
+		"docker.io/library/test:different":  differentSigned,
+		"docker.io/library/test:invalid":    invalid,
+		"docker.io/library/test:missing":    missing,
+		"docker.io/library/test:repointed":  repointed, "docker.io/library/test:index": index,
 	} {
 		records[ref] = images.Image{Name: ref, Target: target}
 	}
@@ -112,6 +158,7 @@ func TestDmverityContainerImage(t *testing.T) {
 		wantErr string
 	}{
 		{name: "requested signed tag", spec: runtime.ImageSpec{Image: "test:signed"}, want: signedRef},
+		{name: "requested unsigned tag", spec: runtime.ImageSpec{Image: id, UserSpecifiedImage: "test:plain"}, want: plainRef},
 		{name: "requested signed digest", spec: runtime.ImageSpec{Image: digestRef}, want: digestRef},
 		{name: "named alias matching ID prefix", spec: runtime.ImageSpec{Image: shortID}, aliases: []string{plainRef, hexNameRef}, want: hexNameRef},
 		{name: "requested selected platform", spec: runtime.ImageSpec{Image: "test:index"}, want: "docker.io/library/test:index"},
@@ -130,6 +177,13 @@ func TestDmverityContainerImage(t *testing.T) {
 		{name: "unambiguous signed ID", spec: runtime.ImageSpec{Image: id}, aliases: []string{signedRef}, want: signedRef},
 		{name: "no cached aliases", spec: runtime.ImageSpec{Image: id}, aliases: []string{}, wantErr: "has no cached image references"},
 		{name: "aliases of same manifest", spec: runtime.ImageSpec{Image: id}, aliases: []string{signedRef, digestRef}, want: signedRef},
+		{name: "unsigned compression aliases", spec: runtime.ImageSpec{Image: id}, aliases: []string{plainRef, "docker.io/library/test:compressed"}, want: plainRef},
+		{name: "unsigned compression aliases reversed", spec: runtime.ImageSpec{Image: id}, aliases: []string{"docker.io/library/test:compressed", plainRef}, want: "docker.io/library/test:compressed"},
+		{name: "equivalent signed identities", spec: runtime.ImageSpec{Image: id}, aliases: []string{signedRef, "docker.io/library/test:equivalent"}, want: signedRef},
+		{name: "different signed identities", spec: runtime.ImageSpec{Image: id}, aliases: []string{signedRef, "docker.io/library/test:different"}, wantErr: "requires an explicit image reference"},
+		{name: "mixed identities signed first", spec: runtime.ImageSpec{Image: id}, aliases: []string{signedRef, plainRef}, wantErr: "requires an explicit image reference"},
+		{name: "invalid observation is not unsigned", spec: runtime.ImageSpec{Image: id}, aliases: []string{plainRef, "docker.io/library/test:invalid"}, wantErr: "invalid retained dm-verity referrer"},
+		{name: "missing signed bundle is not unsigned", spec: runtime.ImageSpec{Image: id}, aliases: []string{plainRef, "docker.io/library/test:missing"}, wantErr: "read retained signed dm-verity bundle"},
 		{name: "index and manifest aliases", spec: runtime.ImageSpec{Image: id}, aliases: []string{signedRef, "docker.io/library/test:index"}, want: signedRef},
 		{name: "repointed cached alias", spec: runtime.ImageSpec{Image: id}, aliases: []string{"docker.io/library/test:repointed"}, wantErr: "expected " + id},
 		{name: "stock ignores requested signed tag", spec: runtime.ImageSpec{Image: "test:signed"}, stock: true, want: plainRef},

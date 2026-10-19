@@ -31,6 +31,7 @@ import (
 	"github.com/davecgh/go-spew/spew"
 	docker "github.com/distribution/reference"
 	"github.com/opencontainers/go-digest"
+	"github.com/opencontainers/image-spec/identity"
 	imagespec "github.com/opencontainers/image-spec/specs-go/v1"
 	runtimespec "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/opencontainers/selinux/go-selinux"
@@ -53,6 +54,7 @@ import (
 	"github.com/containerd/containerd/v2/pkg/blockio"
 	"github.com/containerd/containerd/v2/pkg/deprecation"
 	"github.com/containerd/containerd/v2/pkg/oci"
+	snpkg "github.com/containerd/containerd/v2/pkg/snapshotters"
 	"github.com/containerd/containerd/v2/pkg/tracing"
 )
 
@@ -1279,6 +1281,20 @@ func (c *criService) dmverityContainerImage(ctx context.Context, image imagestor
 		requested = spec.GetUserSpecifiedImage()
 	}
 	if requested == "" || isID(requested) {
+		snapshotKey := func(candidate containerd.Image) (string, error) {
+			signed, err := snpkg.ImageHasDmverityReferrer(ctx, candidate.ContentStore(), candidate.Target(), candidate.Platform())
+			if err != nil {
+				return "", err
+			}
+			if signed {
+				return snpkg.DmverityImageSnapshotKey(ctx, candidate.ContentStore(), candidate.Target(), candidate.Platform())
+			}
+			diffIDs, err := candidate.RootFS(ctx)
+			if err != nil {
+				return "", err
+			}
+			return identity.ChainID(diffIDs).String(), nil
+		}
 		var selected containerd.Image
 		var manifestDigest digest.Digest
 		for _, ref := range image.References {
@@ -1311,7 +1327,17 @@ func (c *criService) dmverityContainerImage(ctx context.Context, image imagestor
 				return nil, fmt.Errorf("cached image reference %q has no matching manifest", ref)
 			}
 			if selected != nil && manifestDigest != currentDigest {
-				return nil, fmt.Errorf("image ID %q requires an explicit image reference or UserSpecifiedImage to distinguish cached manifests", image.ID)
+				selectedKey, err := snapshotKey(selected)
+				if err != nil {
+					return nil, fmt.Errorf("resolve snapshot identity for cached image reference %q: %w", selected.Name(), err)
+				}
+				candidateKey, err := snapshotKey(candidate)
+				if err != nil {
+					return nil, fmt.Errorf("resolve snapshot identity for cached image reference %q: %w", ref, err)
+				}
+				if selectedKey != candidateKey {
+					return nil, fmt.Errorf("image ID %q requires an explicit image reference or UserSpecifiedImage to distinguish cached snapshot identities", image.ID)
+				}
 			}
 			if selected == nil {
 				selected, manifestDigest = candidate, currentDigest

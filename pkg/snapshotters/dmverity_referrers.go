@@ -340,6 +340,18 @@ func (h *dmverityHandler) Handle(
 
 	// Strip registry-supplied targets so only those validated here reach unpack.
 	imageLayers := sanitizeDmverityImageLayers(children)
+	if len(imageLayers) == 0 && len(children) > 0 {
+		unfiltered, err := images.ChildrenHandler(h.store).Handle(ctx, desc)
+		if err != nil {
+			return nil, fmt.Errorf("read manifest %s for dm-verity layer selection: %w", desc.Digest, err)
+		}
+		for _, child := range unfiltered {
+			if images.IsLayerType(child.MediaType) {
+				// Metadata-only traversal must not replace a retained signed selection.
+				return children, nil
+			}
+		}
+	}
 	requireSigned := false
 	if h.fetcher != nil {
 		selected, discovered, err := fetchSignatures(ctx, h.fetcher, h.store, desc, imageLayers)
