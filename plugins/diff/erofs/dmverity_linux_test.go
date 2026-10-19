@@ -19,16 +19,21 @@
 package erofs
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
 
+	"github.com/containerd/containerd/v2/core/images/imagetest"
+	"github.com/containerd/containerd/v2/internal/dmverity"
+	snpkg "github.com/containerd/containerd/v2/pkg/snapshotters"
 	"github.com/containerd/log/logtest"
+	"github.com/opencontainers/go-digest"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-
-	"github.com/containerd/containerd/v2/internal/dmverity"
 )
 
 // TestGetDmverityOptions tests the block size configuration
@@ -125,4 +130,46 @@ func TestFormatDmverityLayer(t *testing.T) {
 		// Hash offset should be rounded up to next 4096-byte boundary
 		assert.Equal(t, uint64(8192), metadata.HashOffset)
 	})
+}
+
+func TestApplySignedTarIndexArtifacts(t *testing.T) {
+	ctx := logtest.WithT(context.Background(), t)
+	store := imagetest.NewContentStore(ctx, t)
+	metadataBytes := []byte("erofs metadata")
+	tarBytes := []byte("tar payload")
+	treeBytes := []byte("verity superblock and tree")
+	signatureBytes := []byte("pkcs7 signature")
+	target := snpkg.DmverityTarget{
+		RootHash:  digest.FromString("root").Encoded(),
+		Metadata:  store.Blob("application/vnd.containerd.erofs.metadata.v1", metadataBytes).Descriptor,
+		Tree:      store.Blob("application/vnd.containerd.erofs.dmverity.merkle-tree.v1", treeBytes).Descriptor,
+		Signature: store.Blob("application/vnd.containerd.erofs.dmverity.layer-signature.v1+pkcs7", signatureBytes).Descriptor,
+	}
+	annotation, err := json.Marshal(target)
+	require.NoError(t, err)
+	desc := ocispec.Descriptor{
+		Digest:      digest.FromString("layer"),
+		Annotations: map[string]string{snpkg.TargetLayerDmverityLabel: string(annotation)},
+	}
+	layerPath := filepath.Join(t.TempDir(), "layer.erofs")
+
+	differ := erofsDiff{store: store.Store}
+	require.NoError(t, differ.applySignedTarIndexArtifacts(ctx, desc, layerPath, bytes.NewReader(tarBytes)))
+
+	data, err := os.ReadFile(layerPath)
+	require.NoError(t, err)
+	expected := append([]byte{}, metadataBytes...)
+	expected = append(expected, tarBytes...)
+	expected = append(expected, make([]byte, int(deviceAlignment)-len(expected))...)
+	require.Equal(t, append(expected, treeBytes...), data)
+
+	metadata, err := dmverity.ReadMetadata(layerPath)
+	require.NoError(t, err)
+	require.Equal(t, target.RootHash, metadata.RootHash)
+	require.Equal(t, uint64(deviceAlignment), metadata.HashOffset)
+	signature, err := os.ReadFile(dmverity.SignaturePath(layerPath))
+	require.NoError(t, err)
+	require.Equal(t, signatureBytes, signature)
+	_, err = os.Stat(layerPath + ".hashtree")
+	require.ErrorIs(t, err, os.ErrNotExist)
 }

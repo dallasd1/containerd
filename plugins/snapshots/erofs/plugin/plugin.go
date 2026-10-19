@@ -56,6 +56,9 @@ type Config struct {
 	// DmverityMode controls dm-verity behavior: "auto" (use if available), "on" (require), "off" (disable)
 	// Linux only
 	DmverityMode string `toml:"dmverity_mode"`
+
+	// EnableDmverityReferrers enables signed dm-verity referrer discovery and usage.
+	EnableDmverityReferrers bool `toml:"enable_dmverity_referrers"`
 }
 
 // snapshotterPlatforms returns the platforms this snapshotter advertises: the
@@ -122,6 +125,10 @@ func init() {
 
 			ic.Meta.Exports[plugins.SnapshotterRootDir] = root
 			ic.Meta.Capabilities = append(ic.Meta.Capabilities, "rebase")
+			if config.EnableDmverityReferrers {
+				opts = append(opts, erofs.WithDmverityReferrers())
+				ic.Meta.Capabilities = append(ic.Meta.Capabilities, plugins.CapabilityDmverityReferrers)
+			}
 			return erofs.NewSnapshotter(root, opts...)
 		},
 	})

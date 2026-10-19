@@ -34,6 +34,7 @@ import (
 	"github.com/containerd/containerd/v2/core/images"
 	"github.com/containerd/containerd/v2/core/mount"
 	"github.com/containerd/containerd/v2/internal/erofsutils"
+	snpkg "github.com/containerd/containerd/v2/pkg/snapshotters"
 
 	"github.com/google/uuid"
 )
@@ -150,6 +151,11 @@ func (s erofsDiff) Apply(ctx context.Context, desc ocispec.Descriptor, mounts []
 		return emptyDesc, err
 	}
 
+	// The target is supplied by the referrer handler.
+	dmverityReferrersPresent := desc.Annotations[snpkg.TargetLayerDmverityLabel] != ""
+	if native && dmverityReferrersPresent {
+		return emptyDesc, fmt.Errorf("signed native EROFS layers are unsupported; layer %s must use a tar layer", desc.Digest)
+	}
 	ra, err := s.store.ReaderAt(ctx, desc)
 	if err != nil {
 		return emptyDesc, fmt.Errorf("failed to get reader from content store: %w", err)
@@ -209,6 +215,15 @@ func (s erofsDiff) Apply(ctx context.Context, desc ocispec.Descriptor, mounts []
 			return emptyDesc, fmt.Errorf("failed to generate tar index: %w", err)
 		}
 		log.G(ctx).WithField("path", layerBlobPath).Debug("Applied layer using tar index mode")
+	} else if dmverityReferrersPresent {
+		if err := s.applySignedTarIndexArtifacts(ctx, desc, layerBlobPath, rc); err != nil {
+			return emptyDesc, err
+		}
+		return ocispec.Descriptor{
+			MediaType: ocispec.MediaTypeImageLayer,
+			Size:      rc.c,
+			Digest:    digester.Digest(),
+		}, nil
 	} else {
 		// Use the tar method: fully convert tar to EROFS
 		err = erofsutils.ConvertTarErofs(ctx, rc, layerBlobPath, u.String(), s.mkfsExtraOpts)
@@ -224,7 +239,7 @@ func (s erofsDiff) Apply(ctx context.Context, desc ocispec.Descriptor, mounts []
 	}
 
 	// Format with dm-verity if enabled
-	if s.enableDmverity {
+	if s.enableDmverity && !dmverityReferrersPresent {
 		if err := s.formatDmverityLayer(ctx, layerBlobPath); err != nil {
 			return emptyDesc, fmt.Errorf("failed to format dm-verity layer: %w", err)
 		}
