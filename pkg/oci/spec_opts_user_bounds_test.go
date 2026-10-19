@@ -60,7 +60,11 @@ func TestOpenUserFileCapsReads(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			data := append(bytes.Repeat([]byte{0}, tc.padBytes), beyond...)
+			padding := bytes.Repeat([]byte{0}, tc.padBytes)
+			for i := 4095; i < len(padding); i += 4096 {
+				padding[i] = '\n'
+			}
+			data := append(padding, beyond...)
 			fsys := fstest.MapFS{
 				"etc/group": &fstest.MapFile{Data: data, Mode: 0o644},
 			}

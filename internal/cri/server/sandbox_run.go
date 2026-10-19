@@ -292,7 +292,7 @@ func (c *criService) RunPodSandbox(ctx context.Context, r *runtime.RunPodSandbox
 	// containers anyway, the CRI layer will pre-pull the pause container to guarantee
 	// it exists (even though it's counter to the purpose of the sandbox API). This may
 	// be removed/deprecated in the distant future, if we decide to remove pause containers.
-	if err := c.ensurePauseImageExists(ctx, r.GetConfig(), r.GetRuntimeHandler()); err != nil {
+	if err := c.ensurePauseImageExists(ctx, r.GetConfig(), r.GetRuntimeHandler(), c.ImageService.RuntimeSnapshotter(ctx, ociRuntime)); err != nil {
 		return nil, err
 	}
 
@@ -406,7 +406,7 @@ func (c *criService) RunPodSandbox(ctx context.Context, r *runtime.RunPodSandbox
 	return &runtime.RunPodSandboxResponse{PodSandboxId: id}, nil
 }
 
-func (c *criService) ensurePauseImageExists(ctx context.Context, config *runtime.PodSandboxConfig, runtimeHandler string) error {
+func (c *criService) ensurePauseImageExists(ctx context.Context, config *runtime.PodSandboxConfig, runtimeHandler, snapshotter string) error {
 	imageConfig := c.ImageService.Config()
 
 	ref := criconfig.DefaultSandboxImage
@@ -415,14 +415,16 @@ func (c *criService) ensurePauseImageExists(ctx context.Context, config *runtime
 		ref = img
 	}
 
-	_, err := c.ImageService.LocalResolve(ref)
+	image, err := c.ImageService.LocalResolve(ref)
 	if err == nil {
-		return nil
+		if _, ok := image.Snapshotters[snapshotter]; ok || len(image.Snapshotters) == 0 {
+			return nil
+		}
 	} else if !errdefs.IsNotFound(err) {
 		return fmt.Errorf("failed to get image %q: %w", ref, err)
 	}
 
-	_, err = c.ImageService.PullImage(ctx, ref, nil, config, runtimeHandler)
+	_, err = c.ImageService.PullImage(ctx, ref, nil, config, runtimeHandler, snapshotter)
 	if err != nil {
 		return fmt.Errorf("failed to pull image %q: %w", ref, err)
 	}
