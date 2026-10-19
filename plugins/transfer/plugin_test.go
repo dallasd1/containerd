@@ -19,12 +19,14 @@ package transfer
 import (
 	"errors"
 	"path/filepath"
+	"slices"
 	"testing"
 
 	"github.com/containerd/containerd/v2/core/diff"
 	"github.com/containerd/containerd/v2/core/metadata"
 	"github.com/containerd/containerd/v2/core/snapshots"
 	"github.com/containerd/containerd/v2/core/transfer/local"
+	"github.com/containerd/containerd/v2/core/unpack"
 	"github.com/containerd/containerd/v2/plugins"
 	contentlocal "github.com/containerd/containerd/v2/plugins/content/local"
 	"github.com/containerd/platforms"
@@ -32,6 +34,42 @@ import (
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	bolt "go.etcd.io/bbolt"
 )
+
+func TestPullHandlerWrapperRequestIntent(t *testing.T) {
+	for _, tc := range []struct {
+		name                              string
+		enabled, requested, capable, want bool
+	}{
+		{name: "fetch off"},
+		{name: "fetch enabled", enabled: true, want: true},
+		{name: "explicit overlayfs", enabled: true, requested: true},
+		{name: "unsupported explicit request", enabled: true, requested: true},
+		{name: "signed matched platform", requested: true, capable: true, want: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var capabilities []string
+			if tc.enabled {
+				capabilities = []string{plugins.CapabilityDmverityReferrers}
+			}
+			ms, ic := newTestInitContext(t,
+				map[string]snapshots.Snapshotter{"erofs": &testSnapshotter{}}, nil,
+				map[string][]string{"erofs": capabilities},
+			)
+			lc := &local.TransferConfig{}
+			configureDmverityFetchRetention(ic, ms, lc)
+			var matched []unpack.Platform
+			if tc.capable {
+				matched = []unpack.Platform{{SnapshotterCapabilities: []string{plugins.CapabilityDmverityReferrers}}}
+			} else if tc.name == "explicit overlayfs" {
+				matched = []unpack.Platform{{SnapshotterKey: "overlayfs"}}
+			}
+			wrapper, err := lc.PullHandlerWrapper(t.Context(), nil, nil, tc.requested, matched)
+			if err != nil || (wrapper != nil) != tc.want {
+				t.Fatalf("wrapper present=%v want=%v error=%v", wrapper != nil, tc.want, err)
+			}
+		})
+	}
+}
 
 func TestConfigureUnpackPlatforms(t *testing.T) {
 	tests := []struct {
@@ -108,7 +146,9 @@ func TestConfigureUnpackPlatforms(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			ms, ic := newTestInitContext(t, map[string]snapshots.Snapshotter{"native": &testSnapshotter{}}, tt.candidates)
+			ms, ic := newTestInitContext(t, map[string]snapshots.Snapshotter{"native": &testSnapshotter{}}, tt.candidates,
+				map[string][]string{"native": {plugins.CapabilityDmverityReferrers}},
+			)
 			lc := &local.TransferConfig{}
 
 			err := configureUnpackPlatforms(ic, ms, &tt.config, lc)
@@ -123,12 +163,106 @@ func TestConfigureUnpackPlatforms(t *testing.T) {
 					t.Fatalf("expected test applier, got %T", lc.UnpackPlatforms[0].Applier)
 				}
 			}
+			if err == nil {
+				configureDmverityFetchRetention(ic, ms, lc)
+				wrapper, err := lc.PullHandlerWrapper(t.Context(), nil, nil, false, nil)
+				if err != nil || wrapper == nil {
+					t.Fatalf("available snapshotter must enable fetch retention even without an applier: %v", err)
+				}
+			}
 		})
 	}
 }
 
-func newTestInitContext(t *testing.T, snapshotters map[string]snapshots.Snapshotter, candidates []*plugin.Registration) (*metadata.DB, *plugin.InitContext) {
+func TestConfigureUnpackPlatformsSelectsSignedLaneForCapableSnapshotter(t *testing.T) {
+	ms, ic := newTestInitContext(t,
+		map[string]snapshots.Snapshotter{"erofs": &testSnapshotter{}},
+		[]*plugin.Registration{newTestDiffPlugin("erofs", testApplier{}, nil, platforms.DefaultSpec())},
+		map[string][]string{"erofs": {plugins.CapabilityDmverityReferrers}},
+	)
+	config := transferConfig{UnpackConfiguration: []unpackConfiguration{{
+		Platform:    platforms.Format(platforms.DefaultSpec()),
+		Snapshotter: "erofs",
+		Differ:      "erofs",
+	}}}
+	lc := &local.TransferConfig{}
+	if err := configureUnpackPlatforms(ic, ms, &config, lc); err != nil {
+		t.Fatal(err)
+	}
+	if len(lc.UnpackPlatforms) != 1 {
+		t.Fatalf("expected one unpack platform, got %d", len(lc.UnpackPlatforms))
+	}
+	up := lc.UnpackPlatforms[0]
+	if up.PrepareLayer == nil {
+		t.Fatal("capable snapshotter is missing dm-verity layer policy")
+	}
+}
+
+func TestConfigureDmverityFetchRetentionCapability(t *testing.T) {
+	for _, tc := range []struct {
+		name                                    string
+		available, capable, failed, missingMeta bool
+		want                                    bool
+	}{
+		{name: "disabled", available: true},
+		{name: "enabled without unpack platforms", available: true, capable: true, want: true},
+		{name: "registered but unavailable", capable: true},
+		{name: "failed snapshotter", capable: true, failed: true},
+		{name: "missing plugin metadata", available: true, capable: true, missingMeta: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			snapshotters := map[string]snapshots.Snapshotter{}
+			if tc.available {
+				snapshotters["erofs"] = &testSnapshotter{}
+			}
+			var capabilities []string
+			if tc.capable {
+				capabilities = []string{plugins.CapabilityDmverityReferrers}
+			}
+			ms, ic := newTestInitContext(t, snapshotters, nil, map[string][]string{"erofs": capabilities})
+			if tc.missingMeta {
+				ic = plugin.NewContext(t.Context(), plugin.NewPluginSet(), nil)
+			}
+			if !tc.available {
+				p := (&plugin.Registration{
+					Type: plugins.SnapshotPlugin,
+					ID:   "erofs",
+					InitFn: func(ic *plugin.InitContext) (any, error) {
+						ic.Meta.Capabilities = append(ic.Meta.Capabilities, capabilities...)
+						if tc.failed {
+							return nil, errors.New("snapshotter unavailable")
+						}
+						return &testSnapshotter{}, nil
+					},
+				}).Init(plugin.NewContext(t.Context(), ic.Plugins(), nil))
+				if err := ic.Plugins().Add(p); err != nil {
+					t.Fatal(err)
+				}
+			}
+			lc := &local.TransferConfig{}
+			config := transferConfig{UnpackConfiguration: []unpackConfiguration{}}
+			if err := configureUnpackPlatforms(ic, ms, &config, lc); err != nil {
+				t.Fatal(err)
+			}
+			configureDmverityFetchRetention(ic, ms, lc)
+			wrapper, err := lc.PullHandlerWrapper(t.Context(), nil, nil, false, nil)
+			if err != nil || (wrapper != nil) != tc.want {
+				t.Fatalf("expected fetch retention %v, got wrapper %v, error %v", tc.want, wrapper != nil, err)
+			}
+			hasCapability := slices.Contains(ic.Meta.Capabilities, plugins.CapabilityDmverityReferrers)
+			if hasCapability != tc.want {
+				t.Fatalf("expected capability %v, got %v", tc.want, hasCapability)
+			}
+		})
+	}
+}
+
+func newTestInitContext(t *testing.T, snapshotters map[string]snapshots.Snapshotter, candidates []*plugin.Registration, capabilityMaps ...map[string][]string) (*metadata.DB, *plugin.InitContext) {
 	t.Helper()
+	var capabilities map[string][]string
+	if len(capabilityMaps) > 0 {
+		capabilities = capabilityMaps[0]
+	}
 
 	cs, err := contentlocal.NewStore(t.TempDir())
 	if err != nil {
@@ -152,7 +286,8 @@ func newTestInitContext(t *testing.T, snapshotters map[string]snapshots.Snapshot
 		p := (&plugin.Registration{
 			Type: plugins.SnapshotPlugin,
 			ID:   name,
-			InitFn: func(*plugin.InitContext) (any, error) {
+			InitFn: func(ic *plugin.InitContext) (any, error) {
+				ic.Meta.Capabilities = append(ic.Meta.Capabilities, capabilities[name]...)
 				return sn, nil
 			},
 		}).Init(ic)
