@@ -19,8 +19,11 @@ package dmverity
 import (
 	"fmt"
 	"os"
+	"runtime"
+	"strings"
 
 	"github.com/containerd/containerd/v2/core/mount"
+	"github.com/containerd/go-dmverity/pkg/dm"
 	"github.com/containerd/go-dmverity/pkg/utils"
 	"github.com/containerd/go-dmverity/pkg/verity"
 )
@@ -124,6 +127,10 @@ func Format(dataDevice, hashDevice string, opts *DmverityOptions) (string, error
 //     Uses explicitly provided parameters from opts. All dm-verity parameters must be
 //     supplied programmatically since there's no superblock to read from.
 func Open(dataDevice string, name string, hashDevice string, rootHash string, hashOffset uint64, opts *DmverityOptions) (string, error) {
+	return open(dataDevice, name, hashDevice, rootHash, hashOffset, opts, "")
+}
+
+func open(dataDevice string, name string, hashDevice string, rootHash string, hashOffset uint64, opts *DmverityOptions, signatureFile string) (string, error) {
 	if rootHash == "" {
 		return "", fmt.Errorf("rootHash cannot be empty")
 	}
@@ -169,7 +176,15 @@ func Open(dataDevice string, name string, hashDevice string, rootHash string, ha
 		hashLoopDevice = dataLoopDevice
 	}
 
-	devicePath, err := verity.Open(&params, name, dataLoopDevice, hashLoopDevice, rootDigest, "", nil)
+	// go-dmverity stores the signature on the current OS thread. If the function switches
+	// threads mid-execution, the signature might not be correctly associated with the thread.
+	// Stay on that OS thread so the kernel can find the signature and the library cleanup correctly.
+	if signatureFile != "" {
+		runtime.LockOSThread()
+		defer runtime.UnlockOSThread()
+	}
+
+	devicePath, err := verity.Open(&params, name, dataLoopDevice, hashLoopDevice, rootDigest, signatureFile, nil)
 	if err != nil {
 		dataLoop.Close()
 		if hashLoop != nil {
@@ -185,6 +200,14 @@ func Open(dataDevice string, name string, hashDevice string, rootHash string, ha
 	}
 
 	return devicePath, nil
+}
+
+// OpenSigned creates a dm-verity mapping with kernel root-hash signature verification.
+func OpenSigned(dataDevice string, name string, hashDevice string, rootHash string, hashOffset uint64, signatureFile string) (string, error) {
+	if signatureFile == "" {
+		return "", fmt.Errorf("signature file cannot be empty")
+	}
+	return open(dataDevice, name, hashDevice, rootHash, hashOffset, nil, signatureFile)
 }
 
 func Close(name string) error {
@@ -207,4 +230,47 @@ func VerifyDevice(name string, rootHash string) error {
 	}
 
 	return nil
+}
+
+// VerifySignedDevice checks device health, the expected root hash, and signature enforcement.
+func VerifySignedDevice(name string, rootHash string) error {
+	if err := VerifyDevice(name, rootHash); err != nil {
+		return err
+	}
+
+	// Open the device-mapper control to inspect the table for signature enforcement.
+	control, err := dm.Open()
+	if err != nil {
+		return fmt.Errorf("open device-mapper control: %w", err)
+	}
+	defer control.Close()
+
+	// the dm-verity table represents its current configuration parameters string, which includes
+	// the root hash signature option if present.
+	table, err := control.TableStatus(name, true)
+	if err != nil {
+		return fmt.Errorf("read dm-verity device %q table: %w", name, err)
+	}
+	if !hasRootHashSignatureOption(table) {
+		return fmt.Errorf("dm-verity device %q does not have a root hash signature option", name)
+	}
+	return nil
+}
+
+func hasRootHashSignatureOption(table string) bool {
+	// TableStatus returns ten required verity parameters, then the optional argument count.
+	const requiredParamsCount = 10
+	fields := strings.Fields(table)
+	if len(fields) <= requiredParamsCount {
+		return false
+	}
+
+	// Skip the kernel-generated count and search the optional arguments.
+	optionalArgs := fields[requiredParamsCount+1:]
+	for _, opt := range optionalArgs {
+		if opt == "root_hash_sig_key_desc" {
+			return true
+		}
+	}
+	return false
 }

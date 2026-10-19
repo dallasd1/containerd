@@ -25,6 +25,12 @@ import (
 	"strings"
 )
 
+const (
+	MountOptionMetadataPrefix        = "X-containerd.dmverity="
+	MountOptionRootHashPrefix        = "X-containerd.dmverity.root-hash="
+	MountOptionSignatureDigestPrefix = "X-containerd.dmverity.signature-digest="
+)
+
 type DmverityOptions struct {
 	// Salt for hashing, represented as a hex string
 	Salt string
@@ -62,6 +68,12 @@ func MetadataPath(layerBlobPath string) string {
 		return layerBlobPath
 	}
 	return layerBlobPath + ".dmverity"
+}
+
+// SignaturePath returns the path to the dm-verity signature file for a layer.
+// The signature file contains the PKCS#7 root-hash signature bytes.
+func SignaturePath(layerBlobPath string) string {
+	return layerBlobPath + ".sig"
 }
 
 func DevicePath(name string) string {
