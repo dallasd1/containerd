@@ -47,6 +47,7 @@ import (
 	erofsdiffer "github.com/containerd/containerd/v2/plugins/diff/erofs"
 	erofsmount "github.com/containerd/containerd/v2/plugins/mount/erofs"
 	"github.com/containerd/errdefs"
+	"github.com/containerd/go-dmverity/pkg/verity"
 	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
@@ -77,10 +78,8 @@ func TestFailedSignedParentViewCanBeRetried(t *testing.T) {
 		parentID, _, _, err = storage.GetInfo(ctx, "parent-active")
 		return err
 	}))
-	require.NoError(t, os.WriteFile(s.layerBlobPath(parentID), []byte("layer"), 0600))
-
 	rootHash := strings.Repeat("a", 64)
-	signatureDigest := digest.FromString("signature").String()
+	signatureDigest := writeSignedArtifacts(t, s.layerBlobPath(parentID), rootHash)
 	require.NoError(t, s.Commit(ctx, "parent", "parent-active", snapshots.WithLabels(map[string]string{
 		"containerd.io/snapshot/erofs.dmverity.root-hash":        rootHash,
 		"containerd.io/snapshot/erofs.dmverity.signature-digest": signatureDigest,
@@ -96,6 +95,196 @@ func TestFailedSignedParentViewCanBeRetried(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, mounts, 1)
 	require.Contains(t, mounts[0].Options, "X-containerd.dmverity.root-hash="+rootHash)
+}
+
+// writeSignedArtifacts writes the files produced by the signed EROFS differ.
+func writeSignedArtifacts(t *testing.T, layerBlob, rootHash string) string {
+	t.Helper()
+	signature := []byte("signature")
+	require.NoError(t, os.WriteFile(layerBlob, []byte("layer"), 0600))
+	require.NoError(t, os.WriteFile(dmverity.MetadataPath(layerBlob), []byte(fmt.Sprintf(`{"roothash":%q,"hashoffset":4096}`, rootHash)), 0600))
+	require.NoError(t, os.WriteFile(dmverity.SignaturePath(layerBlob), signature, 0600))
+	return digest.FromBytes(signature).String()
+}
+
+func TestCommitRequiresSignedArtifactsForSignedIdentity(t *testing.T) {
+	rootHash := strings.Repeat("a", 64)
+	signedLabels := func(signatureDigest string) map[string]string {
+		return map[string]string{
+			"containerd.io/snapshot/erofs.dmverity.root-hash":        rootHash,
+			"containerd.io/snapshot/erofs.dmverity.signature-digest": signatureDigest,
+		}
+	}
+	validDigest := digest.FromBytes([]byte("signature")).String()
+
+	for _, tc := range []struct {
+		name         string
+		prepareLabel bool
+		walking      bool
+		commitLabels map[string]string
+		write        func(t *testing.T, s *snapshotter, id string)
+		wantErr      string
+	}{
+		{
+			// Walking differ: upperdir only, no signed EROFS blob.
+			name:         "walking upperdir with signed commit labels",
+			walking:      true,
+			commitLabels: signedLabels(validDigest),
+			write: func(t *testing.T, s *snapshotter, id string) {
+				require.NoError(t, os.WriteFile(filepath.Join(s.upperPath(id), "file"), []byte("data"), 0600))
+			},
+			wantErr: "was not applied by a signed EROFS differ",
+		},
+		{
+			name:         "walking upperdir with signed prepare and commit labels",
+			walking:      true,
+			prepareLabel: true,
+			commitLabels: signedLabels(validDigest),
+			write: func(t *testing.T, s *snapshotter, id string) {
+				require.NoError(t, os.WriteFile(filepath.Join(s.upperPath(id), "file"), []byte("data"), 0600))
+			},
+			wantErr: "was not applied by a signed EROFS differ",
+		},
+		{
+			name:         "signed prepare committed without signed labels",
+			walking:      true,
+			prepareLabel: true,
+			write: func(t *testing.T, s *snapshotter, id string) {
+				require.NoError(t, os.WriteFile(filepath.Join(s.upperPath(id), "file"), []byte("data"), 0600))
+			},
+			wantErr: "commit identity differs",
+		},
+		{
+			name:         "signed prepare committed with another signature",
+			prepareLabel: true,
+			commitLabels: signedLabels(digest.FromString("other").String()),
+			write: func(t *testing.T, s *snapshotter, id string) {
+				writeSignedArtifacts(t, s.layerBlobPath(id), rootHash)
+			},
+			wantErr: "commit identity differs",
+		},
+		{
+			name:         "missing signature",
+			commitLabels: signedLabels(validDigest),
+			write: func(t *testing.T, s *snapshotter, id string) {
+				writeSignedArtifacts(t, s.layerBlobPath(id), rootHash)
+				require.NoError(t, os.Remove(dmverity.SignaturePath(s.layerBlobPath(id))))
+			},
+			wantErr: "open signature file",
+		},
+		{
+			name:         "empty signature",
+			commitLabels: signedLabels(digest.FromBytes(nil).String()),
+			write: func(t *testing.T, s *snapshotter, id string) {
+				writeSignedArtifacts(t, s.layerBlobPath(id), rootHash)
+				require.NoError(t, os.WriteFile(dmverity.SignaturePath(s.layerBlobPath(id)), nil, 0600))
+			},
+			wantErr: "signature file cannot be empty",
+		},
+		{
+			name:         "oversized signature",
+			commitLabels: signedLabels(digest.FromBytes(make([]byte, verity.MaxSignatureSize+1)).String()),
+			write: func(t *testing.T, s *snapshotter, id string) {
+				writeSignedArtifacts(t, s.layerBlobPath(id), rootHash)
+				require.NoError(t, os.WriteFile(dmverity.SignaturePath(s.layerBlobPath(id)), make([]byte, verity.MaxSignatureSize+1), 0600))
+			},
+			wantErr: "exceeds maximum size",
+		},
+		{
+			// Ordinary EROFS differ: layer blob without signed payloads.
+			name:         "ordinary erofs blob without signed artifacts",
+			commitLabels: signedLabels(validDigest),
+			write: func(t *testing.T, s *snapshotter, id string) {
+				require.NoError(t, os.WriteFile(s.layerBlobPath(id), []byte("layer"), 0600))
+			},
+			wantErr: "invalid signed artifacts",
+		},
+		{
+			name:         "mismatched root hash",
+			commitLabels: signedLabels(validDigest),
+			write: func(t *testing.T, s *snapshotter, id string) {
+				writeSignedArtifacts(t, s.layerBlobPath(id), strings.Repeat("b", 64))
+			},
+			wantErr: "does not match signed identity",
+		},
+		{
+			name:         "mismatched signature",
+			commitLabels: signedLabels(digest.FromString("other").String()),
+			write: func(t *testing.T, s *snapshotter, id string) {
+				writeSignedArtifacts(t, s.layerBlobPath(id), rootHash)
+			},
+			wantErr: "does not match signed identity",
+		},
+		{
+			name:         "valid signed artifacts",
+			prepareLabel: true,
+			commitLabels: signedLabels(validDigest),
+			write: func(t *testing.T, s *snapshotter, id string) {
+				writeSignedArtifacts(t, s.layerBlobPath(id), rootHash)
+			},
+		},
+		{
+			name: "unsigned erofs blob",
+			write: func(t *testing.T, s *snapshotter, id string) {
+				require.NoError(t, os.WriteFile(s.layerBlobPath(id), []byte("layer"), 0600))
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			root := t.TempDir()
+			require.NoError(t, os.Mkdir(filepath.Join(root, "snapshots"), 0700))
+			ms, err := storage.NewMetaStore(filepath.Join(root, "metadata.db"))
+			require.NoError(t, err)
+			s := &snapshotter{root: root, ms: ms, dmverityMode: "auto", enableDmverityReferrers: true}
+			t.Cleanup(func() { require.NoError(t, s.Close()) })
+
+			var prepareOpts []snapshots.Opt
+			if tc.prepareLabel {
+				prepareOpts = append(prepareOpts, snapshots.WithLabels(signedLabels(validDigest)))
+			}
+			_, err = s.Prepare(ctx, "active", "", prepareOpts...)
+			require.NoError(t, err)
+			var id string
+			require.NoError(t, ms.WithTransaction(ctx, false, func(ctx context.Context) error {
+				id, _, _, err = storage.GetInfo(ctx, "active")
+				return err
+			}))
+			tc.write(t, s, id)
+
+			evaluations := 0
+			commitOpts := []snapshots.Opt{func(*snapshots.Info) error {
+				evaluations++
+				return nil
+			}}
+			if tc.commitLabels != nil {
+				commitOpts = append(commitOpts, snapshots.WithLabels(tc.commitLabels))
+			}
+			err = s.Commit(ctx, "committed", "active", commitOpts...)
+			require.Equal(t, 1, evaluations, "commit opts must be evaluated once")
+			if tc.wantErr != "" {
+				require.ErrorContains(t, err, tc.wantErr)
+				_, err = s.Stat(ctx, "committed")
+				require.True(t, errdefs.IsNotFound(err), "rejected commit created a snapshot: %v", err)
+				if tc.walking {
+					_, err = os.Stat(s.layerBlobPath(id))
+					require.True(t, os.IsNotExist(err), "rejected walking commit converted the upperdir")
+				}
+				return
+			}
+			require.NoError(t, err)
+			info, err := s.Stat(ctx, "committed")
+			require.NoError(t, err)
+			require.Equal(t, tc.commitLabels, nilIfEmpty(info.Labels))
+		})
+	}
+}
+
+func nilIfEmpty(labels map[string]string) map[string]string {
+	if len(labels) == 0 {
+		return nil
+	}
+	return labels
 }
 
 func TestSignedReferrersRejectDmverityOff(t *testing.T) {
@@ -900,6 +1089,56 @@ func TestMountsWithMergedFsMeta(t *testing.T) {
 // fsmeta is valid for the topmost parent, so it is the only lower. Since
 // overlayfs rejects a lowerdir with no upperdir, this collapses to a plain
 // bind mount instead.
+func TestMountsWithMixedSignedParentsAndMergedFsMeta(t *testing.T) {
+	for _, signedIndex := range []int{0, 1, 3} {
+		t.Run(fmt.Sprintf("signed-parent-%d", signedIndex), func(t *testing.T) {
+			root := t.TempDir()
+			s := &snapshotter{root: root, enableDmverityReferrers: true, dmverityMode: "auto"}
+			parents := []string{"p0", "p1", "p2", "p3"}
+			parentInfo := make([]snapshots.Info, len(parents))
+			for _, id := range parents {
+				require.NoError(t, os.MkdirAll(filepath.Join(root, "snapshots", id), 0755))
+				require.NoError(t, os.WriteFile(s.layerBlobPath(id), []byte("layer"), 0644))
+				// Every cutoff is available, including ones that would hide the signed parent.
+				require.NoError(t, os.WriteFile(s.fsMetaPath(id), []byte("merged"), 0644))
+			}
+			rootHash := strings.Repeat("a", 64)
+			signature := digest.FromString("signature").String()
+			parentInfo[signedIndex].Labels = map[string]string{
+				"containerd.io/snapshot/erofs.dmverity.root-hash":        rootHash,
+				"containerd.io/snapshot/erofs.dmverity.signature-digest": signature,
+			}
+			mounts, err := s.mounts(storage.Snapshot{
+				Kind: snapshots.KindView, ParentIDs: parents,
+			}, snapshots.Info{}, parentInfo)
+			require.NoError(t, err)
+
+			lowers := signedIndex + 1
+			if lowers < len(parents) {
+				lowers++
+			}
+			require.Len(t, mounts, lowers+1)
+			for i := 0; i <= signedIndex; i++ {
+				require.Equal(t, "erofs", mounts[i].Type)
+				require.Equal(t, s.layerBlobPath(parents[i]), mounts[i].Source)
+			}
+			require.Contains(t, mounts[signedIndex].Options, "X-containerd.dmverity.root-hash="+rootHash)
+			require.Contains(t, mounts[signedIndex].Options, "X-containerd.dmverity.signature-digest="+signature)
+			if signedIndex+1 < len(parents) {
+				cutoff := signedIndex + 1
+				require.Equal(t, s.fsMetaPath(parents[cutoff]), mounts[cutoff].Source)
+				expected := []string{"ro", "loop"}
+				for i := len(parents) - 1; i >= cutoff; i-- {
+					expected = append(expected, "device="+s.layerBlobPath(parents[i]))
+				}
+				require.Equal(t, expected, mounts[cutoff].Options)
+			}
+			require.Equal(t, "format/mkdir/overlay", mounts[lowers].Type)
+			require.Contains(t, mounts[lowers].Options, fmt.Sprintf("lowerdir={{ overlay 0 %d }}", lowers-1))
+		})
+	}
+}
+
 func TestMountsWithMergedFsMetaOnTopParent(t *testing.T) {
 	root := t.TempDir()
 	s := &snapshotter{root: root}

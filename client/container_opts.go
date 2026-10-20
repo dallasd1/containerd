@@ -240,16 +240,33 @@ func WithSnapshotCleanup(ctx context.Context, client *Client, c containers.Conta
 // WithNewSnapshot allocates a new snapshot to be used by the container as the
 // root filesystem in read-write mode
 func WithNewSnapshot(id string, i Image, opts ...snapshots.Opt) NewContainerOpts {
-	return withNewSnapshot(id, i, false, opts...)
+	return withNewSnapshot(id, i, false, nil, opts...)
+}
+
+// WithNewSnapshotParentResolver allocates a new snapshot using a caller-selected
+// image parent. The resolver receives the image's ordinary OCI ChainID.
+func WithNewSnapshotParentResolver(
+	id string,
+	i Image,
+	resolve func(context.Context, string) (string, error),
+	opts ...snapshots.Opt,
+) NewContainerOpts {
+	return withNewSnapshot(id, i, false, resolve, opts...)
 }
 
 // WithNewSnapshotView allocates a new snapshot to be used by the container as the
 // root filesystem in read-only mode
 func WithNewSnapshotView(id string, i Image, opts ...snapshots.Opt) NewContainerOpts {
-	return withNewSnapshot(id, i, true, opts...)
+	return withNewSnapshot(id, i, true, nil, opts...)
 }
 
-func withNewSnapshot(id string, i Image, readonly bool, opts ...snapshots.Opt) NewContainerOpts {
+func withNewSnapshot(
+	id string,
+	i Image,
+	readonly bool,
+	resolveParent func(context.Context, string) (string, error),
+	opts ...snapshots.Opt,
+) NewContainerOpts {
 	return func(ctx context.Context, client *Client, c *containers.Container) error {
 		diffIDs, err := i.RootFS(ctx)
 		if err != nil {
@@ -257,6 +274,15 @@ func withNewSnapshot(id string, i Image, readonly bool, opts ...snapshots.Opt) N
 		}
 
 		parent := identity.ChainID(diffIDs).String()
+		if resolveParent != nil {
+			parent, err = resolveParent(ctx, parent)
+			if err != nil {
+				return fmt.Errorf("resolve image snapshot parent: %w", err)
+			}
+			if parent == "" {
+				return fmt.Errorf("resolved image snapshot parent is empty: %w", errdefs.ErrInvalidArgument)
+			}
+		}
 		c.Snapshotter, err = client.resolveSnapshotterName(ctx, c.Snapshotter)
 		if err != nil {
 			return err

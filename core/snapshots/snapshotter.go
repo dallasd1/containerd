@@ -115,6 +115,15 @@ type Info struct {
 	Updated time.Time         // Last update time
 }
 
+// LayerPreparation describes the snapshot identity and policy for unpacking a layer.
+// Key must be nonempty. ValidateExisting checks cached snapshots.
+type LayerPreparation struct {
+	Key              string
+	GCQualifier      string
+	Labels           map[string]string
+	ValidateExisting func(Info) error
+}
+
 // Usage defines statistics for disk resources consumed by the snapshot.
 //
 // These resources only include the resources consumed by the snapshot itself
@@ -392,6 +401,16 @@ func FilterInheritedLabels(labels map[string]string) map[string]string {
 			filtered[k] = v
 		}
 	}
+	return filtered
+}
+
+// FilterImageInheritedLabels excludes locally assigned signed identity from
+// publisher annotations. FilterInheritedLabels still preserves that identity
+// when metadata is passed to the snapshotter.
+func FilterImageInheritedLabels(labels map[string]string) map[string]string {
+	filtered := FilterInheritedLabels(labels)
+	delete(filtered, "containerd.io/snapshot/erofs.dmverity.root-hash")
+	delete(filtered, "containerd.io/snapshot/erofs.dmverity.signature-digest")
 	return filtered
 }
 

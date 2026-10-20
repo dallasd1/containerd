@@ -21,10 +21,13 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 
 	containerd "github.com/containerd/containerd/v2/client"
 	"github.com/containerd/containerd/v2/core/leases"
 	"github.com/containerd/containerd/v2/core/mount"
+	snpkg "github.com/containerd/containerd/v2/pkg/snapshotters"
+	"github.com/containerd/containerd/v2/plugins"
 	"github.com/containerd/errdefs"
 	"github.com/containerd/log"
 	"github.com/containerd/platforms"
@@ -92,14 +95,22 @@ func (c *criService) mutateImageMount(
 	if err != nil {
 		return fmt.Errorf("failed to resolve image %q: %w", ref, err)
 	}
-	containerdImage, err := c.toContainerdImage(ctx, image)
+	capable, err := c.dmverityReferrersEnabled(ctx, snapshotter)
+	if err != nil {
+		return err
+	}
+	var containerdImage containerd.Image
+	if capable {
+		containerdImage, err = c.dmverityContainerImage(ctx, image, imageSpec, platforms.Only(platform))
+	} else {
+		containerdImage, err = c.toContainerdImage(ctx, image)
+	}
 	if err != nil {
 		return fmt.Errorf("failed to get image from containerd %q: %w", image.ID, err)
 	}
 
 	// This is a digest of the manifest
 	imageID := containerdImage.Target().Digest.Encoded()
-
 	target := c.getImageVolumeHostPath(sandboxID, imageID)
 
 	// Already mounted in another container on the same pod
@@ -110,22 +121,32 @@ func (c *criService) mutateImageMount(
 	if err != nil {
 		return fmt.Errorf("failed to ensure %s is mounted: %w", target, err)
 	}
-	if !mounted {
+	if mounted {
+		if !capable {
+			return setImageMountPath(extraMount, target)
+		}
+	}
+
+	i := containerdImage
+	if !capable {
 		img, err := c.client.ImageService().Get(ctx, ref)
 		if err != nil {
 			return fmt.Errorf("failed to get image volume ref %q: %w", ref, err)
 		}
-
-		i := containerd.NewImageWithPlatform(c.client, img, platforms.Only(platform))
+		i = containerd.NewImageWithPlatform(c.client, img, platforms.Only(platform))
+	}
+	diffIDs, err := i.RootFS(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get diff IDs for image volume %q: %w", ref, err)
+	}
+	chainID := identity.ChainID(diffIDs).String()
+	if err := c.rejectSignedImageVolume(ctx, i, snapshotter, platforms.Only(platform)); err != nil {
+		return err
+	}
+	if !mounted {
 		if err := i.Unpack(ctx, snapshotter); err != nil {
 			return fmt.Errorf("failed to unpack image volume: %w", err)
 		}
-
-		diffIDs, err := i.RootFS(ctx)
-		if err != nil {
-			return fmt.Errorf("failed to get diff IDs for image volume %q: %w", ref, err)
-		}
-		chainID := identity.ChainID(diffIDs).String()
 
 		// Get snapshot options with user namespace idmap labels if needed
 		snapshotOpts, err := c.getImageVolumeSnapshotOpts(ctx, extraMount)
@@ -186,6 +207,10 @@ func (c *criService) mutateImageMount(
 		}
 	}
 
+	return setImageMountPath(extraMount, target)
+}
+
+func setImageMountPath(extraMount *runtime.Mount, target string) error {
 	if imageSubPath := extraMount.GetImageSubPath(); imageSubPath != "" {
 		mountPoint, err := ensureImageSubPath(target, imageSubPath)
 		if err != nil {
@@ -193,9 +218,7 @@ func (c *criService) mutateImageMount(
 		}
 		target = mountPoint
 	}
-
 	extraMount.HostPath = target
-
 	// Clear UID/GID mappings from the mount to prevent the OCI runtime from
 	// attempting idmap on the bind mount. The idmap is already applied to the
 	// overlay lower layers via the snapshotter when the image volume is prepared.
@@ -203,7 +226,6 @@ func (c *criService) mutateImageMount(
 	// (e.g., by another container in the same pod).
 	extraMount.UidMappings = nil
 	extraMount.GidMappings = nil
-
 	return nil
 }
 
@@ -282,4 +304,47 @@ func ensureImageSubPath(mountPoint, subPath string) (string, error) {
 	}
 
 	return file.Name(), nil
+}
+
+// rejectSignedImageVolume refuses signed dm-verity images, which image volumes
+// cannot mount yet, rather than materializing them unsigned.
+func (c *criService) rejectSignedImageVolume(
+	ctx context.Context,
+	i containerd.Image,
+	snapshotter string,
+	platform platforms.MatchComparer,
+) error {
+	capable, err := c.dmverityReferrersEnabled(ctx, snapshotter)
+	if err != nil {
+		return err
+	}
+	if !capable {
+		return nil
+	}
+	signed, err := snpkg.ImageHasDmverityReferrer(ctx, i.ContentStore(), i.Target(), platform)
+	if err != nil {
+		return fmt.Errorf("failed to inspect dm-verity observation for image volume %q: %w", i.Name(), err)
+	}
+	if signed {
+		return fmt.Errorf("image volume %q is a signed dm-verity image, which image volumes do not support: %w", i.Name(), errdefs.ErrNotImplemented)
+	}
+	return nil
+}
+
+func (c *criService) dmverityReferrersEnabled(ctx context.Context, snapshotter string) (bool, error) {
+	c.dmverityCapabilityMu.Lock()
+	defer c.dmverityCapabilityMu.Unlock()
+	if capable, ok := c.dmverityCapabilities[snapshotter]; ok {
+		return capable, nil
+	}
+	capabilities, err := c.client.GetSnapshotterCapabilities(ctx, snapshotter)
+	if err != nil {
+		return false, fmt.Errorf("failed to get capabilities of snapshotter %q: %w", snapshotter, err)
+	}
+	capable := slices.Contains(capabilities, plugins.CapabilityDmverityReferrers)
+	if c.dmverityCapabilities == nil {
+		c.dmverityCapabilities = make(map[string]bool)
+	}
+	c.dmverityCapabilities[snapshotter] = capable
+	return capable, nil
 }

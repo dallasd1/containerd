@@ -17,16 +17,84 @@
 package image
 
 import (
+	"context"
+	"fmt"
 	"sort"
 	"strings"
 	"testing"
 
+	"github.com/containerd/containerd/v2/core/content"
+	"github.com/containerd/containerd/v2/core/images"
+	"github.com/containerd/containerd/v2/core/images/imagetest"
 	"github.com/containerd/errdefs"
+	"github.com/containerd/platforms"
 
 	"github.com/opencontainers/go-digest/digestset"
 	assertlib "github.com/stretchr/testify/assert"
 	"k8s.io/apimachinery/pkg/util/sets"
 )
+
+func TestImageSnapshottersNormalizeQualifiedReferences(t *testing.T) {
+	ctx := context.Background()
+	cs := imagetest.NewContentStore(ctx, t)
+	target := imagetest.SimpleManifest(50)(cs)
+	_, err := cs.Store.Update(ctx, content.Info{
+		Digest: target.Children[0].Descriptor.Digest,
+		Labels: map[string]string{
+			"containerd.io/gc.ref.snapshot.erofs/dmverity": "dmverity-key",
+		},
+	}, "labels.containerd.io/gc.ref.snapshot.erofs/dmverity")
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := NewStore(nil, cs.Store, platforms.Default())
+	img, err := store.getImage(ctx, images.Image{Name: "signed", Target: target.Descriptor})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := img.Snapshotters["erofs"]; !ok {
+		t.Fatalf("qualified snapshot reference did not resolve to erofs: %#v", img.Snapshotters)
+	}
+	if _, ok := img.Snapshotters["erofs/dmverity"]; ok {
+		t.Fatalf("GC lane qualifier was reported as a separate snapshotter: %#v", img.Snapshotters)
+	}
+}
+
+func TestSnapshottersRefreshForExistingImage(t *testing.T) {
+	const id = "sha256:1123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	for _, alias := range []bool{false, true} {
+		for _, pinned := range []bool{false, true} {
+			t.Run(fmt.Sprintf("alias=%t/pinned=%t", alias, pinned), func(t *testing.T) {
+				s := NewStore(nil, nil, platforms.Default())
+				img := Image{ID: id, References: []string{"old"}, Snapshotters: map[string]struct{}{"overlayfs": {}}}
+				assert := assertlib.New(t)
+				assert.NoError(s.update("old", &img))
+				before, err := s.Get(id)
+				assert.NoError(err)
+				ref := "old"
+				if alias {
+					ref = "new"
+				}
+				img.References = []string{ref}
+				img.Pinned = pinned
+				img.Snapshotters = map[string]struct{}{"overlayfs": {}, "erofs": {}}
+				assert.NoError(s.update(ref, &img))
+				after, err := s.Get(id)
+				assert.NoError(err)
+				assert.Contains(after.Snapshotters, "erofs")
+				assert.NotContains(before.Snapshotters, "erofs")
+				assert.Equal(pinned, after.Pinned)
+				delete(img.Snapshotters, "erofs")
+				assert.Contains(after.Snapshotters, "erofs", "cache must not share the replacement input map")
+				assert.NoError(s.update(ref, &img))
+				refreshed, err := s.Get(id)
+				assert.NoError(err)
+				assert.NotContains(refreshed.Snapshotters, "erofs", "refresh must remove stale snapshotters")
+				assert.Contains(after.Snapshotters, "erofs", "refresh must not mutate previously returned metadata")
+			})
+		}
+	}
+}
 
 func TestInternalStore(t *testing.T) {
 	images := []Image{
