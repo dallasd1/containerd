@@ -111,3 +111,7 @@ const (
 const (
 	SnapshotterRootDir = "root"
 )
+
+const (
+	CapabilityDmverityReferrers = "dmverity-referrers"
+)
