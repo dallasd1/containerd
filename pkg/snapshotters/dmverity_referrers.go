@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"maps"
 	"strings"
+	"time"
 
 	"github.com/containerd/containerd/v2/core/content"
 	"github.com/containerd/containerd/v2/core/images"
@@ -160,30 +161,43 @@ func fetchSignatures(
 		return nil, false, fmt.Errorf("fetch dm-verity referrers for %s: %w", subject.Digest, err)
 	}
 	var selected ocispec.Descriptor
+	var selectedCreated time.Time
+	found := false
 	for _, referrer := range referrers {
 		if referrer.ArtifactType != signatureArtifactType {
 			continue
 		}
-		if referrer.MediaType != ocispec.MediaTypeImageManifest {
-			return nil, true, fmt.Errorf(
-				"dm-verity referrer %s has unexpected media type %q",
-				referrer.Digest,
-				referrer.MediaType,
-			)
+		var created time.Time
+		if value := referrer.Annotations[ocispec.AnnotationCreated]; value != "" {
+			parsed, err := time.Parse(time.RFC3339Nano, value)
+			if err != nil {
+				log.G(ctx).WithField("bundle", referrer.Digest).WithError(err).
+					Warn("Ignoring invalid dm-verity referrer creation time")
+			} else {
+				created = parsed
+			}
 		}
-		if selected.Digest == referrer.Digest {
+		// Registry order is unspecified. Break equal or missing timestamp ties by digest.
+		if found && (created.Before(selectedCreated) ||
+			created.Equal(selectedCreated) && referrer.Digest >= selected.Digest) {
 			continue
 		}
-		if selected.Digest != "" {
-			return nil, true, fmt.Errorf(
-				"manifest %s has multiple dm-verity referrers; the publisher contract allows one bundle per manifest",
-				subject.Digest,
-			)
-		}
 		selected = referrer
+		selectedCreated = created
+		found = true
 	}
-	if selected.Digest == "" {
+	if !found {
 		return nil, true, nil
+	}
+	if err := selected.Digest.Validate(); err != nil {
+		return nil, true, fmt.Errorf("invalid dm-verity referrer digest %q: %w", selected.Digest, err)
+	}
+	if selected.MediaType != ocispec.MediaTypeImageManifest {
+		return nil, true, fmt.Errorf(
+			"dm-verity referrer %s has unexpected media type %q",
+			selected.Digest,
+			selected.MediaType,
+		)
 	}
 
 	if err := remotes.Fetch(ctx, store, fetcher, selected); err != nil && !errdefs.IsAlreadyExists(err) {

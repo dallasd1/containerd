@@ -259,7 +259,7 @@ func (f referrerTestFetcher) FetchReferrers(context.Context, digest.Digest, ...r
 	return f.referrers, nil
 }
 
-func TestFetchSignaturesAcceptsOneBundleAndRejectsMultiple(t *testing.T) {
+func TestFetchSignaturesAcceptsOneBundle(t *testing.T) {
 	ctx := t.Context()
 	store := imagetest.NewContentStore(ctx, t)
 	subject := ocispec.Descriptor{Digest: digest.FromString("subject")}
@@ -271,12 +271,76 @@ func TestFetchSignaturesAcceptsOneBundleAndRejectsMultiple(t *testing.T) {
 	require.True(t, discovered)
 	require.Equal(t, digest.FromString("root-single").Encoded(), bundle.layers[layerDigest.String()].RootHash)
 	require.Equal(t, referrer.Digest, bundle.desc.Digest)
+}
 
-	other := addTestDmverityReferrer(t, store, subject, layerDigest, "other")
-	_, _, err = fetchSignatures(ctx, referrerTestFetcher{
-		referrers: []ocispec.Descriptor{referrer, other},
-	}, store.Store, subject, map[string]struct{}{layerDigest.String(): {}})
-	require.ErrorContains(t, err, "multiple dm-verity referrers")
+func TestFetchSignaturesSelectsLatestBundle(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		aCreated string
+		bCreated string
+		newest   string
+	}{
+		{"newer timestamp", "2026-11-12T22:00:00Z", "2026-11-13T12:00:00Z", "b"},
+		{"timezone comparison", "2026-11-13T10:00:00-03:00", "2026-11-13T12:00:00Z", "a"},
+		{"nanosecond comparison", "2026-11-13T12:00:00.1Z", "2026-11-13T12:00:00.2Z", "b"},
+		{"missing timestamp", "", "2026-11-13T12:00:00Z", "b"},
+		{"invalid timestamp", "not-a-timestamp", "2026-11-13T12:00:00Z", "b"},
+		{"equal timestamps", "2026-11-13T12:00:00Z", "2026-11-13T13:00:00+01:00", ""},
+		{"both timestamps missing", "", "", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := t.Context()
+			store := imagetest.NewContentStore(ctx, t)
+			subject := ocispec.Descriptor{Digest: digest.FromString("subject")}
+			layerDigest := digest.FromString("image layer")
+			a := addTestDmverityReferrer(t, store, subject, layerDigest, "a")
+			b := addTestDmverityReferrer(t, store, subject, layerDigest, "b")
+			a.Annotations = map[string]string{ocispec.AnnotationCreated: tc.aCreated}
+			b.Annotations = map[string]string{ocispec.AnnotationCreated: tc.bCreated}
+			want := a.Digest
+			if tc.newest == "b" || tc.newest == "" && b.Digest < a.Digest {
+				want = b.Digest
+			}
+			unrelated := ocispec.Descriptor{
+				ArtifactType: "application/vnd.cncf.notary.signature",
+				Digest:       digest.FromString("ordinary signature"),
+				Annotations:  map[string]string{ocispec.AnnotationCreated: "2099-01-01T00:00:00Z"},
+			}
+			for _, refs := range [][]ocispec.Descriptor{{a, unrelated, b}, {b, unrelated, a}} {
+				bundle, discovered, err := fetchSignatures(ctx, referrerTestFetcher{referrers: refs},
+					store.Store, subject, map[string]struct{}{layerDigest.String(): {}})
+				require.NoError(t, err)
+				require.True(t, discovered)
+				require.Equal(t, want, bundle.desc.Digest)
+			}
+		})
+	}
+}
+
+func TestFetchSignaturesRejectsInvalidDescriptors(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		digest    digest.Digest
+		mediaType string
+		want      string
+	}{
+		{"empty digest", "", ocispec.MediaTypeImageManifest, "invalid dm-verity referrer digest"},
+		{"invalid digest", "not-a-digest", ocispec.MediaTypeImageManifest, "invalid dm-verity referrer digest"},
+		{"wrong media type", digest.FromString("bundle"), ocispec.MediaTypeImageIndex, "unexpected media type"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			bundle, discovered, err := fetchSignatures(t.Context(), referrerTestFetcher{
+				referrers: []ocispec.Descriptor{{
+					Digest:       tc.digest,
+					MediaType:    tc.mediaType,
+					ArtifactType: signatureArtifactType,
+				}},
+			}, nil, ocispec.Descriptor{Digest: digest.FromString("subject")}, nil)
+			require.ErrorContains(t, err, tc.want)
+			require.True(t, discovered)
+			require.Nil(t, bundle)
+		})
+	}
 }
 
 func TestUnsignedManifestUsesOrdinaryLayerFallback(t *testing.T) {
@@ -358,11 +422,13 @@ func TestFetchSignaturesRejectsMalformedBundles(t *testing.T) {
 			require.NoError(t, err)
 			var manifest ocispec.Manifest
 			require.NoError(t, json.Unmarshal(data, &manifest))
+			valid.Annotations = map[string]string{ocispec.AnnotationCreated: "2026-11-12T12:00:00Z"}
 			tc.mutate(&manifest)
 			referrer := store.JSONObject(ocispec.MediaTypeImageManifest, manifest).Descriptor
 			referrer.ArtifactType = signatureArtifactType
+			referrer.Annotations = map[string]string{ocispec.AnnotationCreated: "2026-11-13T12:00:00Z"}
 			bundle, discovered, err := fetchSignatures(ctx,
-				referrerTestFetcher{referrers: []ocispec.Descriptor{referrer}},
+				referrerTestFetcher{referrers: []ocispec.Descriptor{valid, referrer}},
 				store.Store, subject, map[string]struct{}{source.String(): {}})
 			require.ErrorContains(t, err, tc.want)
 			require.True(t, discovered, "malformed signed content must not become unsigned absence")
@@ -430,7 +496,10 @@ func TestSignedBundleIsRetainedOnSubjectManifest(t *testing.T) {
 	})
 	subject := subjectContent.Descriptor
 	referrer := addTestDmverityReferrer(t, store, subject, layer.Digest, "retained")
-	fetcher := referrerTestFetcher{referrers: []ocispec.Descriptor{referrer}}
+	referrer.Annotations = map[string]string{ocispec.AnnotationCreated: "2026-11-13T12:00:00Z"}
+	older := addTestDmverityReferrerWithRoot(t, store, subject, layer.Digest, "older", digest.FromString("root-retained").Encoded())
+	older.Annotations = map[string]string{ocispec.AnnotationCreated: "2026-11-12T12:00:00Z"}
+	fetcher := referrerTestFetcher{referrers: []ocispec.Descriptor{older}}
 	base := images.HandlerFunc(func(_ context.Context, desc ocispec.Descriptor) ([]ocispec.Descriptor, error) {
 		if desc.Digest == subject.Digest {
 			return []ocispec.Descriptor{layer}, nil
@@ -438,6 +507,9 @@ func TestSignedBundleIsRetainedOnSubjectManifest(t *testing.T) {
 		return nil, nil
 	})
 
+	_, err := AppendSignatureHandlerWrapper(fetcher, store.Store)(base).Handle(ctx, subject)
+	require.NoError(t, err)
+	fetcher.referrers = []ocispec.Descriptor{older, referrer}
 	children, err := AppendSignatureHandlerWrapper(fetcher, store.Store)(base).Handle(ctx, subject)
 	require.NoError(t, err)
 	target, err := ParseDmverityTarget(children[0].Annotations[TargetLayerDmverityLabel])
