@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"maps"
 	"strings"
 	"sync"
@@ -228,15 +229,49 @@ func TestSignatureDiscoveryErrorPreservesSelection(t *testing.T) {
 		MediaType: ocispec.MediaTypeImageManifest,
 		Digest:    digest.FromString("subject"),
 	}
-	handler := AppendSignatureHandlerWrapper(
-		signatureTestFetcher{err: fmt.Errorf("referrers index exceeds maximum allowed: %w", errdefs.ErrNotFound)},
-		nil,
-	)(images.HandlerFunc(func(context.Context, ocispec.Descriptor) ([]ocispec.Descriptor, error) {
-		return nil, nil
-	}))
+	for _, failure := range []error{
+		fmt.Errorf("referrers index exceeds maximum allowed: %w", errdefs.ErrNotFound),
+		errdefs.ErrUnavailable,
+		context.Canceled,
+		context.DeadlineExceeded,
+	} {
+		t.Run(failure.Error(), func(t *testing.T) {
+			handler := AppendSignatureHandlerWrapper(
+				signatureTestFetcher{err: failure}, nil,
+			)(images.HandlerFunc(func(context.Context, ocispec.Descriptor) ([]ocispec.Descriptor, error) {
+				return nil, nil
+			}))
 
-	_, err := handler.Handle(t.Context(), subject)
-	require.ErrorIs(t, err, errdefs.ErrNotFound)
+			_, err := handler.Handle(t.Context(), subject)
+			require.ErrorIs(t, err, failure)
+		})
+	}
+}
+
+func TestReferrerManifestReadErrorDoesNotFallBack(t *testing.T) {
+	ctx := t.Context()
+	store := imagetest.NewContentStore(ctx, t)
+	subject := store.Blob(ocispec.MediaTypeImageManifest, []byte("{}")).Descriptor
+	fetcher := referrerTestFetcher{
+		signatureTestFetcher: signatureTestFetcher{
+			Fetcher: remotes.FetcherFunc(func(context.Context, ocispec.Descriptor) (io.ReadCloser, error) {
+				return nil, io.ErrUnexpectedEOF
+			}),
+		},
+		referrers: []ocispec.Descriptor{{
+			MediaType:    ocispec.MediaTypeImageManifest,
+			ArtifactType: signatureArtifactType,
+			Digest:       digest.FromString("unavailable referrer"),
+			Size:         1,
+		}},
+	}
+	handler := AppendSignatureHandlerWrapper(fetcher, store.Store)(
+		images.HandlerFunc(func(context.Context, ocispec.Descriptor) ([]ocispec.Descriptor, error) {
+			return nil, nil
+		}),
+	)
+	_, err := handler.Handle(ctx, subject)
+	require.ErrorIs(t, err, io.ErrUnexpectedEOF)
 }
 
 type signatureTestFetcher struct {
@@ -329,16 +364,22 @@ func TestFetchSignaturesRejectsInvalidDescriptors(t *testing.T) {
 		{"wrong media type", digest.FromString("bundle"), ocispec.MediaTypeImageIndex, "unexpected media type"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			bundle, discovered, err := fetchSignatures(t.Context(), referrerTestFetcher{
+			ctx := t.Context()
+			store := imagetest.NewContentStore(ctx, t)
+			subject := store.Blob(ocispec.MediaTypeImageManifest, []byte("{}")).Descriptor
+			source := digest.FromString("image layer")
+			fetcher := referrerTestFetcher{
 				referrers: []ocispec.Descriptor{{
 					Digest:       tc.digest,
 					MediaType:    tc.mediaType,
 					ArtifactType: signatureArtifactType,
 				}},
-			}, nil, ocispec.Descriptor{Digest: digest.FromString("subject")}, nil)
+			}
+			bundle, discovered, err := fetchSignatures(ctx, fetcher, store.Store, subject, nil)
 			require.ErrorContains(t, err, tc.want)
 			require.True(t, discovered)
 			require.Nil(t, bundle)
+			assertUnsignedReferrerFallback(t, store, subject, source, fetcher)
 		})
 	}
 }
@@ -404,18 +445,23 @@ func TestFetchSignaturesRejectsMalformedBundles(t *testing.T) {
 		{"wrong subject", func(m *ocispec.Manifest) {
 			m.Subject = &ocispec.Descriptor{Digest: digest.FromString("other subject")}
 		}, "subject does not match"},
+		{"wrong artifact type", func(m *ocispec.Manifest) {
+			m.ArtifactType = "application/vnd.example.invalid"
+		}, "unexpected artifact type"},
 		{"missing metadata", func(m *ocispec.Manifest) { m.Layers = m.Layers[1:] }, "incomplete dm-verity artifacts"},
 		{"missing tree", func(m *ocispec.Manifest) { m.Layers = append(m.Layers[:1], m.Layers[2:]...) }, "incomplete dm-verity artifacts"},
 		{"missing signature", func(m *ocispec.Manifest) { m.Layers = m.Layers[:2] }, "incomplete dm-verity artifacts"},
 		{"duplicate metadata", func(m *ocispec.Manifest) { m.Layers = append(m.Layers, m.Layers[0]) }, "duplicate EROFS metadata"},
 		{"duplicate tree", func(m *ocispec.Manifest) { m.Layers = append(m.Layers, m.Layers[1]) }, "duplicate Merkle-tree"},
 		{"duplicate signature", func(m *ocispec.Manifest) { m.Layers = append(m.Layers, m.Layers[2]) }, "duplicate signature"},
+		{"invalid payload digest", func(m *ocispec.Manifest) { m.Layers[0].Digest = "not-a-digest" }, "invalid payload digest"},
+		{"zero payload size", func(m *ocispec.Manifest) { m.Layers[0].Size = 0 }, "invalid payload size"},
 		{"oversized signature", func(m *ocispec.Manifest) { m.Layers[2].Size = verity.MaxSignatureSize + 1 }, "maximum is"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := t.Context()
 			store := imagetest.NewContentStore(ctx, t)
-			subject := ocispec.Descriptor{Digest: digest.FromString("subject")}
+			subject := store.Blob(ocispec.MediaTypeImageManifest, []byte("{}")).Descriptor
 			source := digest.FromString("layer")
 			valid := addTestDmverityReferrer(t, store, subject, source, "valid")
 			data, err := content.ReadBlob(ctx, store.Store, valid)
@@ -427,14 +473,83 @@ func TestFetchSignaturesRejectsMalformedBundles(t *testing.T) {
 			referrer := store.JSONObject(ocispec.MediaTypeImageManifest, manifest).Descriptor
 			referrer.ArtifactType = signatureArtifactType
 			referrer.Annotations = map[string]string{ocispec.AnnotationCreated: "2026-11-13T12:00:00Z"}
-			bundle, discovered, err := fetchSignatures(ctx,
-				referrerTestFetcher{referrers: []ocispec.Descriptor{valid, referrer}},
+			fetcher := referrerTestFetcher{referrers: []ocispec.Descriptor{valid, referrer}}
+			bundle, discovered, err := fetchSignatures(ctx, fetcher,
 				store.Store, subject, map[string]struct{}{source.String(): {}})
 			require.ErrorContains(t, err, tc.want)
-			require.True(t, discovered, "malformed signed content must not become unsigned absence")
+			require.True(t, discovered, "malformed metadata is not an empty discovery result")
 			require.Nil(t, bundle)
+			assertUnsignedReferrerFallback(t, store, subject, source, fetcher)
 		})
 	}
+}
+
+func assertUnsignedReferrerFallback(
+	t *testing.T,
+	store imagetest.ContentStore,
+	subject ocispec.Descriptor,
+	source digest.Digest,
+	fetcher remotes.Fetcher,
+) {
+	t.Helper()
+	ctx := t.Context()
+	layer := ocispec.Descriptor{
+		MediaType: ocispec.MediaTypeImageLayer,
+		Digest:    source,
+		Size:      1,
+		Annotations: map[string]string{
+			TargetLayerDmverityLabel:             "untrusted",
+			dmverityReferrerRootHashLabel:        "untrusted",
+			dmverityReferrerSignatureDigestLabel: "untrusted",
+		},
+	}
+	base := images.HandlerFunc(func(context.Context, ocispec.Descriptor) ([]ocispec.Descriptor, error) {
+		return []ocispec.Descriptor{layer}, nil
+	})
+	children, err := AppendSignatureHandlerWrapper(fetcher, store.Store)(base).Handle(ctx, subject)
+	require.NoError(t, err)
+	require.Len(t, children, 1)
+	chainID := digest.FromString("ordinary chain").String()
+	prepared, err := PrepareDmverityLayer(ctx, children[0], chainID, "")
+	require.NoError(t, err)
+	require.Equal(t, chainID, prepared.Key)
+	require.Empty(t, prepared.Labels)
+	info, err := store.Info(ctx, subject.Digest)
+	require.NoError(t, err)
+	require.NotContains(t, info.Labels, dmverityBundleContentLabel)
+	require.NotContains(t, info.Labels, dmverityNoReferrerLabel)
+	cached, err := AppendCachedSignatureHandlerWrapper(store.Store)(base).Handle(ctx, subject)
+	require.NoError(t, err)
+	require.Equal(t, children, cached)
+}
+
+func TestMalformedReferrerRetryUsesRepairedBundle(t *testing.T) {
+	ctx := t.Context()
+	store := imagetest.NewContentStore(ctx, t)
+	config := store.JSONObject(ocispec.MediaTypeImageConfig, ocispec.Image{})
+	layer := store.Blob(ocispec.MediaTypeImageLayer, []byte("layer"))
+	subject := store.Manifest(config, layer).Descriptor
+	base := images.ChildrenHandler(store.Store)
+	malformed := store.Blob(ocispec.MediaTypeImageManifest, []byte("{")).Descriptor
+	malformed.ArtifactType = signatureArtifactType
+	children, err := AppendSignatureHandlerWrapper(
+		referrerTestFetcher{referrers: []ocispec.Descriptor{malformed}}, store.Store,
+	)(base).Handle(ctx, subject)
+	require.NoError(t, err)
+	require.NotContains(t, children[1].Annotations, TargetLayerDmverityLabel)
+
+	repaired := addTestDmverityReferrer(t, store, subject, layer.Descriptor.Digest, "repaired")
+	children, err = AppendSignatureHandlerWrapper(
+		referrerTestFetcher{referrers: []ocispec.Descriptor{repaired}}, store.Store,
+	)(base).Handle(ctx, subject)
+	require.NoError(t, err)
+	target, err := ParseDmverityTarget(children[1].Annotations[TargetLayerDmverityLabel])
+	require.NoError(t, err)
+	require.Equal(t, digest.FromString("root-repaired").Encoded(), target.RootHash)
+	info, err := store.Info(ctx, subject.Digest)
+	require.NoError(t, err)
+	require.Equal(t, repaired.Digest.String(), info.Labels[dmverityBundleContentLabel])
+	require.NotContains(t, info.Labels, dmverityNoReferrerLabel)
 }
 
 func addTestDmverityReferrer(
@@ -534,8 +649,23 @@ func TestSignedBundleIsRetainedOnSubjectManifest(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, children[0].Annotations[TargetLayerDmverityLabel], cached[0].Annotations[TargetLayerDmverityLabel])
 
+	malformed := store.Blob(ocispec.MediaTypeImageManifest, []byte("{")).Descriptor
+	malformed.ArtifactType = signatureArtifactType
+	malformed.Annotations = map[string]string{ocispec.AnnotationCreated: "2026-11-14T12:00:00Z"}
+	malformedHandler := AppendSignatureHandlerWrapper(
+		referrerTestFetcher{referrers: []ocispec.Descriptor{referrer, malformed}}, store.Store,
+	)(base)
+	retained, err := malformedHandler.Handle(ctx, subject)
+	require.NoError(t, err)
+	require.Equal(t, cached, retained)
+	after, err := store.Info(ctx, subject.Digest)
+	require.NoError(t, err)
+	require.Equal(t, info.Labels, after.Labels)
+
 	require.NoError(t, store.Store.Delete(ctx, target.Tree.Digest))
 	_, err = AppendCachedSignatureHandlerWrapper(store.Store)(base).Handle(ctx, subject)
+	require.ErrorContains(t, err, "read retained dm-verity payload")
+	_, err = malformedHandler.Handle(ctx, subject)
 	require.ErrorContains(t, err, "read retained dm-verity payload")
 }
 

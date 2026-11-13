@@ -19,6 +19,7 @@ package snapshotters
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"maps"
 	"strings"
@@ -139,6 +140,10 @@ type dmverityBundle struct {
 	layers map[string]*DmverityTarget
 }
 
+type malformedDmverityReferrerError struct{ error }
+
+func (e malformedDmverityReferrerError) Unwrap() error { return e.error }
+
 func fetchSignatures(
 	ctx context.Context,
 	fetcher remotes.Fetcher,
@@ -190,14 +195,14 @@ func fetchSignatures(
 		return nil, true, nil
 	}
 	if err := selected.Digest.Validate(); err != nil {
-		return nil, true, fmt.Errorf("invalid dm-verity referrer digest %q: %w", selected.Digest, err)
+		return nil, true, malformedDmverityReferrerError{
+			fmt.Errorf("invalid dm-verity referrer digest %q: %w", selected.Digest, err),
+		}
 	}
 	if selected.MediaType != ocispec.MediaTypeImageManifest {
-		return nil, true, fmt.Errorf(
-			"dm-verity referrer %s has unexpected media type %q",
-			selected.Digest,
-			selected.MediaType,
-		)
+		return nil, true, malformedDmverityReferrerError{
+			fmt.Errorf("dm-verity referrer %s has unexpected media type %q", selected.Digest, selected.MediaType),
+		}
 	}
 
 	if err := remotes.Fetch(ctx, store, fetcher, selected); err != nil && !errdefs.IsAlreadyExists(err) {
@@ -231,9 +236,17 @@ func readDmverityBundle(
 	}
 	var manifest ocispec.Manifest
 	if err := json.Unmarshal(data, &manifest); err != nil {
-		return nil, fmt.Errorf("parse dm-verity referrer %s: %w", referrer.Digest, err)
+		return nil, malformedDmverityReferrerError{
+			fmt.Errorf("parse dm-verity referrer %s: %w", referrer.Digest, err),
+		}
 	}
-	return readDmverityBundleManifest(manifest, referrer, subject, imageLayers)
+	targets, err := readDmverityBundleManifest(manifest, referrer, subject, imageLayers)
+	if err != nil {
+		return nil, malformedDmverityReferrerError{
+			fmt.Errorf("invalid dm-verity referrer %s: %w", referrer.Digest, err),
+		}
+	}
+	return targets, nil
 }
 
 func readDmverityBundleManifest(
@@ -264,6 +277,9 @@ func readDmverityBundleManifest(
 		}
 		if _, ok := imageLayers[sourceDigest]; !ok {
 			continue
+		}
+		if err := layer.Digest.Validate(); err != nil {
+			return nil, fmt.Errorf("bundle descriptor for layer %s has invalid payload digest %q: %w", sourceDigest, layer.Digest, err)
 		}
 		if layer.Size <= 0 {
 			return nil, fmt.Errorf("bundle descriptor %s has invalid payload size %d", layer.Digest, layer.Size)
@@ -370,9 +386,15 @@ func (h *dmverityHandler) Handle(
 	if h.fetcher != nil {
 		selected, discovered, err := fetchSignatures(ctx, h.fetcher, h.store, desc, imageLayers)
 		if err != nil {
-			return nil, err
-		}
-		if discovered && selected == nil {
+			var malformed malformedDmverityReferrerError
+			if !errors.As(err, &malformed) {
+				return nil, err
+			}
+			// Malformed metadata is not an observation that no referrer exists.
+			// Preserve retained signed targets, otherwise unpack the original layers.
+			log.G(ctx).WithField("manifest", desc.Digest).WithError(err).
+				Warn("Ignoring malformed dm-verity referrer; using retained signed metadata or ordinary unsigned layers")
+		} else if discovered && selected == nil {
 			signed, err := recordDmverityObservation(ctx, h.store, desc.Digest, "", imageLayers)
 			if err != nil {
 				return nil, fmt.Errorf("record absence of dm-verity referrer for %s: %w", desc.Digest, err)
