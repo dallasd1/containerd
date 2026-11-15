@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/containerd/containerd/v2/core/mount"
+	"github.com/opencontainers/go-digest"
 )
 
 const (
@@ -120,6 +121,7 @@ type Info struct {
 type LayerPreparation struct {
 	Key              string
 	GCQualifier      string
+	GCContent        digest.Digest // Defaults to the image config when empty.
 	Labels           map[string]string
 	ValidateExisting func(Info) error
 }

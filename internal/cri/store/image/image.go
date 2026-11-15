@@ -183,15 +183,42 @@ func (s *Store) getImage(ctx context.Context, i images.Image) (*Image, error) {
 	}
 
 	snapshotters := make(map[string]struct{})
-	for label := range info.Labels {
-		const prefix = "containerd.io/gc.ref.snapshot."
-		if strings.HasPrefix(label, prefix) {
-			snapshotter := label[len(prefix):]
-			if separator := strings.IndexByte(snapshotter, '/'); separator >= 0 {
-				snapshotter = snapshotter[:separator]
+	addSnapshotters := func(info content.Info) {
+		for label := range info.Labels {
+			const prefix = "containerd.io/gc.ref.snapshot."
+			if strings.HasPrefix(label, prefix) {
+				snapshotter := label[len(prefix):]
+				if separator := strings.IndexByte(snapshotter, '/'); separator >= 0 {
+					snapshotter = snapshotter[:separator]
+				}
+				snapshotters[snapshotter] = struct{}{}
 			}
-			snapshotters[snapshotter] = struct{}{}
 		}
+	}
+	addSnapshotters(info)
+	children := images.LimitManifests(images.FilterPlatforms(images.ChildrenHandler(s.provider), s.platform), s.platform, 1)
+	err = images.Walk(ctx, images.HandlerFunc(func(ctx context.Context, desc imagespec.Descriptor) ([]imagespec.Descriptor, error) {
+		if images.IsIndexType(desc.MediaType) {
+			return children(ctx, desc)
+		}
+		if !images.IsManifestType(desc.MediaType) {
+			return nil, nil
+		}
+		info, err := s.provider.Info(ctx, desc.Digest)
+		if err != nil {
+			return nil, err
+		}
+		if referrer := info.Labels["containerd.io/gc.ref.content.dmverity"]; referrer != "" {
+			retained, err := s.provider.Info(ctx, imagedigest.Digest(referrer))
+			if err != nil {
+				return nil, err
+			}
+			addSnapshotters(retained)
+		}
+		return nil, nil
+	}), i.Target)
+	if err != nil {
+		return nil, fmt.Errorf("get signed image snapshotters: %w", err)
 	}
 
 	var spec imagespec.Image

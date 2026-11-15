@@ -73,12 +73,14 @@ func TestImageReadinessUsesSelectedSnapshotLane(t *testing.T) {
 	for _, tc := range []struct {
 		name       string
 		signed     bool
-		legacyOnly bool
+		staleCache string
 		disabled   bool
 	}{
 		{name: "unsigned"},
 		{name: "signed", signed: true},
-		{name: "signed legacy cache needs new unpack", signed: true, legacyOnly: true},
+		{name: "signed legacy cache needs new unpack", signed: true, staleCache: "legacy"},
+		{name: "signed root-only cache needs new unpack", signed: true, staleCache: "root-only"},
+		{name: "signed replacement signature needs new unpack", signed: true, staleCache: "previous signature"},
 		{name: "disabled ignores invalid observation", disabled: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -91,6 +93,7 @@ func TestImageReadinessUsesSelectedSnapshotLane(t *testing.T) {
 			layer := store.RandomBlob(ocispec.MediaTypeImageLayer, 16)
 			manifest := store.Manifest(config, layer)
 			rootHash := digest.FromString("root").Encoded()
+			signatureDigest := digest.FromString("application/vnd.containerd.erofs.dmverity.layer-signature.v1+pkcs7").String()
 			if tc.disabled {
 				_, err := store.Update(ctx, content.Info{
 					Digest: manifest.Descriptor.Digest,
@@ -134,12 +137,19 @@ func TestImageReadinessUsesSelectedSnapshotLane(t *testing.T) {
 			expected := chainID
 			if tc.signed {
 				var err error
-				expected, err = snpkg.DmveritySnapshotKey(chainID, "", rootHash)
+				expected, err = snpkg.DmveritySnapshotKey(chainID, "", rootHash, signatureDigest)
 				require.NoError(t, err)
 			}
 			available := expected
-			if tc.legacyOnly {
+			switch tc.staleCache {
+			case "legacy":
 				available = chainID + "-dmverity"
+			case "root-only":
+				available = digest.FromString("erofs-dmverity-v2\n\n"+chainID+"\n"+rootHash).String() + "-dmverity-v2"
+			case "previous signature":
+				var err error
+				available, err = snpkg.DmveritySnapshotKey(chainID, "", rootHash, digest.FromString("previous signature").String())
+				require.NoError(t, err)
 			}
 			snapshotter := &dmverityReadinessSnapshotter{existing: map[string]bool{available: true}}
 			client, err := containerd.New("", containerd.WithServices(
@@ -157,7 +167,7 @@ func TestImageReadinessUsesSelectedSnapshotLane(t *testing.T) {
 
 			ok, err := service.imageIsUnpacked(ctx, image, "erofs")
 			require.NoError(t, err)
-			require.Equal(t, !tc.legacyOnly, ok)
+			require.Equal(t, tc.staleCache == "", ok)
 			require.Len(t, snapshotter.keys, 1)
 			require.Equal(t, expected, snapshotter.keys[0])
 		})

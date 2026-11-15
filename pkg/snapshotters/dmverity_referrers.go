@@ -60,6 +60,7 @@ func PrepareDmverityLayer(_ context.Context, desc ocispec.Descriptor, chainID, p
 		return snapshots.LayerPreparation{}, err
 	}
 	expectedRootHash := labels[dmverityReferrerRootHashLabel]
+	expectedSignatureDigest := labels[dmverityReferrerSignatureDigestLabel]
 	expectedSigned := len(labels) > 0
 	preparation := snapshots.LayerPreparation{
 		Key:    chainID,
@@ -68,15 +69,23 @@ func PrepareDmverityLayer(_ context.Context, desc ocispec.Descriptor, chainID, p
 			if expectedSigned && info.Parent != parent {
 				return fmt.Errorf("existing signed snapshot has parent %q, expected %q", info.Parent, parent)
 			}
-			return validateDmveritySnapshot(info.Labels, expectedRootHash, expectedSigned)
+			return validateDmveritySnapshot(info.Labels, expectedRootHash, expectedSignatureDigest, expectedSigned)
 		},
 	}
 	if len(labels) > 0 {
-		preparation.Key, err = DmveritySnapshotKey(chainID, parent, expectedRootHash)
+		target, err := ParseDmverityTarget(desc.Annotations[TargetLayerDmverityLabel])
 		if err != nil {
 			return snapshots.LayerPreparation{}, err
 		}
-		// Keep each signed variant reachable even when manifests share a config.
+		if err := target.Referrer.Validate(); err != nil {
+			return snapshots.LayerPreparation{}, fmt.Errorf("invalid dm-verity referrer digest: %w", err)
+		}
+		preparation.Key, err = DmveritySnapshotKey(chainID, parent, expectedRootHash, expectedSignatureDigest)
+		if err != nil {
+			return snapshots.LayerPreparation{}, err
+		}
+		// Retire the chain with its referrer, not the shared image config.
+		preparation.GCContent = target.Referrer
 		preparation.GCQualifier = "dmverity-" + digest.FromString(preparation.Key).Encoded()
 	}
 	return preparation, nil
@@ -166,43 +175,40 @@ func fetchSignatures(
 		return nil, false, fmt.Errorf("fetch dm-verity referrers for %s: %w", subject.Digest, err)
 	}
 	var selected ocispec.Descriptor
-	var selectedCreated time.Time
+	var selectedCreatedTime time.Time
 	found := false
-	conflicting := false
 	for _, referrer := range referrers {
 		if referrer.ArtifactType != signatureArtifactType {
 			continue
 		}
-		var created time.Time
+		var createdTime time.Time
 		if value := referrer.Annotations[ocispec.AnnotationCreated]; value != "" {
 			parsed, err := time.Parse(time.RFC3339Nano, value)
 			if err != nil {
 				log.G(ctx).WithField("bundle", referrer.Digest).WithError(err).
 					Warn("Ignoring invalid dm-verity referrer creation time")
 			} else {
-				created = parsed
+				createdTime = parsed
 			}
 		}
-		if found && created.Equal(selectedCreated) && referrer.Digest == selected.Digest {
-			conflicting = conflicting || referrer.MediaType != selected.MediaType || referrer.Size != selected.Size
-			continue
-		}
 		// Registry order is unspecified. Break equal or missing timestamp ties by digest.
-		if found && (created.Before(selectedCreated) ||
-			created.Equal(selectedCreated) && referrer.Digest >= selected.Digest) {
+		if found && (createdTime.Before(selectedCreatedTime) ||
+			createdTime.Equal(selectedCreatedTime) && referrer.Digest >= selected.Digest) {
 			continue
 		}
 		selected = referrer
-		selectedCreated = created
+		selectedCreatedTime = createdTime
 		found = true
-		conflicting = false
 	}
 	if !found {
 		return nil, true, nil
 	}
-	if conflicting {
-		return nil, true, malformedDmverityReferrerError{
-			fmt.Errorf("conflicting dm-verity referrer descriptors for %s", selected.Digest),
+	for _, referrer := range referrers {
+		if referrer.ArtifactType == signatureArtifactType && referrer.Digest == selected.Digest &&
+			(referrer.MediaType != selected.MediaType || referrer.Size != selected.Size) {
+			return nil, true, malformedDmverityReferrerError{
+				fmt.Errorf("conflicting dm-verity referrer descriptors for %s", selected.Digest),
+			}
 		}
 	}
 	if err := selected.Digest.Validate(); err != nil {
@@ -303,7 +309,7 @@ func readDmverityBundleManifest(
 
 		info := infoMap[sourceDigest]
 		if info == nil {
-			info = &DmverityTarget{}
+			info = &DmverityTarget{Referrer: referrer.Digest}
 			infoMap[sourceDigest] = info
 		}
 		switch layer.MediaType {

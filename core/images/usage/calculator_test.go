@@ -111,32 +111,54 @@ func (s *qualifiedReferenceSnapshotter) Usage(_ context.Context, key string) (sn
 }
 
 func TestUsageCalculationUsesQualifiedSnapshotReference(t *testing.T) {
-	ctx := context.Background()
-	cs := imagetest.NewContentStore(ctx, t)
-	target := imagetest.SimpleManifest(50)(cs)
-	key := "dmverity-0123456789"
-	_, err := cs.Store.Update(ctx, content.Info{
-		Digest: target.Children[0].Descriptor.Digest,
-		Labels: map[string]string{
-			"containerd.io/gc.ref.snapshot.erofs/dmverity": key,
-		},
-	}, "labels.containerd.io/gc.ref.snapshot.erofs/dmverity")
-	if err != nil {
-		t.Fatal(err)
-	}
+	for _, owner := range []string{"config", "referrer"} {
+		t.Run(owner, func(t *testing.T) {
+			ctx := context.Background()
+			cs := imagetest.NewContentStore(ctx, t)
+			target := imagetest.SimpleManifest(50)(cs)
+			key := "dmverity-0123456789"
+			ownerDigest := target.Children[0].Descriptor.Digest
+			if owner == "referrer" {
+				referrer := cs.JSONObject(ocispec.MediaTypeImageManifest, ocispec.Manifest{
+					MediaType: ocispec.MediaTypeImageManifest,
+					Config:    ocispec.DescriptorEmptyJSON, Subject: &target.Descriptor,
+				})
+				ownerDigest = referrer.Descriptor.Digest
+				_, err := cs.Store.Update(ctx, content.Info{
+					Digest: target.Descriptor.Digest,
+					Labels: map[string]string{"containerd.io/gc.ref.content.dmverity": ownerDigest.String()},
+				}, "labels.containerd.io/gc.ref.content.dmverity")
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			_, err := cs.Store.Update(ctx, content.Info{
+				Digest: ownerDigest,
+				Labels: map[string]string{
+					"containerd.io/gc.ref.snapshot.erofs/dmverity": key,
+				},
+			}, "labels.containerd.io/gc.ref.snapshot.erofs/dmverity")
+			if err != nil {
+				t.Fatal(err)
+			}
 
-	snapshotter := &qualifiedReferenceSnapshotter{}
-	img := images.Image{Name: "qualified", Target: target.Descriptor}
-	_, err = CalculateImageUsage(ctx, img, cs, WithSnapshotters(func(name string) snapshots.Snapshotter {
-		if name != "erofs" {
-			t.Errorf("snapshotter lookup received %q, want erofs", name)
-		}
-		return snapshotter
-	}))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if snapshotter.key != key {
-		t.Fatalf("snapshot usage used key %q, want %q", snapshotter.key, key)
+			snapshotter := &qualifiedReferenceSnapshotter{}
+			img := images.Image{Name: "qualified", Target: target.Descriptor}
+			size, err := CalculateImageUsage(ctx, img, cs, WithSnapshotters(func(name string) snapshots.Snapshotter {
+				if name != "erofs" {
+					t.Errorf("snapshotter lookup received %q, want erofs", name)
+				}
+				return snapshotter
+			}))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if snapshotter.key != key {
+				t.Fatalf("snapshot usage used key %q, want %q", snapshotter.key, key)
+			}
+			if expected := imagetest.SizeOfContent(target) + 10; size != expected {
+				t.Fatalf("unexpected usage: %d, expected %d", size, expected)
+			}
+		})
 	}
 }

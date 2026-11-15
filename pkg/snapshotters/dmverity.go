@@ -82,9 +82,8 @@ const (
 	dmverityReferrerSignatureDigestLabel = "containerd.io/snapshot/erofs.dmverity.signature-digest"
 )
 
-// DmveritySnapshotKey binds a signed layer to its root and selected parent.
-// Signature replacement for the same root preserves the existing materialization.
-func DmveritySnapshotKey(chainID, parent, rootHash string) (string, error) {
+// DmveritySnapshotKey binds a signed layer to its root, signature and selected parent.
+func DmveritySnapshotKey(chainID, parent, rootHash, signatureDigest string) (string, error) {
 	chainDigest, err := digest.Parse(chainID)
 	if err != nil {
 		return "", fmt.Errorf("parse OCI ChainID %q: %w", chainID, err)
@@ -92,13 +91,19 @@ func DmveritySnapshotKey(chainID, parent, rootHash string) (string, error) {
 	if err := validateRootHash(rootHash); err != nil {
 		return "", err
 	}
-	key := digest.FromString("erofs-dmverity-v2\n" + parent + "\n" + chainDigest.String() + "\n" + strings.ToLower(rootHash))
-	return key.String() + "-dmverity-v2", nil
+	signature, err := digest.Parse(signatureDigest)
+	if err != nil {
+		return "", fmt.Errorf("parse dm-verity signature digest %q: %w", signatureDigest, err)
+	}
+	key := digest.FromString("erofs-dmverity-v3\n" + parent + "\n" + chainDigest.String() + "\n" +
+		strings.ToLower(rootHash) + "\n" + signature.String())
+	return key.String() + "-dmverity-v3", nil
 }
 
 // DmverityTarget is the trusted layer annotation. Payload descriptors are
 // resolved from the selected referrer in the local content store.
 type DmverityTarget struct {
+	Referrer  digest.Digest      `json:"referrer,omitempty"`
 	RootHash  string             `json:"rootHash"`
 	Metadata  ocispec.Descriptor `json:"metadata"`
 	Tree      ocispec.Descriptor `json:"tree"`
@@ -123,6 +128,7 @@ func ParseDmverityTarget(value string) (DmverityTarget, error) {
 func targetAnnotation(info *DmverityTarget) (string, error) {
 	// Carry only the fields needed to identify and read the selected payloads.
 	target := DmverityTarget{
+		Referrer:  info.Referrer,
 		RootHash:  info.RootHash,
 		Metadata:  compactDescriptor(info.Metadata),
 		Tree:      compactDescriptor(info.Tree),
@@ -195,15 +201,15 @@ func GetDmveritySnapshotIdentity(labels map[string]string) (rootHash, signatureD
 
 // ValidateDmveritySnapshot rejects a snapshot that lacks the selected signed identity.
 func ValidateDmveritySnapshot(existing, expected map[string]string) error {
-	expectedRootHash, _, expectedSigned, err := GetDmveritySnapshotIdentity(expected)
+	expectedRootHash, expectedSignatureDigest, expectedSigned, err := GetDmveritySnapshotIdentity(expected)
 	if err != nil {
 		return fmt.Errorf("invalid expected dm-verity snapshot identity: %w", err)
 	}
-	return validateDmveritySnapshot(existing, expectedRootHash, expectedSigned)
+	return validateDmveritySnapshot(existing, expectedRootHash, expectedSignatureDigest, expectedSigned)
 }
 
-func validateDmveritySnapshot(existing map[string]string, expectedRootHash string, expectedSigned bool) error {
-	existingRootHash, _, existingSigned, err := GetDmveritySnapshotIdentity(existing)
+func validateDmveritySnapshot(existing map[string]string, expectedRootHash, expectedSignatureDigest string, expectedSigned bool) error {
+	existingRootHash, existingSignatureDigest, existingSigned, err := GetDmveritySnapshotIdentity(existing)
 	if err != nil {
 		return fmt.Errorf("invalid existing dm-verity snapshot identity: %w", err)
 	}
@@ -217,6 +223,8 @@ func validateDmveritySnapshot(existing map[string]string, expectedRootHash strin
 	if !strings.EqualFold(existingRootHash, expectedRootHash) {
 		return fmt.Errorf("existing snapshot has a different signed dm-verity root hash; remove the affected snapshot and descendants or reimage before retrying")
 	}
-	// Reuse keeps the existing signature label and mounted materialization unchanged.
+	if existingSignatureDigest != expectedSignatureDigest {
+		return fmt.Errorf("existing snapshot has a different signed dm-verity signature digest; remove the affected snapshot and descendants or reimage before retrying")
+	}
 	return nil
 }

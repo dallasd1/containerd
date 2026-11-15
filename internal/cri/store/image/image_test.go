@@ -30,33 +30,59 @@ import (
 	"github.com/containerd/platforms"
 
 	"github.com/opencontainers/go-digest/digestset"
+	imagespec "github.com/opencontainers/image-spec/specs-go/v1"
 	assertlib "github.com/stretchr/testify/assert"
 	"k8s.io/apimachinery/pkg/util/sets"
 )
 
 func TestImageSnapshottersNormalizeQualifiedReferences(t *testing.T) {
-	ctx := context.Background()
-	cs := imagetest.NewContentStore(ctx, t)
-	target := imagetest.SimpleManifest(50)(cs)
-	_, err := cs.Store.Update(ctx, content.Info{
-		Digest: target.Children[0].Descriptor.Digest,
-		Labels: map[string]string{
-			"containerd.io/gc.ref.snapshot.erofs/dmverity": "dmverity-key",
-		},
-	}, "labels.containerd.io/gc.ref.snapshot.erofs/dmverity")
-	if err != nil {
-		t.Fatal(err)
-	}
-	store := NewStore(nil, cs.Store, platforms.Default())
-	img, err := store.getImage(ctx, images.Image{Name: "signed", Target: target.Descriptor})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, ok := img.Snapshotters["erofs"]; !ok {
-		t.Fatalf("qualified snapshot reference did not resolve to erofs: %#v", img.Snapshotters)
-	}
-	if _, ok := img.Snapshotters["erofs/dmverity"]; ok {
-		t.Fatalf("GC lane qualifier was reported as a separate snapshotter: %#v", img.Snapshotters)
+	for _, owner := range []string{"config", "referrer", "index-referrer"} {
+		t.Run(owner, func(t *testing.T) {
+			ctx := context.Background()
+			cs := imagetest.NewContentStore(ctx, t)
+			target := imagetest.SimpleManifest(50)(cs)
+			ownerDigest := target.Children[0].Descriptor.Digest
+			if owner != "config" {
+				referrer := cs.JSONObject(imagespec.MediaTypeImageManifest, imagespec.Manifest{
+					MediaType: imagespec.MediaTypeImageManifest,
+					Config:    imagespec.DescriptorEmptyJSON, Subject: &target.Descriptor,
+				})
+				ownerDigest = referrer.Descriptor.Digest
+				_, err := cs.Store.Update(ctx, content.Info{
+					Digest: target.Descriptor.Digest,
+					Labels: map[string]string{"containerd.io/gc.ref.content.dmverity": ownerDigest.String()},
+				}, "labels.containerd.io/gc.ref.content.dmverity")
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			_, err := cs.Store.Update(ctx, content.Info{
+				Digest: ownerDigest,
+				Labels: map[string]string{
+					"containerd.io/gc.ref.snapshot.erofs/dmverity": "dmverity-key",
+				},
+			}, "labels.containerd.io/gc.ref.snapshot.erofs/dmverity")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if owner == "index-referrer" {
+				target = cs.Index(
+					imagetest.AddPlatform(imagetest.SimpleManifest(51)(cs), imagespec.Platform{OS: "linux", Architecture: "arm64"}),
+					imagetest.AddPlatform(target, platforms.DefaultSpec()),
+				)
+			}
+			store := NewStore(nil, cs.Store, platforms.Default())
+			img, err := store.getImage(ctx, images.Image{Name: "signed", Target: target.Descriptor})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, ok := img.Snapshotters["erofs"]; !ok {
+				t.Fatalf("qualified snapshot reference did not resolve to erofs: %#v", img.Snapshotters)
+			}
+			if _, ok := img.Snapshotters["erofs/dmverity"]; ok {
+				t.Fatalf("GC lane qualifier was reported as a separate snapshotter: %#v", img.Snapshotters)
+			}
+		})
 	}
 }
 

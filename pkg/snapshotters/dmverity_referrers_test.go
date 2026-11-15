@@ -92,6 +92,7 @@ func TestSanitizedDmverityLayerPreparation(t *testing.T) {
 	require.NoError(t, unsigned.ValidateExisting(snapshots.Info{}))
 
 	target := &DmverityTarget{
+		Referrer:  digest.FromString("referrer"),
 		RootHash:  digest.FromString("trusted-root").Encoded(),
 		Metadata:  ocispec.Descriptor{Digest: digest.FromString("metadata")},
 		Tree:      ocispec.Descriptor{Digest: digest.FromString("tree")},
@@ -191,7 +192,7 @@ func TestDmverityImageSnapshotKeyUsesRetainedSelection(t *testing.T) {
 			key, err := DmverityImageSnapshotKey(ctx, store.Store, index.Descriptor, platforms.Default())
 			if mode == "selected platform" || mode == "non-layer artifacts" {
 				require.NoError(t, err)
-				expected, err := DmveritySnapshotKey(diffID.String(), "", root)
+				expected, err := DmveritySnapshotKey(diffID.String(), "", root, digest.FromString("selected-sig").String())
 				require.NoError(t, err)
 				require.Equal(t, expected, key)
 			} else {
@@ -466,6 +467,43 @@ func TestFetchSignaturesDeduplicatesSameReferrerDigest(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestFetchSignaturesRejectsSelectedDigestConflictsAcrossTimestamps(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		mutate func(*ocispec.Descriptor)
+	}{
+		{"media type", func(d *ocispec.Descriptor) { d.MediaType = ocispec.MediaTypeImageIndex }},
+		{"size", func(d *ocispec.Descriptor) { d.Size++ }},
+	} {
+		for _, order := range []string{"older first", "newer first"} {
+			t.Run(tc.name+"/"+order, func(t *testing.T) {
+				ctx := t.Context()
+				store := imagetest.NewContentStore(ctx, t)
+				subject := store.Blob(ocispec.MediaTypeImageManifest, []byte("{}")).Descriptor
+				layerDigest := digest.FromString("image layer")
+				newer := addTestDmverityReferrer(t, store, subject, layerDigest, "selected")
+				newer.Annotations = map[string]string{ocispec.AnnotationCreated: "2026-11-13T12:00:00Z"}
+				older := newer
+				older.Annotations = map[string]string{ocispec.AnnotationCreated: "2026-11-12T12:00:00Z"}
+				tc.mutate(&older)
+				refs := []ocispec.Descriptor{older, newer}
+				if order == "newer first" {
+					refs = []ocispec.Descriptor{newer, older}
+				}
+				fetcher := referrerTestFetcher{referrers: refs}
+				bundle, discovered, err := fetchSignatures(ctx, fetcher,
+					store.Store, subject, map[string]struct{}{layerDigest.String(): {}})
+				require.ErrorContains(t, err, "conflicting dm-verity referrer descriptors")
+				var malformed malformedDmverityReferrerError
+				require.ErrorAs(t, err, &malformed)
+				require.True(t, discovered)
+				require.Nil(t, bundle)
+				assertUnsignedReferrerFallback(t, store, subject, layerDigest, fetcher)
+			})
+		}
 	}
 }
 
@@ -975,6 +1013,7 @@ func TestConflictingReferrerPreservesCachedSignedIdentity(t *testing.T) {
 	preparation, err := PrepareDmverityLayer(ctx, cached[0], digest.FromString("chain").String(), "")
 	require.NoError(t, err)
 	require.NoError(t, preparation.ValidateExisting(snapshots.Info{Labels: committed}))
+	originalKey := preparation.Key
 
 	replacement := addTestDmverityReferrerWithRoot(t, store, subject, layer.Digest, "new-signature", digest.FromString("root-first").Encoded())
 	_, err = pull(replacement)
@@ -989,7 +1028,9 @@ func TestConflictingReferrerPreservesCachedSignedIdentity(t *testing.T) {
 	require.NotEqual(t, committed[dmverityReferrerSignatureDigestLabel], replacedLabels[dmverityReferrerSignatureDigestLabel])
 	preparation, err = PrepareDmverityLayer(ctx, cached[0], digest.FromString("chain").String(), "")
 	require.NoError(t, err)
-	require.NoError(t, preparation.ValidateExisting(snapshots.Info{Labels: committed}))
+	require.NotEqual(t, originalKey, preparation.Key)
+	require.ErrorContains(t, preparation.ValidateExisting(snapshots.Info{Labels: committed}), "different signed dm-verity signature digest")
+	require.NoError(t, preparation.ValidateExisting(snapshots.Info{Labels: replacedLabels}))
 
 	target, err := ParseDmverityTarget(cached[0].Annotations[TargetLayerDmverityLabel])
 	require.NoError(t, err)
