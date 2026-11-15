@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"os"
 	"runtime"
+	"slices"
 	"strings"
 
 	"github.com/containerd/containerd/v2/core/mount"
@@ -266,11 +267,5 @@ func hasRootHashSignatureOption(table string) bool {
 	}
 
 	// Skip the kernel-generated count and search the optional arguments.
-	optionalArgs := fields[requiredParamsCount+1:]
-	for _, opt := range optionalArgs {
-		if opt == "root_hash_sig_key_desc" {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(fields[requiredParamsCount+1:], "root_hash_sig_key_desc")
 }

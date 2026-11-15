@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -1265,12 +1266,8 @@ func (c *criService) dmverityContainerImage(ctx context.Context, image imagestor
 	isID := func(ref string) bool {
 		// LocalResolve tries named references before abbreviated IDs.
 		if ref != image.ID {
-			if normalized, err := docker.ParseDockerRef(ref); err == nil {
-				for _, alias := range image.References {
-					if normalized.String() == alias {
-						return false
-					}
-				}
+			if normalized, err := docker.ParseDockerRef(ref); err == nil && slices.Contains(image.References, normalized.String()) {
+				return false
 			}
 		}
 		return ref != "" && (strings.HasPrefix(image.ID, ref) ||

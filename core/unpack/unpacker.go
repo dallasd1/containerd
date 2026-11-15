@@ -23,6 +23,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"slices"
 	"strconv"
 	"strings"
@@ -360,7 +361,6 @@ func (u *Unpacker) Unpack(h images.Handler) images.Handler {
 				})
 			}
 			for _, layers := range toFetch {
-				layers := layers
 				u.eg.Go(func() error {
 					return u.fetch(u.ctx, h, layers, nil)
 				})
@@ -578,9 +578,7 @@ func (u *Unpacker) unpack(
 		if i > 0 {
 			snapshotLabels[labelSnapshotParent] = preparations[i-1].Key
 		}
-		for key, value := range prepared.Labels {
-			snapshotLabels[key] = value
-		}
+		maps.Copy(snapshotLabels, prepared.Labels)
 		validateExistingSnapshot := prepared.ValidateExisting
 
 		var (

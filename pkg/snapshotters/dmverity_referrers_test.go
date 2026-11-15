@@ -652,14 +652,25 @@ func TestMalformedReferrerRetryUsesRepairedBundle(t *testing.T) {
 }
 
 func TestMalformedLatestReferrerPreservesRetainedSelection(t *testing.T) {
-	for _, state := range []string{"valid cache", "missing cached payload", "missing cached bundle", "invalid cached selection"} {
-		t.Run(state, func(t *testing.T) {
+	for _, test := range []struct {
+		state   string
+		payload int
+	}{
+		{"valid cache", -1},
+		{"missing cached payload", -1},
+		{"missing cached bundle", -1},
+		{"invalid cached selection", -1},
+		{"metadata size", 0},
+		{"tree size", 1},
+		{"signature size", 2},
+	} {
+		t.Run(test.state, func(t *testing.T) {
 			ctx := t.Context()
 			store := imagetest.NewContentStore(ctx, t)
 			config := store.JSONObject(ocispec.MediaTypeImageConfig, ocispec.Image{})
 			layer := store.Blob(ocispec.MediaTypeImageLayer, []byte("layer"))
 			subject := store.Manifest(config, layer).Descriptor
-			base := images.ChildrenHandler(store.Store)
+			base := images.Handlers(remotes.FetchHandler(store.Store, referrerTestFetcher{}), images.ChildrenHandler(store.Store))
 			older := addTestDmverityReferrer(t, store, subject, layer.Descriptor.Digest, "older")
 			older.Annotations = map[string]string{ocispec.AnnotationCreated: "2026-11-12T12:00:00Z"}
 			children, err := AppendSignatureHandlerWrapper(
@@ -670,7 +681,7 @@ func TestMalformedLatestReferrerPreservesRetainedSelection(t *testing.T) {
 			require.NoError(t, err)
 
 			var wantErr string
-			switch state {
+			switch test.state {
 			case "missing cached payload":
 				require.NoError(t, store.Delete(ctx, target.Tree.Digest))
 				wantErr = "read retained dm-verity payload"
@@ -690,6 +701,14 @@ func TestMalformedLatestReferrerPreservesRetainedSelection(t *testing.T) {
 			beforeLabels := maps.Clone(before.Labels)
 
 			malformed := store.Blob(ocispec.MediaTypeImageManifest, []byte("{")).Descriptor
+			if test.payload >= 0 {
+				data, err := content.ReadBlob(ctx, store.Store, older)
+				require.NoError(t, err)
+				var bundle ocispec.Manifest
+				require.NoError(t, json.Unmarshal(data, &bundle))
+				bundle.Layers[test.payload].Size++
+				malformed = store.JSONObject(ocispec.MediaTypeImageManifest, bundle).Descriptor
+			}
 			malformed.ArtifactType = signatureArtifactType
 			malformed.Annotations = map[string]string{ocispec.AnnotationCreated: "2026-11-13T12:00:00Z"}
 			retained, err := AppendSignatureHandlerWrapper(
@@ -708,6 +727,16 @@ func TestMalformedLatestReferrerPreservesRetainedSelection(t *testing.T) {
 			after, err := store.Info(ctx, subject.Digest)
 			require.NoError(t, err)
 			require.Equal(t, beforeLabels, after.Labels)
+			if wantErr == "" {
+				replacement := addTestDmverityReferrerWithRoot(t, store, subject, layer.Descriptor.Digest, "replacement", target.RootHash)
+				_, err := AppendSignatureHandlerWrapper(
+					referrerTestFetcher{referrers: []ocispec.Descriptor{replacement}}, store.Store,
+				)(base).Handle(ctx, subject)
+				require.NoError(t, err, "a malformed candidate must not prevent a later valid replacement")
+				after, err = store.Info(ctx, subject.Digest)
+				require.NoError(t, err)
+				require.Equal(t, replacement.Digest.String(), after.Labels[dmverityBundleContentLabel])
+			}
 		})
 	}
 }

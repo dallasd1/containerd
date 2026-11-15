@@ -407,11 +407,16 @@ func (h *dmverityHandler) Handle(
 	requireSigned := false
 	if h.fetcher != nil {
 		selected, discovered, err := fetchSignatures(ctx, h.fetcher, h.store, desc, imageLayers)
+		if err == nil && selected != nil {
+			// Retain the payloads before exposing their descriptors to unpack.
+			err = persistSignatureReferrer(ctx, h.handler, h.store, selected)
+		}
 		if err != nil {
 			var malformed malformedDmverityReferrerError
 			if !errors.As(err, &malformed) {
 				return nil, err
 			}
+			selected = nil
 			log.G(ctx).WithField("manifest", desc.Digest).WithError(err).
 				Warn("Ignoring malformed latest dm-verity referrer; checking retained selection")
 		} else if discovered && selected == nil {
@@ -425,10 +430,6 @@ func (h *dmverityHandler) Handle(
 			requireSigned = true
 		}
 		if selected != nil {
-			// Retain the payloads before exposing their descriptors to unpack.
-			if err := persistSignatureReferrer(ctx, h.handler, h.store, selected); err != nil {
-				return nil, err
-			}
 			_, err := recordDmverityObservation(ctx, h.store, desc.Digest, selected.desc.Digest, imageLayers)
 			if err != nil {
 				return nil, fmt.Errorf("record dm-verity referrer for %s: %w", desc.Digest, err)
@@ -569,11 +570,18 @@ func loadRetainedDmverityBundle(
 	if err != nil {
 		return nil, true, fmt.Errorf("read retained signed dm-verity bundle for manifest %s: %w", subject.Digest, err)
 	}
+	if err := validateDmverityPayloads(ctx, store, targets); err != nil {
+		return nil, true, err
+	}
+	return targets, true, nil
+}
+
+func validateDmverityPayloads(ctx context.Context, store content.Store, targets map[string]*DmverityTarget) error {
 	for layerDigest, target := range targets {
 		for _, payload := range []ocispec.Descriptor{target.Metadata, target.Tree, target.Signature} {
 			payloadInfo, err := store.Info(ctx, payload.Digest)
 			if err != nil {
-				return nil, true, fmt.Errorf(
+				return fmt.Errorf(
 					"read retained dm-verity payload %s for layer %s: %w",
 					payload.Digest,
 					layerDigest,
@@ -581,17 +589,17 @@ func loadRetainedDmverityBundle(
 				)
 			}
 			if payloadInfo.Size != payload.Size {
-				return nil, true, fmt.Errorf(
+				return malformedDmverityReferrerError{fmt.Errorf(
 					"retained dm-verity payload %s for layer %s has size %d, expected %d",
 					payload.Digest,
 					layerDigest,
 					payloadInfo.Size,
 					payload.Size,
-				)
+				)}
 			}
 		}
 	}
-	return targets, true, nil
+	return nil
 }
 
 // DmverityManifestHasSignedReferrer reports whether discovery retained a
@@ -693,6 +701,9 @@ func persistSignatureReferrer(
 			}
 			children = append(children, child)
 		}
+	}
+	if err := validateDmverityPayloads(ctx, store, referrer.layers); err != nil {
+		return err
 	}
 
 	// Keep the selected payloads reachable while the referrer is retained.
