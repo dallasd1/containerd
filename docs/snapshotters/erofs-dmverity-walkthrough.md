@@ -262,6 +262,10 @@ Legacy config edges can retain old chains until their owning config itself becom
 
 - Plain OCI/overlayfs behavior remains ordinary; the preparation hook is optional.
   Plain and signed EROFS lanes coexist without replacing one another.
+- Concurrent shared-layer starts can still hit the
+  [mapper activation limitation](erofs.md#known-limitation-concurrent-mapper-activation)
+  seen in both signed and native unsigned dm-verity paths. Kubelet retry recovery
+  is not proof of first-attempt success or a complete concurrency fix.
 - Discovery is optional, not "reject every unsigned image": unsupported referrer
   discovery or an unsigned/unobserved image can use the plain path. A malformed
   latest candidate is ignored in favor of a usable retained selection, if any;
