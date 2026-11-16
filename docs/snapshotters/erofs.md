@@ -280,6 +280,41 @@ automatically reads all parameters from the superblock, ensuring that any corrup
 or tampering will be detected at read time. The dm-verity device is then mounted as
 the backing layer in the OverlayFS stack
 
+#### Known limitation: concurrent mapper activation
+
+Concurrent starts, restarts, or replacements of containers sharing EROFS layers
+can encounter dm-verity mapper activation failures. These have been observed in
+both the native unsigned dm-verity path and the signed-referrer path. An `EBUSY`
+error is not specific to IPE and does not by itself indicate a signature rejection.
+Typical errors include:
+
+```text
+dm create 'containerd-erofs-<snapshot-id>': device or resource busy
+dm create 'containerd-erofs-signed-<snapshot-id>-<verity-identity>': device or resource busy
+```
+
+The cleanup-ownership fix in the
+[vendored activation helper](../../vendor/github.com/containerd/go-dmverity/pkg/verity/verity.go)
+arms failed-activation cleanup only after device creation succeeds. This prevents
+a failed duplicate create from removing another activation's mapper, but it is
+not a complete mapper-concurrency fix. The remaining activation symptoms are
+still under investigation; an `EBUSY` report alone does not establish a specific
+activation, reuse, or teardown race.
+
+Kubelet retries can recover and bring affected pods to Ready, but recovery is a
+mitigation, not proof that the runtime issue is fixed. A Ready pod or zero
+container restarts does not establish first-attempt success. Stress validation
+should retain the failed startup attempts and recovery times, use a bounded
+readiness deadline, and verify workload health after recovery. Repeated starts
+and stop/delete/recreate cycles of containers sharing image layers exercise this
+limitation.
+
+Do not classify `existing dm-verity device ... verification failed`,
+`no such device or address` (`ENXIO`), signature/key rejection, or integrity
+failures as retryable `EBUSY`. These require separate investigation; temporal
+proximity to an `EBUSY` does not prove a shared cause. Deadline exhaustion remains
+a failure, and recovery must not bypass root-hash or signature verification.
+
 ## How It Works
 
 For each layer, the EROFS snapshotter prepares a directory containing the
