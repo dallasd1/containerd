@@ -177,11 +177,10 @@ func TestValidateDmveritySnapshotIdentity(t *testing.T) {
 
 		if label == dmverityReferrerRootHashLabel {
 			existing[label] = digest.FromString("different root").Encoded()
-			require.Error(t, ValidateDmveritySnapshot(existing, expected))
 		} else {
 			existing[label] = digest.FromString("different signature").String()
-			require.NoError(t, ValidateDmveritySnapshot(existing, expected))
 		}
+		require.Error(t, ValidateDmveritySnapshot(existing, expected))
 		delete(existing, label)
 		require.Error(t, ValidateDmveritySnapshot(existing, expected))
 	}
@@ -195,21 +194,28 @@ func TestValidateDmveritySnapshotIdentity(t *testing.T) {
 func TestDmveritySnapshotKey(t *testing.T) {
 	chainID := digest.FromString("chain").String()
 	root := digest.FromString("root").Encoded()
-	key, err := DmveritySnapshotKey(chainID, "", root)
+	signature := digest.FromString("signature").String()
+	key, err := DmveritySnapshotKey(chainID, "", root, signature)
 	require.NoError(t, err)
 	require.NotEqual(t, chainID+"-dmverity", key)
-	parentKey, err := DmveritySnapshotKey(chainID, key, root)
+	parentKey, err := DmveritySnapshotKey(chainID, key, root, signature)
 	require.NoError(t, err)
 	require.NotEqual(t, key, parentKey)
-	uppercaseKey, err := DmveritySnapshotKey(chainID, "", strings.ToUpper(root))
+	replacementKey, err := DmveritySnapshotKey(chainID, "", root, digest.FromString("replacement signature").String())
+	require.NoError(t, err)
+	require.NotEqual(t, key, replacementKey)
+	uppercaseKey, err := DmveritySnapshotKey(chainID, "", strings.ToUpper(root), signature)
 	require.NoError(t, err)
 	require.Equal(t, key, uppercaseKey)
-	_, err = DmveritySnapshotKey(chainID, "", "bad-root")
+	_, err = DmveritySnapshotKey(chainID, "", "bad-root", signature)
 	require.ErrorContains(t, err, "root hash")
 
 	for _, invalid := range []string{"", "not-a-digest", "sha256:bad", key} {
-		got, err := DmveritySnapshotKey(invalid, "", root)
+		got, err := DmveritySnapshotKey(invalid, "", root, signature)
 		require.ErrorContains(t, err, "parse OCI ChainID")
+		require.Empty(t, got)
+		got, err = DmveritySnapshotKey(chainID, "", root, invalid)
+		require.ErrorContains(t, err, "signature digest")
 		require.Empty(t, got)
 	}
 }
@@ -230,6 +236,7 @@ func TestPrepareDmverityLayerSelectsSignedRepresentation(t *testing.T) {
 	require.ErrorContains(t, err, "parse dm-verity target")
 
 	target := &DmverityTarget{
+		Referrer:  digest.FromString("referrer"),
 		RootHash:  digest.FromString("root").Encoded(),
 		Metadata:  imagespec.Descriptor{Digest: digest.FromString("metadata")},
 		Tree:      imagespec.Descriptor{Digest: digest.FromString("tree")},
@@ -241,9 +248,10 @@ func TestPrepareDmverityLayerSelectsSignedRepresentation(t *testing.T) {
 	require.NoError(t, err)
 	require.NotEqual(t, chainID, signed.Key)
 	require.NotEmpty(t, signed.GCQualifier)
-	expectedKey, err := DmveritySnapshotKey(chainID, "", target.RootHash)
+	expectedKey, err := DmveritySnapshotKey(chainID, "", target.RootHash, target.Signature.Digest.String())
 	require.NoError(t, err)
 	require.Equal(t, expectedKey, signed.Key)
+	require.Equal(t, target.Referrer, signed.GCContent)
 	require.Equal(t, map[string]string{
 		dmverityReferrerRootHashLabel:        target.RootHash,
 		dmverityReferrerSignatureDigestLabel: target.Signature.Digest.String(),
@@ -258,9 +266,11 @@ func TestPrepareDmverityLayerSelectsSignedRepresentation(t *testing.T) {
 	require.NoError(t, err)
 	replacedSignature, err := PrepareDmverityLayer(t.Context(), desc, chainID, "")
 	require.NoError(t, err)
-	require.Equal(t, signed.Key, replacedSignature.Key)
+	require.NotEqual(t, signed.Key, replacedSignature.Key)
+	require.NotEqual(t, signed.GCQualifier, replacedSignature.GCQualifier)
 	require.Equal(t, target.Signature.Digest.String(), replacedSignature.Labels[dmverityReferrerSignatureDigestLabel])
-	require.NoError(t, replacedSignature.ValidateExisting(snapshots.Info{Labels: signed.Labels}))
+	require.ErrorContains(t, replacedSignature.ValidateExisting(snapshots.Info{Labels: signed.Labels}), "different signed dm-verity signature digest")
+	require.NoError(t, replacedSignature.ValidateExisting(snapshots.Info{Labels: replacedSignature.Labels}))
 
 	target.RootHash = digest.FromString("different root").Encoded()
 	desc.Annotations[TargetLayerDmverityLabel], err = targetAnnotation(target)
@@ -277,4 +287,10 @@ func TestPrepareDmverityLayerSelectsSignedRepresentation(t *testing.T) {
 	require.NotEqual(t, replacedRoot.Key, withParent.Key)
 	require.ErrorContains(t, withParent.ValidateExisting(snapshots.Info{Labels: withParent.Labels}), "parent")
 	require.NoError(t, withParent.ValidateExisting(snapshots.Info{Parent: signed.Key, Labels: withParent.Labels}))
+
+	target.Referrer = ""
+	desc.Annotations[TargetLayerDmverityLabel], err = targetAnnotation(target)
+	require.NoError(t, err)
+	_, err = PrepareDmverityLayer(t.Context(), desc, chainID, "")
+	require.ErrorContains(t, err, "invalid dm-verity referrer digest")
 }

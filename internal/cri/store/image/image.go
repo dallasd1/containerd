@@ -57,6 +57,8 @@ type Image struct {
 	Pinned bool
 	// Snapshotters is a map whose keys are snapshotters for which this image has a snapshot.
 	Snapshotters map[string]struct{}
+	// referrerSnapshotters is the per-reference contribution merged when caching the image.
+	referrerSnapshotters map[string]struct{}
 }
 
 // Getter is used to get images but does not make changes
@@ -134,7 +136,7 @@ func (s *Store) update(ref string, img *Image) error {
 	}
 	if oldExist {
 		if oldID == img.ID {
-			if err := s.store.refreshSnapshotters(img.ID, img.Snapshotters); err != nil {
+			if err := s.store.refreshSnapshotters(ref, *img); err != nil {
 				return err
 			}
 			if s.store.isPinned(img.ID, ref) == img.Pinned {
@@ -183,15 +185,43 @@ func (s *Store) getImage(ctx context.Context, i images.Image) (*Image, error) {
 	}
 
 	snapshotters := make(map[string]struct{})
-	for label := range info.Labels {
-		const prefix = "containerd.io/gc.ref.snapshot."
-		if strings.HasPrefix(label, prefix) {
-			snapshotter := label[len(prefix):]
-			if separator := strings.IndexByte(snapshotter, '/'); separator >= 0 {
-				snapshotter = snapshotter[:separator]
+	addSnapshotters := func(snapshotters map[string]struct{}, info content.Info) {
+		for label := range info.Labels {
+			const prefix = "containerd.io/gc.ref.snapshot."
+			if strings.HasPrefix(label, prefix) {
+				snapshotter := label[len(prefix):]
+				if separator := strings.IndexByte(snapshotter, '/'); separator >= 0 {
+					snapshotter = snapshotter[:separator]
+				}
+				snapshotters[snapshotter] = struct{}{}
 			}
-			snapshotters[snapshotter] = struct{}{}
 		}
+	}
+	addSnapshotters(snapshotters, info)
+	referrerSnapshotters := make(map[string]struct{})
+	children := images.LimitManifests(images.FilterPlatforms(images.ChildrenHandler(s.provider), s.platform), s.platform, 1)
+	err = images.Walk(ctx, images.HandlerFunc(func(ctx context.Context, desc imagespec.Descriptor) ([]imagespec.Descriptor, error) {
+		if images.IsIndexType(desc.MediaType) {
+			return children(ctx, desc)
+		}
+		if !images.IsManifestType(desc.MediaType) {
+			return nil, nil
+		}
+		info, err := s.provider.Info(ctx, desc.Digest)
+		if err != nil {
+			return nil, err
+		}
+		if referrer := info.Labels["containerd.io/gc.ref.content.dmverity"]; referrer != "" {
+			retained, err := s.provider.Info(ctx, imagedigest.Digest(referrer))
+			if err != nil {
+				return nil, err
+			}
+			addSnapshotters(referrerSnapshotters, retained)
+		}
+		return nil, nil
+	}), i.Target)
+	if err != nil {
+		return nil, fmt.Errorf("get signed image snapshotters: %w", err)
 	}
 
 	var spec imagespec.Image
@@ -202,13 +232,14 @@ func (s *Store) getImage(ctx context.Context, i images.Image) (*Image, error) {
 	pinned := i.Labels[labels.PinnedImageLabelKey] == labels.PinnedImageLabelValue
 
 	return &Image{
-		ID:           id,
-		References:   []string{i.Name},
-		ChainID:      chainID.String(),
-		Size:         size,
-		ImageSpec:    spec,
-		Pinned:       pinned,
-		Snapshotters: snapshotters,
+		ID:                   id,
+		References:           []string{i.Name},
+		ChainID:              chainID.String(),
+		Size:                 size,
+		ImageSpec:            spec,
+		Pinned:               pinned,
+		Snapshotters:         snapshotters,
+		referrerSnapshotters: referrerSnapshotters,
 	}, nil
 
 }
@@ -237,10 +268,12 @@ func (s *Store) List() []Image {
 }
 
 type store struct {
-	lock       sync.RWMutex
-	images     map[string]Image
-	digestSet  *digestset.Set
-	pinnedRefs map[string]sets.Set[string]
+	lock               sync.RWMutex
+	images             map[string]Image
+	digestSet          *digestset.Set
+	pinnedRefs         map[string]sets.Set[string]
+	configSnapshotters map[string]map[string]struct{}
+	refSnapshotters    map[string]map[string]map[string]struct{}
 }
 
 func (s *store) list() []Image {
@@ -273,30 +306,60 @@ func (s *store) add(img Image) error {
 		}
 	}
 
+	if s.configSnapshotters == nil {
+		s.configSnapshotters = make(map[string]map[string]struct{})
+	}
+	if s.refSnapshotters == nil {
+		s.refSnapshotters = make(map[string]map[string]map[string]struct{})
+	}
+	s.configSnapshotters[img.ID] = maps.Clone(img.Snapshotters)
+	if s.refSnapshotters[img.ID] == nil {
+		s.refSnapshotters[img.ID] = make(map[string]map[string]struct{})
+	}
+	for _, ref := range img.References {
+		s.refSnapshotters[img.ID][ref] = maps.Clone(img.referrerSnapshotters)
+	}
+	img.referrerSnapshotters = nil
 	i, ok := s.images[img.ID]
 	if !ok {
 		// If the image doesn't exist, add it.
+		img.Snapshotters = s.snapshotters(img.ID)
 		s.images[img.ID] = img
 		return nil
 	}
 	// Or else, merge and sort the references.
 	i.References = docker.Sort(util.MergeStringSlices(i.References, img.References))
 	i.Pinned = i.Pinned || img.Pinned
-	i.Snapshotters = maps.Clone(img.Snapshotters)
+	i.Snapshotters = s.snapshotters(img.ID)
 	s.images[img.ID] = i
 	return nil
 }
 
-func (s *store) refreshSnapshotters(id string, snapshotters map[string]struct{}) error {
+func (s *store) refreshSnapshotters(ref string, img Image) error {
 	s.lock.Lock()
 	defer s.lock.Unlock()
-	i, ok := s.images[id]
+	i, ok := s.images[img.ID]
 	if !ok {
 		return errdefs.ErrNotFound
 	}
-	i.Snapshotters = maps.Clone(snapshotters)
-	s.images[id] = i
+	s.configSnapshotters[img.ID] = maps.Clone(img.Snapshotters)
+	s.refSnapshotters[img.ID][ref] = maps.Clone(img.referrerSnapshotters)
+	i.Snapshotters = s.snapshotters(img.ID)
+	s.images[img.ID] = i
 	return nil
+}
+
+// snapshotters requires the store lock.
+func (s *store) snapshotters(id string) map[string]struct{} {
+	snapshotters := maps.Clone(s.configSnapshotters[id])
+	for _, refSnapshotters := range s.refSnapshotters[id] {
+		if snapshotters == nil {
+			snapshotters = maps.Clone(refSnapshotters)
+		} else {
+			maps.Copy(snapshotters, refSnapshotters)
+		}
+	}
+	return snapshotters
 }
 
 func (s *store) isPinned(id, ref string) bool {
@@ -396,6 +459,7 @@ func (s *store) delete(id, ref string) {
 		return
 	}
 	i.References = util.SubtractStringSlice(i.References, ref)
+	delete(s.refSnapshotters[digest.String()], ref)
 	if len(i.References) != 0 {
 		if refs := s.pinnedRefs[digest.String()]; refs != nil {
 			if refs.Delete(ref); len(refs) == 0 {
@@ -406,6 +470,7 @@ func (s *store) delete(id, ref string) {
 			}
 		}
 
+		i.Snapshotters = s.snapshotters(digest.String())
 		s.images[digest.String()] = i
 		return
 	}
@@ -413,4 +478,6 @@ func (s *store) delete(id, ref string) {
 	s.digestSet.Remove(digest)
 	delete(s.images, digest.String())
 	delete(s.pinnedRefs, digest.String())
+	delete(s.configSnapshotters, digest.String())
+	delete(s.refSnapshotters, digest.String())
 }

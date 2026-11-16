@@ -332,26 +332,28 @@ with or without the EROFS differ.
 For signed dm-verity referrers, the unpack policy derives each snapshot key as:
 
 ```
-sha256("erofs-dmverity-v2\n" + selectedParentKey + "\n" +
-       ordinaryChainID + "\n" + lowercaseRootHash) + "-dmverity-v2"
+sha256("erofs-dmverity-v3\n" + selectedParentKey + "\n" +
+       ordinaryChainID + "\n" + lowercaseRootHash + "\n" +
+       signatureDigest) + "-dmverity-v3"
 ```
 
 The first layer has an empty parent key. This keeps signed materializations with
-different roots separate, including descendants whose own root is unchanged but
-whose selected parent differs. Unsigned snapshots retain their ordinary OCI
-ChainIDs. A replacement signature for the same root reuses the existing snapshot
-and its original signature; it does not overwrite cached signature identity.
+different roots or signatures separate, including descendants whose own identity
+is unchanged but whose selected parent differs. Unsigned snapshots retain their
+ordinary OCI ChainIDs. A replacement signature for the same root selects a new
+snapshot; it does not overwrite an existing snapshot or its signature.
 
 CRI snapshot creation and unpack readiness resolve this same chain from the
 selected platform manifest and its retained referrer bundle. Only rootfs layer
 descriptors participate in this chain; non-layer artifacts are excluded, matching
 the image unpacker's layer selection. Each signed top key
-gets a distinct config GC reference
+gets a distinct GC reference on its selected signature referrer
 `containerd.io/gc.ref.snapshot.<snapshotter>/dmverity-<sha256(topKey)>`,
-alongside any plain reference, so variants sharing a config remain reachable.
+while any plain reference stays on the config. Retiring a referrer allows its
+signed chain to be collected once no image, container, or lease retains it.
 Manifests sharing a config are deduplicated for unpack only when they select the
-same prepared snapshot chain. Alternate layer blobs are still fetched, including
-when the selected snapshots are already cached.
+same prepared snapshot chain and retained referrer. Alternate layer blobs are
+still fetched, including when the selected snapshots are already cached.
 
 Signed unpacking requires the EROFS differ. Before committing a snapshot with a
 signed identity, the snapshotter checks that the EROFS blob, dm-verity metadata,
@@ -365,6 +367,8 @@ Legacy `<ChainID>-dmverity` snapshots and their references are left untouched.
 They are not selected by the new policy: a subsequent signed unpack materializes
 the versioned chain alongside them. Existing containers can keep their original
 snapshot parents; no snapshot deletion is required.
+Config-owned signed references from earlier experimental builds are not migrated
+and can retain old variants until their config becomes unreachable.
 
 ## Tar Index Mode
 

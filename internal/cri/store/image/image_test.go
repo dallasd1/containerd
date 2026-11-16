@@ -30,33 +30,66 @@ import (
 	"github.com/containerd/platforms"
 
 	"github.com/opencontainers/go-digest/digestset"
+	imagespec "github.com/opencontainers/image-spec/specs-go/v1"
 	assertlib "github.com/stretchr/testify/assert"
 	"k8s.io/apimachinery/pkg/util/sets"
 )
 
 func TestImageSnapshottersNormalizeQualifiedReferences(t *testing.T) {
-	ctx := context.Background()
-	cs := imagetest.NewContentStore(ctx, t)
-	target := imagetest.SimpleManifest(50)(cs)
-	_, err := cs.Store.Update(ctx, content.Info{
-		Digest: target.Children[0].Descriptor.Digest,
-		Labels: map[string]string{
-			"containerd.io/gc.ref.snapshot.erofs/dmverity": "dmverity-key",
-		},
-	}, "labels.containerd.io/gc.ref.snapshot.erofs/dmverity")
-	if err != nil {
-		t.Fatal(err)
-	}
-	store := NewStore(nil, cs.Store, platforms.Default())
-	img, err := store.getImage(ctx, images.Image{Name: "signed", Target: target.Descriptor})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, ok := img.Snapshotters["erofs"]; !ok {
-		t.Fatalf("qualified snapshot reference did not resolve to erofs: %#v", img.Snapshotters)
-	}
-	if _, ok := img.Snapshotters["erofs/dmverity"]; ok {
-		t.Fatalf("GC lane qualifier was reported as a separate snapshotter: %#v", img.Snapshotters)
+	for _, owner := range []string{"config", "referrer", "index-referrer"} {
+		t.Run(owner, func(t *testing.T) {
+			ctx := context.Background()
+			cs := imagetest.NewContentStore(ctx, t)
+			target := imagetest.SimpleManifest(50)(cs)
+			ownerDigest := target.Children[0].Descriptor.Digest
+			if owner != "config" {
+				referrer := cs.JSONObject(imagespec.MediaTypeImageManifest, imagespec.Manifest{
+					MediaType: imagespec.MediaTypeImageManifest,
+					Config:    imagespec.DescriptorEmptyJSON, Subject: &target.Descriptor,
+				})
+				ownerDigest = referrer.Descriptor.Digest
+				_, err := cs.Store.Update(ctx, content.Info{
+					Digest: target.Descriptor.Digest,
+					Labels: map[string]string{"containerd.io/gc.ref.content.dmverity": ownerDigest.String()},
+				}, "labels.containerd.io/gc.ref.content.dmverity")
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			_, err := cs.Store.Update(ctx, content.Info{
+				Digest: ownerDigest,
+				Labels: map[string]string{
+					"containerd.io/gc.ref.snapshot.erofs/dmverity": "dmverity-key",
+				},
+			}, "labels.containerd.io/gc.ref.snapshot.erofs/dmverity")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if owner == "index-referrer" {
+				target = cs.Index(
+					imagetest.AddPlatform(imagetest.SimpleManifest(51)(cs), imagespec.Platform{OS: "linux", Architecture: "arm64"}),
+					imagetest.AddPlatform(target, platforms.DefaultSpec()),
+				)
+			}
+			store := NewStore(nil, cs.Store, platforms.Default())
+			img, err := store.getImage(ctx, images.Image{Name: "signed", Target: target.Descriptor})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := store.update("signed", img); err != nil {
+				t.Fatal(err)
+			}
+			cached, err := store.Get(img.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, ok := cached.Snapshotters["erofs"]; !ok {
+				t.Fatalf("qualified snapshot reference did not resolve to erofs: %#v", cached.Snapshotters)
+			}
+			if _, ok := cached.Snapshotters["erofs/dmverity"]; ok {
+				t.Fatalf("GC lane qualifier was reported as a separate snapshotter: %#v", cached.Snapshotters)
+			}
+		})
 	}
 }
 
@@ -91,8 +124,56 @@ func TestSnapshottersRefreshForExistingImage(t *testing.T) {
 				assert.NoError(err)
 				assert.NotContains(refreshed.Snapshotters, "erofs", "refresh must remove stale snapshotters")
 				assert.Contains(after.Snapshotters, "erofs", "refresh must not mutate previously returned metadata")
+				img.Snapshotters = map[string]struct{}{}
+				assert.NoError(s.update(ref, &img))
+				refreshed, err = s.Get(id)
+				assert.NoError(err)
+				assert.Empty(refreshed.Snapshotters, "config-owned snapshotters are shared across aliases")
 			})
 		}
+	}
+}
+
+func TestSnapshottersAcrossReferences(t *testing.T) {
+	const id = "sha256:1123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	const otherID = "sha256:2123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	for _, signedFirst := range []bool{false, true} {
+		t.Run(fmt.Sprintf("signed-first=%t", signedFirst), func(t *testing.T) {
+			assert := assertlib.New(t)
+			s := NewStore(nil, nil, platforms.Default())
+			signedSnapshotters := map[string]struct{}{"overlayfs": {}, "erofs": {}}
+			signed := Image{ID: id, References: []string{"signed"}, Snapshotters: map[string]struct{}{"overlayfs": {}}, referrerSnapshotters: map[string]struct{}{"erofs": {}}}
+			other := Image{ID: id, References: []string{"other"}, Snapshotters: map[string]struct{}{"overlayfs": {}}}
+			images := []Image{signed, other}
+			if !signedFirst {
+				images[0], images[1] = images[1], images[0]
+			}
+			for _, img := range images {
+				assert.NoError(s.update(img.References[0], &img))
+			}
+			check := func(id string, expected map[string]struct{}) {
+				t.Helper()
+				cached, err := s.Get(id)
+				assert.NoError(err)
+				assert.Equal(expected, cached.Snapshotters)
+			}
+			check(id, signedSnapshotters)
+			delete(signed.referrerSnapshotters, "erofs")
+			assert.NoError(s.update("other", &other))
+			check(id, signedSnapshotters)
+			assert.NoError(s.update("signed", &signed))
+			check(id, other.Snapshotters)
+			signed.referrerSnapshotters = map[string]struct{}{"erofs": {}}
+			assert.NoError(s.update("signed", &signed))
+			assert.NoError(s.update("signed", nil))
+			check(id, other.Snapshotters)
+			assert.NoError(s.update("signed", &signed))
+			check(id, signedSnapshotters)
+			signed.ID = otherID
+			assert.NoError(s.update("signed", &signed))
+			check(id, other.Snapshotters)
+			check(otherID, signedSnapshotters)
+		})
 	}
 }
 
@@ -127,9 +208,11 @@ func TestInternalStore(t *testing.T) {
 	genTruncIndex := func(normalName string) string { return normalName[:(len(normalName)+1)/2] }
 
 	s := &store{
-		images:     make(map[string]Image),
-		digestSet:  digestset.NewSet(),
-		pinnedRefs: make(map[string]sets.Set[string]),
+		images:             make(map[string]Image),
+		digestSet:          digestset.NewSet(),
+		pinnedRefs:         make(map[string]sets.Set[string]),
+		configSnapshotters: make(map[string]map[string]struct{}),
+		refSnapshotters:    make(map[string]map[string]map[string]struct{}),
 	}
 
 	t.Logf("should be able to add image")
@@ -210,9 +293,11 @@ func TestInternalStore(t *testing.T) {
 func TestInternalStorePinnedImage(t *testing.T) {
 	assert := assertlib.New(t)
 	s := &store{
-		images:     make(map[string]Image),
-		digestSet:  digestset.NewSet(),
-		pinnedRefs: make(map[string]sets.Set[string]),
+		images:             make(map[string]Image),
+		digestSet:          digestset.NewSet(),
+		pinnedRefs:         make(map[string]sets.Set[string]),
+		configSnapshotters: make(map[string]map[string]struct{}),
+		refSnapshotters:    make(map[string]map[string]map[string]struct{}),
 	}
 
 	ref1 := "containerd.io/ref-1"

@@ -23,6 +23,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"slices"
 	"strconv"
 	"strings"
@@ -360,7 +361,6 @@ func (u *Unpacker) Unpack(h images.Handler) images.Handler {
 				})
 			}
 			for _, layers := range toFetch {
-				layers := layers
 				u.eg.Go(func() error {
 					return u.fetch(u.ctx, h, layers, nil)
 				})
@@ -487,7 +487,10 @@ func layerPreparationIdentity(preparations []snapshots.LayerPreparation) string 
 		b.WriteByte(0)
 	}
 	if len(preparations) > 0 {
-		b.WriteString(preparations[len(preparations)-1].GCQualifier)
+		top := preparations[len(preparations)-1]
+		b.WriteString(top.GCQualifier)
+		b.WriteByte(0)
+		b.WriteString(top.GCContent.String())
 	}
 	return b.String()
 }
@@ -575,9 +578,7 @@ func (u *Unpacker) unpack(
 		if i > 0 {
 			snapshotLabels[labelSnapshotParent] = preparations[i-1].Key
 		}
-		for key, value := range prepared.Labels {
-			snapshotLabels[key] = value
-		}
+		maps.Copy(snapshotLabels, prepared.Labels)
 		validateExistingSnapshot := prepared.ValidateExisting
 
 		var (
@@ -830,17 +831,22 @@ func (u *Unpacker) unpack(
 	var chainID string
 	gcLabel := ""
 	gcSnapshotKey := ""
+	gcContent := config.Digest
 	if len(chainIDs) > 0 {
 		chainID = chainIDs[len(chainIDs)-1].String()
-		gcLabel = preparations[len(preparations)-1].GCQualifier
-		gcSnapshotKey = preparations[len(preparations)-1].Key
+		top := preparations[len(preparations)-1]
+		gcLabel = top.GCQualifier
+		gcSnapshotKey = top.Key
+		if top.GCContent != "" {
+			gcContent = top.GCContent
+		}
 	}
 	gcRef := fmt.Sprintf("containerd.io/gc.ref.snapshot.%s", unpack.SnapshotterKey)
 	if gcLabel != "" {
 		gcRef += "/" + gcLabel
 	}
 	cinfo := content.Info{
-		Digest: config.Digest,
+		Digest: gcContent,
 		Labels: map[string]string{
 			gcRef: gcSnapshotKey,
 		},

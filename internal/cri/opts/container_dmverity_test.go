@@ -213,7 +213,7 @@ func TestWithNewSnapshotPreflightsAndCreatesFromSignedLane(t *testing.T) {
 	}, "labels.containerd.io/gc.ref.content.dmverity")
 	require.NoError(t, err)
 
-	signedKey, err := snpkg.DmveritySnapshotKey(identity.ChainID([]digest.Digest{diffID}).String(), "", rootHash)
+	signedKey, err := snpkg.DmveritySnapshotKey(identity.ChainID([]digest.Digest{diffID}).String(), "", rootHash, signature.Digest.String())
 	require.NoError(t, err)
 	snapshotter := &preflightSnapshotter{
 		alreadyExists: true,
