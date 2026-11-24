@@ -31,6 +31,7 @@ import (
 	"github.com/containerd/platforms"
 	"github.com/containerd/plugin"
 	"github.com/containerd/plugin/registry"
+	"github.com/moby/locker"
 	"github.com/opencontainers/go-digest"
 
 	"github.com/containerd/containerd/v2/core/mount"
@@ -46,6 +47,9 @@ var forceloop bool
 
 const signedDmverityDeviceNamePrefix = "containerd-erofs-signed-"
 
+// Signed mappers are shared across mount paths and handler instances.
+var signedMapperLocks locker.Locker
+
 type erofsMountHandler struct{}
 
 // NewErofsMountHandler creates a new EROFS mount handler that supports dm-verity
@@ -57,14 +61,6 @@ func (h *erofsMountHandler) Mount(ctx context.Context, m mount.Mount, mp string,
 	if m.Type != "erofs" {
 		return mount.ActiveMount{}, errdefs.ErrNotImplemented
 	}
-
-	var dmverityDevice string
-	defer func() {
-		if retErr == nil || dmverityDevice == "" {
-			return
-		}
-		dmverity.Close(dmverityDevice)
-	}()
 
 	var (
 		metadataPath            string
@@ -118,11 +114,20 @@ func (h *erofsMountHandler) Mount(ctx context.Context, m mount.Mount, mp string,
 
 		var devicePath, cleanupName string
 		if signedDmverity {
-			devicePath, cleanupName, err = setupSignedDmVerityDevice(ctx, m.Source, expectedRootHash, metadata.HashOffset, expectedSignatureDigest)
+			deviceName := signedMapperName(m.Source, expectedRootHash, expectedSignatureDigest)
+			// A mounted filesystem pins the device; keep teardown out until the
+			// mount succeeds or the failed attempt cleans up its own device.
+			signedMapperLocks.Lock(deviceName)
+			defer signedMapperLocks.Unlock(deviceName)
+			devicePath, cleanupName, err = setupSignedDmVerityDevice(ctx, m.Source, deviceName, expectedRootHash, metadata.HashOffset)
 		} else {
 			devicePath, cleanupName, err = setupDmVerityDevice(ctx, m.Source, metadata)
 		}
-		dmverityDevice = cleanupName
+		defer func() {
+			if retErr != nil && cleanupName != "" {
+				dmverity.Close(cleanupName)
+			}
+		}()
 		if err != nil {
 			return mount.ActiveMount{}, err
 		}
@@ -246,16 +251,19 @@ func setupDmVerityDevice(ctx context.Context, source string, metadata *dmverity.
 	return devicePath, "", nil
 }
 
+func signedMapperName(source, expectedRootHash, expectedSignatureDigest string) string {
+	snapshotID := filepath.Base(filepath.Dir(filepath.Clean(source)))
+	verityIdentity := digest.FromString(expectedRootHash + "-" + expectedSignatureDigest).Encoded()[:32]
+	return signedDmverityDeviceNamePrefix + snapshotID + "-" + verityIdentity
+}
+
 // setupSignedDmVerityDevice creates or reuses one signed mapper for a layer.
-func setupSignedDmVerityDevice(ctx context.Context, source, expectedRootHash string, hashOffset uint64, expectedSignatureDigest string) (devicePath string, cleanupName string, err error) {
+func setupSignedDmVerityDevice(ctx context.Context, source, deviceName, expectedRootHash string, hashOffset uint64) (devicePath string, cleanupName string, err error) {
 	supported, err := dmverity.IsSupported()
 	if err != nil || !supported {
 		return "", "", fmt.Errorf("layer requires dm-verity but system doesn't support it (dm_verity module not loaded): %w", err)
 	}
 
-	snapshotID := filepath.Base(filepath.Dir(filepath.Clean(source)))
-	verityIdentity := digest.FromString(expectedRootHash + "-" + expectedSignatureDigest).Encoded()[:32]
-	deviceName := signedDmverityDeviceNamePrefix + snapshotID + "-" + verityIdentity
 	devicePath = dmverity.DevicePath(deviceName)
 	signatureFile, err := dmveritySignatureFile(source)
 	if err != nil {
@@ -367,6 +375,10 @@ func (h *erofsMountHandler) Unmount(ctx context.Context, path string) error {
 		}
 	}
 
+	if signedDmverity {
+		signedMapperLocks.Lock(deviceName)
+		defer signedMapperLocks.Unlock(deviceName)
+	}
 	err = mount.Unmount(path, 0)
 	if signedDmverity && err != nil {
 		return err
