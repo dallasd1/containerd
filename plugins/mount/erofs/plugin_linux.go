@@ -272,14 +272,47 @@ func setupSignedDmVerityDevice(ctx context.Context, source, expectedRootHash str
 		return devicePath, deviceName, nil
 	}
 
-	if _, statErr := os.Stat(devicePath); statErr != nil {
+	waited, statErr := statSignedMapperForReuse(ctx, devicePath, err)
+	if statErr != nil {
+		log.G(ctx).WithField("device", devicePath).WithError(statErr).Debug("signed dm-verity device unavailable for reuse")
 		return "", "", fmt.Errorf("failed to open signed dm-verity device: %w", err)
 	}
 	if verifyErr := dmverity.VerifySignedDevice(deviceName, expectedRootHash); verifyErr != nil {
 		return "", "", fmt.Errorf("existing signed dm-verity device %q verification failed: %w", deviceName, verifyErr)
 	}
+	if waited {
+		log.G(ctx).WithField("device", devicePath).Info("signed dm-verity device appeared after create contention and was verified for reuse")
+	}
 	log.G(ctx).WithField("device", devicePath).Debug("signed dm-verity device already exists and is verified, reusing")
 	return devicePath, "", nil
+}
+
+func statSignedMapperForReuse(ctx context.Context, devicePath string, openErr error) (waited bool, err error) {
+	_, err = os.Stat(devicePath)
+	var createErr *verity.DeviceCreateError
+	if !errors.Is(err, os.ErrNotExist) || !errors.As(openErr, &createErr) || !errors.Is(createErr, unix.EBUSY) {
+		return false, err
+	}
+
+	// A concurrent creator can reserve the name before the mapper node is visible.
+	ctx, cancel := context.WithTimeout(ctx, time.Second)
+	defer cancel()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return true, fmt.Errorf("wait for mapper node: %w: %w", ctx.Err(), err)
+		case <-ticker.C:
+			if ctx.Err() != nil {
+				return true, fmt.Errorf("wait for mapper node: %w: %w", ctx.Err(), err)
+			}
+			_, err = os.Stat(devicePath)
+			if !errors.Is(err, os.ErrNotExist) {
+				return true, err
+			}
+		}
+	}
 }
 
 // dmveritySignatureFile checks readability and nonempty contents before mapper reuse.
