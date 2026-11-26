@@ -362,10 +362,26 @@ func GetHashTreeSize(params *Params) (uint64, error) {
 }
 
 func Open(params *Params, name, dataDevice, hashDevice string, rootHash []byte, signatureFile string, flags []string) (string, error) {
-	var keyDesc string
-	var keyID keyring.KeySerial
-
+	var signatureData []byte
 	if signatureFile != "" {
+		var err error
+		signatureData, err = ReadSignatureFile(signatureFile)
+		if err != nil {
+			return "", fmt.Errorf("failed to read signature file: %w", err)
+		}
+	}
+	return OpenWithSignature(params, name, dataDevice, hashDevice, rootHash, signatureData, flags)
+}
+
+// OpenWithSignature sets up verity using the supplied signature bytes. A nil
+// signature opens a mapping without root hash signature verification.
+func OpenWithSignature(params *Params, name, dataDevice, hashDevice string, rootHash, signatureData []byte, flags []string) (string, error) {
+	var keyDesc string
+
+	if signatureData != nil {
+		if len(signatureData) == 0 || len(signatureData) > MaxSignatureSize {
+			return "", fmt.Errorf("invalid signature size %d", len(signatureData))
+		}
 		if err := keyring.CheckKeyringSupport(); err != nil {
 			return "", fmt.Errorf("signature verification requires kernel keyring support: %w", err)
 		}
@@ -382,12 +398,7 @@ func Open(params *Params, name, dataDevice, hashDevice string, rootHash []byte, 
 		return "", err
 	}
 
-	if signatureFile != "" {
-		signatureData, err := ReadSignatureFile(signatureFile)
-		if err != nil {
-			return "", fmt.Errorf("failed to read signature file: %w", err)
-		}
-
+	if signatureData != nil {
 		uuidStr := ""
 		if params.UUID != ([16]byte{}) {
 			uuidStr = fmt.Sprintf("%x-%x-%x-%x-%x",
@@ -401,7 +412,7 @@ func Open(params *Params, name, dataDevice, hashDevice string, rootHash []byte, 
 			keyDesc = fmt.Sprintf("cryptsetup:%s", name)
 		}
 
-		keyID, err = keyring.AddKeyToThreadKeyring("user", keyDesc, signatureData)
+		keyID, err := keyring.AddKeyToThreadKeyring("user", keyDesc, signatureData)
 		if err != nil {
 			return "", fmt.Errorf("failed to load signature into keyring: %w", err)
 		}
@@ -450,10 +461,7 @@ func Open(params *Params, name, dataDevice, hashDevice string, rootHash []byte, 
 		Params:      targetParams,
 	}
 
-	if err := activateDevice(c, name, target); err != nil {
-		if signatureFile != "" && errors.Is(err, unix.EKEYREJECTED) {
-			return "", fmt.Errorf("signature verification failed: key rejected by kernel (check trusted keyring): %w", err)
-		}
+	if err := activateDevice(c, name, target, keyDesc != ""); err != nil {
 		return "", err
 	}
 
@@ -476,24 +484,31 @@ type deviceActivator interface {
 	RemoveDevice(string) error
 }
 
-// DeviceCreateError distinguishes a failed create from errors during activation.
-type DeviceCreateError struct{ Err error }
+// ErrDeviceCreateBusy marks EBUSY from device creation, not activation.
+var ErrDeviceCreateBusy = errors.New("dm-verity device create busy")
 
-func (e *DeviceCreateError) Error() string { return e.Err.Error() }
-func (e *DeviceCreateError) Unwrap() error { return e.Err }
+// ErrSignatureRejected indicates a signed table load failed with a key error and the failed mapper was removed.
+var ErrSignatureRejected = errors.New("dm-verity root hash signature rejected")
 
-func activateDevice(c deviceActivator, name string, target dm.Target) (retErr error) {
+func activateDevice(c deviceActivator, name string, target dm.Target, signed bool) (retErr error) {
 	if _, err := c.CreateDevice(name); err != nil {
-		return &DeviceCreateError{Err: err}
+		if errors.Is(err, unix.EBUSY) {
+			return fmt.Errorf("%w: %w", ErrDeviceCreateBusy, err)
+		}
+		return err
 	}
+	var signatureRejected bool
 	defer func() {
 		if retErr != nil {
 			if err := c.RemoveDevice(name); err != nil {
 				retErr = errors.Join(retErr, fmt.Errorf("remove failed activation %q: %w", name, err))
+			} else if signatureRejected {
+				retErr = fmt.Errorf("%w: %w", ErrSignatureRejected, retErr)
 			}
 		}
 	}()
 	if err := c.LoadTable(name, []dm.Target{target}); err != nil {
+		signatureRejected = signed && (errors.Is(err, unix.ENOKEY) || errors.Is(err, unix.EKEYREJECTED))
 		return fmt.Errorf("load table: %w", err)
 	}
 	if err := c.SuspendDevice(name, false); err != nil {

@@ -29,40 +29,149 @@ import (
 	"time"
 
 	"github.com/containerd/containerd/v2/core/mount"
+	"github.com/containerd/containerd/v2/internal/dmverity"
 	"github.com/containerd/containerd/v2/internal/fsmount"
 	"github.com/containerd/containerd/v2/pkg/testutil"
 	snapshotserofs "github.com/containerd/containerd/v2/plugins/snapshots/erofs"
 	"github.com/containerd/go-dmverity/pkg/verity"
+	"github.com/opencontainers/go-digest"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sys/unix"
 )
 
-func TestStatSignedMapperForReuse(t *testing.T) {
-	busy := fmt.Errorf("open failed: %w", &verity.DeviceCreateError{Err: unix.EBUSY})
+func TestMountAuditFallback(t *testing.T) {
+	originalForceloop := forceloop.Load()
+	t.Cleanup(func() { forceloop.Store(originalForceloop) })
+	rejected := fmt.Errorf("load table: %w: %w", verity.ErrSignatureRejected, unix.ENOKEY)
+	signatureDigest := digest.FromString("signature").String()
 
-	t.Run("waits for node after create busy", func(t *testing.T) {
-		path := filepath.Join(t.TempDir(), "mapper-node")
-		synctest.Test(t, func(t *testing.T) {
-			go func() {
-				time.Sleep(25 * time.Millisecond)
-				if err := os.WriteFile(path, nil, 0600); err != nil {
-					t.Error(err)
+	for _, tc := range []struct {
+		name        string
+		openErr     error
+		enforcing   bool
+		inactive    bool
+		mountErr    error
+		forceLoop   bool
+		needsLoop   bool
+		enforceLoop bool
+		wantErr     error
+		wantSources []string
+	}{
+		{name: "verified signature uses mapper even when loop is forced", forceLoop: true, wantSources: []string{"signed-mapper"}},
+		{name: "signed mount failure does not fall back", mountErr: unix.ENOTBLK, wantErr: unix.ENOTBLK, wantSources: []string{"signed-mapper"}},
+		{name: "audit mounts existing layer", openErr: rejected, wantSources: []string{"layer.erofs"}},
+		{name: "audit can mount through a loop", openErr: rejected, needsLoop: true, wantSources: []string{"layer.erofs", "loop-device"}},
+		{name: "enforcing rejects fallback", openErr: rejected, enforcing: true, wantErr: rejected},
+		{name: "inactive policy rejects fallback", openErr: rejected, inactive: true, wantErr: rejected},
+		{name: "unclassified key error rejects fallback", openErr: unix.ENOKEY, wantErr: unix.ENOKEY},
+		{name: "audit stopped before loop mount", openErr: rejected, needsLoop: true, enforceLoop: true, wantErr: rejected, wantSources: []string{"layer.erofs"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			forceloop.Store(tc.forceLoop)
+			dir := t.TempDir()
+			source := filepath.Join(dir, "layer.erofs")
+			require.NoError(t, os.WriteFile(dmverity.MetadataPath(source), []byte(`{"roothash":"abcd"}`), 0600))
+			request := mount.Mount{Type: "erofs", Source: source, Options: []string{
+				"ro", "loop",
+				dmverity.MountOptionMetadataPrefix + dmverity.MetadataPath(source),
+				dmverity.MountOptionRootHashPrefix + "abcd",
+				dmverity.MountOptionSignatureDigestPrefix + signatureDigest,
+			}}
+
+			ipePath := filepath.Join(dir, "ipe")
+			policy := filepath.Join(ipePath, "policies", "test-policy")
+			require.NoError(t, os.MkdirAll(policy, 0700))
+			active := "1"
+			if tc.inactive {
+				active = "0"
+			}
+			require.NoError(t, os.WriteFile(filepath.Join(policy, "active"), []byte(active), 0600))
+			enforcePath := filepath.Join(ipePath, "enforce")
+			mode := "0"
+			if tc.enforcing {
+				mode = "1"
+			}
+			require.NoError(t, os.WriteFile(enforcePath, []byte(mode), 0600))
+
+			var signedAttempts int
+			setupSigned := func(_ context.Context, gotSource, _, _ string, _ uint64, gotDigest string) (string, string, error) {
+				signedAttempts++
+				require.Equal(t, source, gotSource)
+				require.Equal(t, signatureDigest, gotDigest)
+				if tc.openErr != nil {
+					return "", "", tc.openErr
 				}
-			}()
-			waited, err := statSignedMapperForReuse(t.Context(), path, busy)
-			require.NoError(t, err)
-			require.True(t, waited)
-			waited, err = statSignedMapperForReuse(t.Context(), path, busy)
-			require.NoError(t, err)
-			require.False(t, waited)
+				return filepath.Join(dir, "signed-mapper"), "", nil
+			}
+			setupLoop := func(gotSource string, params mount.LoopParams) (*os.File, error) {
+				require.True(t, tc.needsLoop, "unexpected loop setup")
+				require.Equal(t, source, gotSource)
+				require.True(t, params.Readonly)
+				require.True(t, params.Autoclear)
+				if tc.enforceLoop {
+					require.NoError(t, os.WriteFile(enforcePath, []byte("1"), 0600))
+				}
+				return os.Create(filepath.Join(dir, "loop-device"))
+			}
+			var sources []string
+			mountFilesystem := func(m mount.Mount, _ string) error {
+				sources = append(sources, m.Source)
+				require.Equal(t, []string{"ro"}, m.Options)
+				if tc.needsLoop && m.Source == source {
+					return unix.ENOTBLK
+				}
+				return tc.mountErr
+			}
+
+			activeMount, err := mountErofs(t.Context(), request, filepath.Join(dir, "mount"), ipePath, setupSigned, setupLoop, mountFilesystem)
+			require.ErrorIs(t, err, tc.wantErr)
+			require.Equal(t, 1, signedAttempts)
+			var wantSources []string
+			for _, name := range tc.wantSources {
+				wantSources = append(wantSources, filepath.Join(dir, name))
+			}
+			require.Equal(t, wantSources, sources)
+			if tc.wantErr == nil {
+				require.Equal(t, wantSources[len(wantSources)-1], activeMount.Source)
+			}
 		})
-	})
+	}
+}
+
+func TestStatMapperNode(t *testing.T) {
+	busy := fmt.Errorf("open failed: %w: %w", verity.ErrDeviceCreateBusy, unix.EBUSY)
+
+	for _, tc := range []struct {
+		name    string
+		openErr error
+	}{
+		{"new device", nil},
+		{"create busy", busy},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "mapper-node")
+			synctest.Test(t, func(t *testing.T) {
+				go func() {
+					time.Sleep(25 * time.Millisecond)
+					if err := os.WriteFile(path, nil, 0600); err != nil {
+						t.Error(err)
+					}
+				}()
+				waited, err := statMapperNode(t.Context(), path, tc.openErr)
+				require.NoError(t, err)
+				require.True(t, waited)
+				waited, err = statMapperNode(t.Context(), path, tc.openErr)
+				require.NoError(t, err)
+				require.False(t, waited)
+			})
+		})
+	}
 
 	t.Run("missing node has a bounded wait", func(t *testing.T) {
 		path := filepath.Join(t.TempDir(), "missing")
 		synctest.Test(t, func(t *testing.T) {
 			start := time.Now()
-			waited, err := statSignedMapperForReuse(t.Context(), path, busy)
+			waited, err := statMapperNode(t.Context(), path, busy)
 			require.True(t, waited)
 			require.ErrorIs(t, err, context.DeadlineExceeded)
 			require.ErrorIs(t, err, os.ErrNotExist)
@@ -78,19 +187,19 @@ func TestStatSignedMapperForReuse(t *testing.T) {
 				time.Sleep(25 * time.Millisecond)
 				cancel()
 			}()
-			waited, err := statSignedMapperForReuse(ctx, path, busy)
+			waited, err := statMapperNode(ctx, path, busy)
 			require.True(t, waited)
 			require.ErrorIs(t, err, context.Canceled)
 		})
 	})
 
-	t.Run("only create busy waits", func(t *testing.T) {
+	t.Run("other open failures do not wait", func(t *testing.T) {
 		path := filepath.Join(t.TempDir(), "missing")
 		for _, openErr := range []error{
 			fmt.Errorf("load table: %w", unix.EBUSY),
-			&verity.DeviceCreateError{Err: unix.EACCES},
+			unix.EACCES,
 		} {
-			waited, err := statSignedMapperForReuse(t.Context(), path, openErr)
+			waited, err := statMapperNode(t.Context(), path, openErr)
 			require.False(t, waited)
 			require.ErrorIs(t, err, os.ErrNotExist)
 		}
@@ -99,51 +208,77 @@ func TestStatSignedMapperForReuse(t *testing.T) {
 	t.Run("other stat errors do not wait", func(t *testing.T) {
 		path := filepath.Join(t.TempDir(), "invalid-link")
 		require.NoError(t, os.Symlink(filepath.Base(path), path))
-		waited, err := statSignedMapperForReuse(t.Context(), path, busy)
+		waited, err := statMapperNode(t.Context(), path, busy)
 		require.False(t, waited)
 		require.ErrorIs(t, err, unix.ELOOP)
 	})
 }
 
-func TestDmveritySignatureFileBounds(t *testing.T) {
-	source := filepath.Join(t.TempDir(), "layer.erofs")
-	signaturePath := source + ".sig"
-
+func TestReadVerifiedSignature(t *testing.T) {
 	for _, tc := range []struct {
-		name    string
-		data    []byte
-		wantErr string
-		missing bool
+		name           string
+		data           []byte
+		expectedDigest string
+		wantErr        string
+		missing        bool
 	}{
-		{name: "valid", data: []byte("signature")},
+		{name: "selected bytes", data: []byte("signature")},
 		{name: "at maximum", data: make([]byte, verity.MaxSignatureSize)},
 		{name: "empty", data: nil, wantErr: "cannot be empty"},
 		{name: "oversized", data: make([]byte, verity.MaxSignatureSize+1), wantErr: "exceeds maximum size"},
 		{name: "missing", wantErr: "open signature file", missing: true},
+		{name: "digest mismatch", data: []byte("signature"), expectedDigest: digest.FromString("different signature").String(), wantErr: "does not match signed identity"},
+		{name: "invalid digest", data: []byte("signature"), expectedDigest: "invalid", wantErr: "parse dm-verity signature digest"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if tc.missing {
-				if err := os.Remove(signaturePath); err != nil && !os.IsNotExist(err) {
-					t.Fatal(err)
-				}
-			} else {
-				if err := os.WriteFile(signaturePath, tc.data, 0600); err != nil {
-					t.Fatal(err)
-				}
+			source := filepath.Join(t.TempDir(), "layer.erofs")
+			if !tc.missing {
+				require.NoError(t, os.WriteFile(dmverity.SignaturePath(source), tc.data, 0600))
 			}
-			got, err := dmveritySignatureFile(source)
+			expectedDigest := tc.expectedDigest
+			if expectedDigest == "" {
+				expectedDigest = digest.FromBytes(tc.data).String()
+			}
+			got, err := dmverity.ReadVerifiedSignature(source, expectedDigest)
 			if tc.wantErr != "" {
-				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
-					t.Fatalf("expected error containing %q, got %v", tc.wantErr, err)
-				}
+				require.ErrorContains(t, err, tc.wantErr)
+				require.NotErrorIs(t, err, verity.ErrSignatureRejected)
+				require.Nil(t, got)
 				return
 			}
-			if err != nil {
-				t.Fatalf("dmveritySignatureFile() error = %v", err)
+			require.NoError(t, err)
+			require.Equal(t, tc.data, got)
+		})
+	}
+}
+
+func TestIPEInAuditMode(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		enforce     string
+		active      string
+		wantAllowed bool
+	}{
+		{name: "active audit", enforce: "0\n", active: "1\n", wantAllowed: true},
+		{name: "enforcing", enforce: "1\n", active: "1\n"},
+		{name: "inactive policy", enforce: "0\n", active: "0\n"},
+		{name: "no policies", enforce: "0\n"},
+		{name: "missing mode", active: "1\n"},
+		{name: "unknown mode", enforce: "unexpected\n", active: "1\n"},
+		{name: "IPE unavailable"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			if tc.enforce != "" {
+				require.NoError(t, os.WriteFile(filepath.Join(root, "enforce"), []byte(tc.enforce), 0600))
 			}
-			if got != signaturePath {
-				t.Fatalf("dmveritySignatureFile() = %q, want %q", got, signaturePath)
+			if tc.active != "" {
+				policy := filepath.Join(root, "policies", "test-policy")
+				require.NoError(t, os.MkdirAll(policy, 0700))
+				require.NoError(t, os.WriteFile(filepath.Join(policy, "active"), []byte(tc.active), 0600))
 			}
+
+			require.Equal(t, tc.wantAllowed, ipeInAuditMode(root))
 		})
 	}
 }
