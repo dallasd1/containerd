@@ -29,9 +29,11 @@ import (
 	"github.com/containerd/errdefs"
 	"github.com/containerd/platforms"
 
+	"github.com/opencontainers/go-digest"
 	"github.com/opencontainers/go-digest/digestset"
 	imagespec "github.com/opencontainers/image-spec/specs-go/v1"
 	assertlib "github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"k8s.io/apimachinery/pkg/util/sets"
 )
 
@@ -91,6 +93,35 @@ func TestImageSnapshottersNormalizeQualifiedReferences(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestImageSnapshottersWithMissingRetainedReferrer(t *testing.T) {
+	ctx := t.Context()
+	cs := imagetest.NewContentStore(ctx, t)
+	target := imagetest.SimpleManifest(50)(cs)
+	const referrerLabel = "containerd.io/gc.ref.content.dmverity"
+	const snapshotLabel = "containerd.io/gc.ref.snapshot.overlayfs"
+	missing := digest.FromString("missing referrer").String()
+	_, err := cs.Store.Update(ctx, content.Info{
+		Digest: target.Descriptor.Digest,
+		Labels: map[string]string{referrerLabel: missing},
+	}, "labels."+referrerLabel)
+	require.NoError(t, err)
+	_, err = cs.Store.Update(ctx, content.Info{
+		Digest: target.Children[0].Descriptor.Digest,
+		Labels: map[string]string{snapshotLabel: "ordinary-key"},
+	}, "labels."+snapshotLabel)
+	require.NoError(t, err)
+
+	store := NewStore(nil, cs.Store, platforms.Default())
+	img, err := store.getImage(ctx, images.Image{Name: "cached-image", Target: target.Descriptor})
+	require.NoError(t, err)
+	require.Equal(t, map[string]struct{}{"overlayfs": {}}, img.Snapshotters)
+	require.Empty(t, img.referrerSnapshotters)
+
+	info, err := cs.Store.Info(ctx, target.Descriptor.Digest)
+	require.NoError(t, err)
+	require.Equal(t, missing, info.Labels[referrerLabel], "cache refresh must not erase the signed observation")
 }
 
 func TestSnapshottersRefreshForExistingImage(t *testing.T) {

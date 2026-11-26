@@ -121,29 +121,26 @@ func (c *criService) mutateImageMount(
 	if err != nil {
 		return fmt.Errorf("failed to ensure %s is mounted: %w", target, err)
 	}
-	if mounted {
-		if !capable {
-			return setImageMountPath(extraMount, target)
+	if capable {
+		if err := c.rejectSignedImageVolume(ctx, containerdImage, snapshotter, platforms.Only(platform)); err != nil {
+			return err
 		}
 	}
 
-	i := containerdImage
-	if !capable {
-		img, err := c.client.ImageService().Get(ctx, ref)
-		if err != nil {
-			return fmt.Errorf("failed to get image volume ref %q: %w", ref, err)
-		}
-		i = containerd.NewImageWithPlatform(c.client, img, platforms.Only(platform))
-	}
-	diffIDs, err := i.RootFS(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to get diff IDs for image volume %q: %w", ref, err)
-	}
-	chainID := identity.ChainID(diffIDs).String()
-	if err := c.rejectSignedImageVolume(ctx, i, snapshotter, platforms.Only(platform)); err != nil {
-		return err
-	}
 	if !mounted {
+		i := containerdImage
+		if !capable {
+			img, err := c.client.ImageService().Get(ctx, ref)
+			if err != nil {
+				return fmt.Errorf("failed to get image volume ref %q: %w", ref, err)
+			}
+			i = containerd.NewImageWithPlatform(c.client, img, platforms.Only(platform))
+		}
+		diffIDs, err := i.RootFS(ctx)
+		if err != nil {
+			return fmt.Errorf("failed to get diff IDs for image volume %q: %w", ref, err)
+		}
+		chainID := identity.ChainID(diffIDs).String()
 		if err := i.Unpack(ctx, snapshotter); err != nil {
 			return fmt.Errorf("failed to unpack image volume: %w", err)
 		}

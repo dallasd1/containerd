@@ -63,9 +63,9 @@ func TestPullHandlerWrapperRequestIntent(t *testing.T) {
 			} else if tc.name == "explicit overlayfs" {
 				matched = []unpack.Platform{{SnapshotterKey: "overlayfs"}}
 			}
-			wrapper, err := lc.PullHandlerWrapper(t.Context(), nil, nil, tc.requested, matched)
-			if err != nil || (wrapper != nil) != tc.want {
-				t.Fatalf("wrapper present=%v want=%v error=%v", wrapper != nil, tc.want, err)
+			wrapper, finish, err := lc.PullHandlerWrapper(t.Context(), nil, nil, tc.requested, matched)
+			if err != nil || (wrapper != nil) != tc.want || (finish != nil) != tc.capable {
+				t.Fatalf("wrapper present=%v want=%v; finish present=%v want=%v; error=%v", wrapper != nil, tc.want, finish != nil, tc.capable, err)
 			}
 		})
 	}
@@ -165,7 +165,7 @@ func TestConfigureUnpackPlatforms(t *testing.T) {
 			}
 			if err == nil {
 				configureDmverityFetchRetention(ic, ms, lc)
-				wrapper, err := lc.PullHandlerWrapper(t.Context(), nil, nil, false, nil)
+				wrapper, _, err := lc.PullHandlerWrapper(t.Context(), nil, nil, false, nil)
 				if err != nil || wrapper == nil {
 					t.Fatalf("available snapshotter must enable fetch retention even without an applier: %v", err)
 				}
@@ -245,7 +245,7 @@ func TestConfigureDmverityFetchRetentionCapability(t *testing.T) {
 				t.Fatal(err)
 			}
 			configureDmverityFetchRetention(ic, ms, lc)
-			wrapper, err := lc.PullHandlerWrapper(t.Context(), nil, nil, false, nil)
+			wrapper, _, err := lc.PullHandlerWrapper(t.Context(), nil, nil, false, nil)
 			if err != nil || (wrapper != nil) != tc.want {
 				t.Fatalf("expected fetch retention %v, got wrapper %v, error %v", tc.want, wrapper != nil, err)
 			}

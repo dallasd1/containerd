@@ -209,6 +209,6 @@ type TransferConfig struct {
 	// RegistryConfigPath is a path to the root directory containing registry-specific configurations
 	RegistryConfigPath string
 
-	// PullHandlerWrapper creates an optional handler wrapper for each pull before the unpacker wraps the handler.
-	PullHandlerWrapper func(context.Context, remotes.Fetcher, content.Store, bool, []unpack.Platform) (func(images.Handler) images.Handler, error)
+	// PullHandlerWrapper may wrap dispatch and return a success callback run before releasing the pull lease.
+	PullHandlerWrapper func(context.Context, remotes.Fetcher, content.Store, bool, []unpack.Platform) (func(images.Handler) images.Handler, func(context.Context) error, error)
 }

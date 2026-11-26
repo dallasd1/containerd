@@ -1279,12 +1279,9 @@ func (c *criService) dmverityContainerImage(ctx context.Context, image imagestor
 	}
 	if requested == "" || isID(requested) {
 		snapshotKey := func(candidate containerd.Image) (string, error) {
-			signed, err := snpkg.ImageHasDmverityReferrer(ctx, candidate.ContentStore(), candidate.Target(), candidate.Platform())
-			if err != nil {
-				return "", err
-			}
-			if signed {
-				return snpkg.DmverityImageSnapshotKey(ctx, candidate.ContentStore(), candidate.Target(), candidate.Platform())
+			key, err := snpkg.LookupDmverityImageSnapshotKey(ctx, candidate.ContentStore(), candidate.Target(), candidate.Platform())
+			if err != nil || key != "" {
+				return key, err
 			}
 			diffIDs, err := candidate.RootFS(ctx)
 			if err != nil {

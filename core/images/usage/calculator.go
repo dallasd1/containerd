@@ -26,7 +26,6 @@ import (
 	"github.com/containerd/containerd/v2/core/snapshots"
 	"github.com/containerd/errdefs"
 	"github.com/containerd/platforms"
-	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 
 	"golang.org/x/sync/semaphore"
@@ -123,39 +122,24 @@ func CalculateImageUsage(ctx context.Context, i images.Image, provider content.I
 				}
 
 				if config.snapshots != nil {
-					labelSets := []map[string]string{info.Labels}
-					if referrer := info.Labels["containerd.io/gc.ref.content.dmverity"]; referrer != "" {
-						retained, err := provider.Info(ctx, digest.Digest(referrer))
-						if err != nil {
-							return nil, err
+					for k, v := range info.Labels {
+						const prefix = "containerd.io/gc.ref.snapshot."
+						if !strings.HasPrefix(k, prefix) {
+							continue
 						}
-						labelSets = append(labelSets, retained.Labels)
-					}
-					for _, labels := range labelSets {
-						for k, v := range labels {
-							const prefix = "containerd.io/gc.ref.snapshot."
-							if !strings.HasPrefix(k, prefix) {
-								continue
-							}
 
-							// Snapshotter names can now be in the form of <snapshotter>/<snapshot>. For example, "erofs/dmverity".
-							snapshotterName := k[len(prefix):]
-							if separator := strings.IndexByte(snapshotterName, '/'); separator >= 0 {
-								snapshotterName = snapshotterName[:separator]
-							}
-							sn := config.snapshots(snapshotterName)
-							if sn == nil {
-								continue
-							}
+						sn := config.snapshots(k[len(prefix):])
+						if sn == nil {
+							continue
+						}
 
-							u, err := sn.Usage(ctx, v)
-							if err != nil {
-								if !errdefs.IsNotFound(err) && !errdefs.IsInvalidArgument(err) {
-									return nil, err
-								}
-							} else {
-								usage += u.Size
+						u, err := sn.Usage(ctx, v)
+						if err != nil {
+							if !errdefs.IsNotFound(err) && !errdefs.IsInvalidArgument(err) {
+								return nil, err
 							}
+						} else {
+							usage += u.Size
 						}
 					}
 				}

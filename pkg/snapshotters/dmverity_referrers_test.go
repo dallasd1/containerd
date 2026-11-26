@@ -133,7 +133,7 @@ func TestImageHasDmverityReferrerForSelectedPlatform(t *testing.T) {
 }
 
 func TestDmverityImageSnapshotKeyUsesRetainedSelection(t *testing.T) {
-	for _, mode := range []string{"selected platform", "non-layer artifacts", "no signed observation", "missing bundle", "missing payload", "wrong subject", "wrong diffID count"} {
+	for _, mode := range []string{"selected platform", "non-layer artifacts", "no signed observation", "explicitly unsigned", "missing bundle", "missing payload", "wrong subject", "wrong diffID count"} {
 		t.Run(mode, func(t *testing.T) {
 			ctx := t.Context()
 			store := imagetest.NewContentStore(ctx, t)
@@ -168,6 +168,13 @@ func TestDmverityImageSnapshotKeyUsesRetainedSelection(t *testing.T) {
 				_, err = store.Update(ctx, content.Info{Digest: manifest.Descriptor.Digest}, "labels."+dmverityBundleContentLabel)
 				require.NoError(t, err)
 			}
+			if mode == "explicitly unsigned" {
+				_, err = store.Update(ctx, content.Info{
+					Digest: manifest.Descriptor.Digest,
+					Labels: map[string]string{dmverityNoReferrerLabel: "true"},
+				}, "labels")
+				require.NoError(t, err)
+			}
 			if mode == "missing bundle" {
 				require.NoError(t, store.Delete(ctx, bundle.Digest))
 			}
@@ -189,13 +196,19 @@ func TestDmverityImageSnapshotKeyUsesRetainedSelection(t *testing.T) {
 				imagetest.AddPlatform(otherManifest, otherPlatform),
 				imagetest.AddPlatform(manifest, platforms.DefaultSpec()),
 			)
-			key, err := DmverityImageSnapshotKey(ctx, store.Store, index.Descriptor, platforms.Default())
-			if mode == "selected platform" || mode == "non-layer artifacts" {
+			key, err := LookupDmverityImageSnapshotKey(ctx, store.Store, index.Descriptor, platforms.Default())
+			switch mode {
+			case "selected platform", "non-layer artifacts":
 				require.NoError(t, err)
 				expected, err := DmveritySnapshotKey(diffID.String(), "", root, digest.FromString("selected-sig").String())
 				require.NoError(t, err)
 				require.Equal(t, expected, key)
-			} else {
+			case "no signed observation", "explicitly unsigned":
+				require.NoError(t, err)
+				require.Empty(t, key)
+				_, err := DmverityImageSnapshotKey(ctx, store.Store, index.Descriptor, platforms.Default())
+				require.ErrorContains(t, err, "no selected signed snapshot chain")
+			default:
 				require.Error(t, err)
 				require.Empty(t, key)
 			}
@@ -729,10 +742,8 @@ func TestMalformedLatestReferrerPreservesRetainedSelection(t *testing.T) {
 			require.Equal(t, beforeLabels, after.Labels)
 			if wantErr == "" {
 				replacement := addTestDmverityReferrerWithRoot(t, store, subject, layer.Descriptor.Digest, "replacement", target.RootHash)
-				_, err := AppendSignatureHandlerWrapper(
-					referrerTestFetcher{referrers: []ocispec.Descriptor{replacement}}, store.Store,
-				)(base).Handle(ctx, subject)
-				require.NoError(t, err, "a malformed candidate must not prevent a later valid replacement")
+				publish := stageTestDmverityRotation(t, ctx, store.Store, base, subject, replacement)
+				require.NoError(t, publish(ctx), "a malformed candidate must not prevent a later valid replacement")
 				after, err = store.Info(ctx, subject.Digest)
 				require.NoError(t, err)
 				require.Equal(t, replacement.Digest.String(), after.Labels[dmverityBundleContentLabel])
@@ -803,7 +814,7 @@ func TestSignedBundleIsRetainedOnSubjectManifest(t *testing.T) {
 	referrer.Annotations = map[string]string{ocispec.AnnotationCreated: "2026-11-13T12:00:00Z"}
 	older := addTestDmverityReferrerWithRoot(t, store, subject, layer.Digest, "older", digest.FromString("root-retained").Encoded())
 	older.Annotations = map[string]string{ocispec.AnnotationCreated: "2026-11-12T12:00:00Z"}
-	fetcher := referrerTestFetcher{referrers: []ocispec.Descriptor{older}}
+	fetcher := referrerTestFetcher{referrers: []ocispec.Descriptor{older, referrer}}
 	base := images.HandlerFunc(func(_ context.Context, desc ocispec.Descriptor) ([]ocispec.Descriptor, error) {
 		if desc.Digest == subject.Digest {
 			return []ocispec.Descriptor{layer}, nil
@@ -811,9 +822,6 @@ func TestSignedBundleIsRetainedOnSubjectManifest(t *testing.T) {
 		return nil, nil
 	})
 
-	_, err := AppendSignatureHandlerWrapper(fetcher, store.Store)(base).Handle(ctx, subject)
-	require.NoError(t, err)
-	fetcher.referrers = []ocispec.Descriptor{older, referrer}
 	children, err := AppendSignatureHandlerWrapper(fetcher, store.Store)(base).Handle(ctx, subject)
 	require.NoError(t, err)
 	target, err := ParseDmverityTarget(children[0].Annotations[TargetLayerDmverityLabel])
@@ -934,7 +942,7 @@ func TestKnownSignedManifestWithMissingBundleFailsClosed(t *testing.T) {
 	require.ErrorContains(t, err, "read retained signed dm-verity bundle")
 }
 
-func TestDmverityObservationReplacesSignedBundleButKeepsAbsenceSticky(t *testing.T) {
+func TestDmverityObservationKeepsSignedSelectionUntilPublication(t *testing.T) {
 	ctx := t.Context()
 	store := imagetest.NewContentStore(ctx, t)
 	subject := store.Blob(ocispec.MediaTypeImageManifest, []byte("{}")).Descriptor.Digest
@@ -943,22 +951,14 @@ func TestDmverityObservationReplacesSignedBundleButKeepsAbsenceSticky(t *testing
 	first := addTestDmverityReferrerWithRoot(t, store, ocispec.Descriptor{Digest: subject}, layer, "first", root).Digest
 	second := addTestDmverityReferrerWithRoot(t, store, ocispec.Descriptor{Digest: subject}, layer, "replacement", root).Digest
 
-	for _, transition := range []struct {
-		referrer digest.Digest
-		expected digest.Digest
-	}{
-		{first, first},
-		{"", first},
-		{second, second},
-		{"", second},
-	} {
-		signed, err := recordDmverityObservation(ctx, store.Store, subject, transition.referrer, map[string]struct{}{layer.String(): {}})
+	for _, referrer := range []digest.Digest{first, "", second, ""} {
+		selected, err := recordDmverityObservation(ctx, store.Store, subject, referrer, map[string]struct{}{layer.String(): {}})
 		require.NoError(t, err)
-		require.True(t, signed)
+		require.Equal(t, first, selected)
 
 		info, err := store.Store.Info(ctx, subject)
 		require.NoError(t, err)
-		require.Equal(t, transition.expected.String(), info.Labels[dmverityBundleContentLabel])
+		require.Equal(t, first.String(), info.Labels[dmverityBundleContentLabel])
 		require.Empty(t, info.Labels[dmverityNoReferrerLabel])
 	}
 }
@@ -968,9 +968,9 @@ func TestDmverityObservationRecordsNoReferrerWithoutDemotingKnownSigned(t *testi
 	store := imagetest.NewContentStore(ctx, t)
 	subject := store.Blob(ocispec.MediaTypeImageManifest, []byte("{}")).Descriptor.Digest
 
-	signed, err := recordDmverityObservation(ctx, store.Store, subject, "", nil)
+	selected, err := recordDmverityObservation(ctx, store.Store, subject, "", nil)
 	require.NoError(t, err)
-	require.False(t, signed)
+	require.Empty(t, selected)
 
 	info, err := store.Store.Info(ctx, subject)
 	require.NoError(t, err)
@@ -1045,11 +1045,14 @@ func TestConflictingReferrerPreservesCachedSignedIdentity(t *testing.T) {
 	originalKey := preparation.Key
 
 	replacement := addTestDmverityReferrerWithRoot(t, store, subject, layer.Digest, "new-signature", digest.FromString("root-first").Encoded())
-	_, err = pull(replacement)
-	require.NoError(t, err)
+	overlap := addTestDmverityReferrerWithRoot(t, store, subject, layer.Digest, "overlapping-signature", digest.FromString("root-first").Encoded())
+	publish := stageTestDmverityRotation(t, ctx, store.Store, base, subject, replacement)
+	publishOverlap := stageTestDmverityRotation(t, ctx, store.Store, base, subject, overlap)
+	require.NoError(t, publish(ctx))
+	require.NoError(t, publishOverlap(ctx))
 	info, err = store.Store.Info(ctx, subject.Digest)
 	require.NoError(t, err)
-	require.Equal(t, replacement.Digest.String(), info.Labels[dmverityBundleContentLabel])
+	require.Equal(t, replacement.Digest.String(), info.Labels[dmverityBundleContentLabel], "an overlapping pull must not overwrite the published selection")
 	cached, err = AppendCachedSignatureHandlerWrapper(store.Store)(base).Handle(ctx, subject)
 	require.NoError(t, err)
 	replacedLabels, err := DmveritySnapshotLabels(cached[0])
@@ -1070,6 +1073,24 @@ func TestConflictingReferrerPreservesCachedSignedIdentity(t *testing.T) {
 	info, err = store.Store.Info(ctx, subject.Digest)
 	require.NoError(t, err)
 	require.Equal(t, replacement.Digest.String(), info.Labels[dmverityBundleContentLabel])
+}
+
+func stageTestDmverityRotation(t *testing.T, ctx context.Context, store content.Store, base images.Handler, subject, ref ocispec.Descriptor) func(context.Context) error {
+	t.Helper()
+	wrap, publish := DmverityUnpackHandlers(referrerTestFetcher{referrers: []ocispec.Descriptor{ref}}, store)
+	children, err := wrap(base).Handle(ctx, subject)
+	require.NoError(t, err)
+	target, err := PrepareDmverityLayer(ctx, children[len(children)-1], digest.FromString("chain").String(), "")
+	require.NoError(t, err)
+	require.Equal(t, ref.Digest, target.GCContent)
+	// Simulate the signed snapshot owner's edge written by successful unpack.
+	edge := "containerd.io/gc.ref.snapshot.erofs/" + target.GCQualifier
+	_, err = store.Update(ctx, content.Info{
+		Digest: ref.Digest,
+		Labels: map[string]string{edge: target.Key},
+	}, "labels."+edge)
+	require.NoError(t, err)
+	return publish
 }
 
 func TestConcurrentConflictingObservationsPreserveWinner(t *testing.T) {
