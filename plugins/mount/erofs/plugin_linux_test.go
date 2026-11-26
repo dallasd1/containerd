@@ -17,20 +17,93 @@
 package erofs
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"testing/synctest"
+	"time"
 
 	"github.com/containerd/containerd/v2/core/mount"
 	"github.com/containerd/containerd/v2/internal/fsmount"
 	"github.com/containerd/containerd/v2/pkg/testutil"
 	snapshotserofs "github.com/containerd/containerd/v2/plugins/snapshots/erofs"
 	"github.com/containerd/go-dmverity/pkg/verity"
+	"github.com/stretchr/testify/require"
 	"golang.org/x/sys/unix"
 )
+
+func TestStatSignedMapperForReuse(t *testing.T) {
+	busy := fmt.Errorf("open failed: %w", &verity.DeviceCreateError{Err: unix.EBUSY})
+
+	t.Run("waits for node after create busy", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "mapper-node")
+		synctest.Test(t, func(t *testing.T) {
+			go func() {
+				time.Sleep(25 * time.Millisecond)
+				if err := os.WriteFile(path, nil, 0600); err != nil {
+					t.Error(err)
+				}
+			}()
+			waited, err := statSignedMapperForReuse(t.Context(), path, busy)
+			require.NoError(t, err)
+			require.True(t, waited)
+			waited, err = statSignedMapperForReuse(t.Context(), path, busy)
+			require.NoError(t, err)
+			require.False(t, waited)
+		})
+	})
+
+	t.Run("missing node has a bounded wait", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "missing")
+		synctest.Test(t, func(t *testing.T) {
+			start := time.Now()
+			waited, err := statSignedMapperForReuse(t.Context(), path, busy)
+			require.True(t, waited)
+			require.ErrorIs(t, err, context.DeadlineExceeded)
+			require.ErrorIs(t, err, os.ErrNotExist)
+			require.LessOrEqual(t, time.Since(start), time.Second)
+		})
+	})
+
+	t.Run("caller cancellation ends wait", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "missing")
+		synctest.Test(t, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(t.Context())
+			go func() {
+				time.Sleep(25 * time.Millisecond)
+				cancel()
+			}()
+			waited, err := statSignedMapperForReuse(ctx, path, busy)
+			require.True(t, waited)
+			require.ErrorIs(t, err, context.Canceled)
+		})
+	})
+
+	t.Run("only create busy waits", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "missing")
+		for _, openErr := range []error{
+			fmt.Errorf("load table: %w", unix.EBUSY),
+			&verity.DeviceCreateError{Err: unix.EACCES},
+		} {
+			waited, err := statSignedMapperForReuse(t.Context(), path, openErr)
+			require.False(t, waited)
+			require.ErrorIs(t, err, os.ErrNotExist)
+		}
+	})
+
+	t.Run("other stat errors do not wait", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "invalid-link")
+		require.NoError(t, os.Symlink(filepath.Base(path), path))
+		waited, err := statSignedMapperForReuse(t.Context(), path, busy)
+		require.False(t, waited)
+		require.ErrorIs(t, err, unix.ELOOP)
+	})
+}
 
 func TestDmveritySignatureFileBounds(t *testing.T) {
 	source := filepath.Join(t.TempDir(), "layer.erofs")

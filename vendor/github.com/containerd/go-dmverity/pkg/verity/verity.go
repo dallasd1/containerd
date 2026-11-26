@@ -476,9 +476,15 @@ type deviceActivator interface {
 	RemoveDevice(string) error
 }
 
+// DeviceCreateError distinguishes a failed create from errors during activation.
+type DeviceCreateError struct{ Err error }
+
+func (e *DeviceCreateError) Error() string { return e.Err.Error() }
+func (e *DeviceCreateError) Unwrap() error { return e.Err }
+
 func activateDevice(c deviceActivator, name string, target dm.Target) (retErr error) {
 	if _, err := c.CreateDevice(name); err != nil {
-		return err
+		return &DeviceCreateError{Err: err}
 	}
 	defer func() {
 		if retErr != nil {
