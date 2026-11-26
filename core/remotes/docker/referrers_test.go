@@ -25,9 +25,12 @@ import (
 	"testing"
 
 	"github.com/containerd/containerd/v2/core/remotes"
+	remoteerrors "github.com/containerd/containerd/v2/core/remotes/errors"
 	"github.com/containerd/errdefs"
+	"github.com/opencontainers/go-digest"
 	specs "github.com/opencontainers/image-spec/specs-go"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+	"github.com/stretchr/testify/require"
 )
 
 func TestFetchReferrers(t *testing.T) {
@@ -44,6 +47,54 @@ func TestFetchReferrers(t *testing.T) {
 			tc.content = make([]byte, MaxManifestSize+1)
 		})
 	})
+}
+
+func TestFetchReferrersFallbackOutcome(t *testing.T) {
+	const artifactType = "application/vnd.test.sig"
+	for _, tc := range []struct {
+		name                string
+		api, fallback       int
+		wantStatus, wantLen int
+	}{
+		{"missing on both endpoints", 404, 404, 0, 0},
+		{"legacy fallback", 404, 200, 0, 1},
+		{"fallback succeeds despite API error", 503, 200, 0, 1},
+		{"missing fallback preserves API error", 503, 404, 503, 0},
+		{"missing fallback preserves auth error", 403, 404, 403, 0},
+		{"absent API does not hide fallback error", 404, 503, 503, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			subject := digest.FromString("subject")
+			tag := strings.Replace(subject.String(), ":", "-", 1)
+			index := newIndex(newContent(ocispec.MediaTypeImageManifest, []byte("signature"), withArtifactType(artifactType)))
+			mux := http.NewServeMux()
+			mux.HandleFunc("/v2/test/referrers/"+subject.String(), func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(tc.api)
+			})
+			mux.HandleFunc("/v2/test/manifests/"+tag, func(w http.ResponseWriter, _ *http.Request) {
+				if tc.fallback == http.StatusOK {
+					w.Header().Set("Content-Type", ocispec.MediaTypeImageIndex)
+				}
+				w.WriteHeader(tc.fallback)
+				if tc.fallback == http.StatusOK {
+					w.Write(index.OCIManifest())
+				}
+			})
+			host, options, close := tlsServer(mux)
+			defer close()
+			fetcher, err := NewResolver(options).Fetcher(t.Context(), host+"/test@"+subject.String())
+			require.NoError(t, err)
+			refs, err := fetcher.(remotes.ReferrersFetcher).FetchReferrers(t.Context(), subject, remotes.WithReferrerArtifactTypes(artifactType))
+			if tc.wantStatus != 0 {
+				var status remoteerrors.ErrUnexpectedStatus
+				require.ErrorAs(t, err, &status)
+				require.Equal(t, tc.wantStatus, status.StatusCode)
+			} else {
+				require.NoError(t, err)
+			}
+			require.Len(t, refs, tc.wantLen)
+		})
+	}
 }
 
 func runReferrersTest(t *testing.T, name string, sf func(h http.Handler) (string, ResolverOptions, func()), ropts ...contentOpt) {

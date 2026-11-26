@@ -26,9 +26,7 @@ import (
 
 	"github.com/containerd/continuity/fs"
 	"github.com/containerd/errdefs"
-	"github.com/containerd/go-dmverity/pkg/verity"
 	"github.com/containerd/log"
-	"github.com/opencontainers/go-digest"
 
 	"github.com/containerd/containerd/v2/core/mount"
 	"github.com/containerd/containerd/v2/core/snapshots"
@@ -736,18 +734,8 @@ func validateSignedArtifacts(layerBlob string, labels map[string]string) error {
 	if !strings.EqualFold(metadata.RootHash, rootHash) {
 		return fmt.Errorf("dm-verity metadata root hash %q does not match signed identity %q", metadata.RootHash, rootHash)
 	}
-	expected, err := digest.Parse(signatureDigest)
-	if err != nil {
-		return err
-	}
-	signature, err := verity.ReadSignatureFile(dmverity.SignaturePath(layerBlob))
-	if err != nil {
-		return err
-	}
-	if actual := expected.Algorithm().FromBytes(signature); actual != expected {
-		return fmt.Errorf("dm-verity signature digest %s does not match signed identity %s", actual, expected)
-	}
-	return nil
+	_, err = dmverity.ReadVerifiedSignature(layerBlob, signatureDigest)
+	return err
 }
 
 func (s *snapshotter) Commit(ctx context.Context, name, key string, opts ...snapshots.Opt) error {

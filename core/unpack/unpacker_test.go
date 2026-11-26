@@ -58,7 +58,7 @@ import (
 )
 
 func TestLayerPolicyCallbacks(t *testing.T) {
-	for _, mode := range []string{"new snapshot", "prepare error", "cache hit", "concurrent commit"} {
+	for _, mode := range []string{"new snapshot", "prepare error", "cache hit", "parallel cache hit", "concurrent commit"} {
 		t.Run(mode, func(t *testing.T) {
 			ctx := t.Context()
 			store := imagetest.NewContentStore(ctx, t)
@@ -95,11 +95,18 @@ func TestLayerPolicyCallbacks(t *testing.T) {
 					},
 				}, nil
 			}
-			if mode == "cache hit" || mode == "concurrent commit" {
+			cacheHit := mode == "cache hit" || mode == "parallel cache hit"
+			if cacheHit || mode == "concurrent commit" {
 				sn.committed[selectedKey] = snapshots.Info{Labels: map[string]string{"test.policy": "old"}}
 			}
 			sn.alreadyExistsOnCommit = mode == "concurrent commit"
-			u, err := NewUnpacker(ctx, store.Store, WithUnpackPlatform(up), WithDuplicationSuppressor(locker))
+			var opts []UnpackerOpt
+			if mode == "parallel cache hit" {
+				up.SnapshotterCapabilities = []string{"rebase"}
+				opts = append(opts, WithUnpackLimiter(semaphore.NewWeighted(2)))
+			}
+			opts = append(opts, WithUnpackPlatform(up), WithDuplicationSuppressor(locker))
+			u, err := NewUnpacker(ctx, store.Store, opts...)
 			require.NoError(t, err)
 			require.NoError(t, images.Dispatch(ctx, u.Unpack(images.ChildrenHandler(store.Store)), nil, manifest.Descriptor))
 			_, err = u.Wait()
@@ -113,10 +120,13 @@ func TestLayerPolicyCallbacks(t *testing.T) {
 				require.Equal(t, selectedKey, configInfo.Labels["containerd.io/gc.ref.snapshot.test/policy"])
 			} else {
 				require.ErrorIs(t, err, sentinel)
+				configInfo, err := store.Info(ctx, config.Descriptor.Digest)
+				require.NoError(t, err)
+				require.NotContains(t, configInfo.Labels, "containerd.io/gc.ref.snapshot.test/policy")
 			}
 			require.Equal(t, 1, preparations)
 			require.False(t, locker.isHeld(lockKey))
-			if mode == "cache hit" || mode == "concurrent commit" {
+			if cacheHit || mode == "concurrent commit" {
 				require.Equal(t, 1, validations)
 				require.Equal(t, "old", sn.committed[selectedKey].Labels["test.policy"])
 			} else {

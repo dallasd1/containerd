@@ -213,6 +213,11 @@ func (s *Store) getImage(ctx context.Context, i images.Image) (*Image, error) {
 		}
 		if referrer := info.Labels["containerd.io/gc.ref.content.dmverity"]; referrer != "" {
 			retained, err := s.provider.Info(ctx, imagedigest.Digest(referrer))
+			if errdefs.IsNotFound(err) {
+				// This is only cache bookkeeping. Signed selection still
+				// requires the retained referrer and its payloads.
+				return nil, nil
+			}
 			if err != nil {
 				return nil, err
 			}

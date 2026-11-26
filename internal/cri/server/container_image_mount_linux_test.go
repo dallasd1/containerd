@@ -20,14 +20,57 @@ package server
 
 import (
 	"context"
+	"errors"
+	"os"
 	"testing"
 
 	containerd "github.com/containerd/containerd/v2/client"
+	"github.com/containerd/containerd/v2/core/images"
+	"github.com/containerd/containerd/v2/core/images/imagetest"
 	"github.com/containerd/containerd/v2/core/snapshots"
+	imagestore "github.com/containerd/containerd/v2/internal/cri/store/image"
+	"github.com/containerd/containerd/v2/pkg/testutil"
+	"github.com/containerd/platforms"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/sys/unix"
 	runtime "k8s.io/cri-api/pkg/apis/runtime/v1"
 )
+
+func TestReuseOrdinaryImageVolumeWithoutRootFS(t *testing.T) {
+	testutil.RequiresRoot(t)
+	ctx := t.Context()
+	store := imagetest.NewContentStore(ctx, t)
+	manifest := imagetest.SimpleManifest(50)(store)
+	config := manifest.Children[0].Descriptor.Digest
+	const ref = "docker.io/library/test:volume"
+	client, err := containerd.New("", containerd.WithServices(
+		containerd.WithContentStore(store.Store),
+		containerd.WithImageStore(aliasImageStore{records: map[string]images.Image{
+			ref: {Name: ref, Target: manifest.Descriptor},
+		}}),
+	))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, client.Close()) })
+	service := &criService{
+		client: client, dmverityCapabilities: map[string]bool{"erofs": true},
+		ImageService: volumeImageService{image: imagestore.Image{ID: config.String(), References: []string{ref}}},
+	}
+	service.config.StateDir = t.TempDir()
+	target := service.getImageVolumeHostPath("sandbox", manifest.Descriptor.Digest.Encoded())
+	require.NoError(t, os.MkdirAll(target, 0700))
+	err = unix.Mount(target, target, "", unix.MS_BIND, "")
+	if errors.Is(err, unix.EPERM) {
+		t.Skip("requires bind mount privileges")
+	}
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, unix.Unmount(target, 0)) })
+
+	require.NoError(t, store.Delete(ctx, config))
+	m := &runtime.Mount{Readonly: true, Image: &runtime.ImageSpec{Image: ref}}
+	require.NoError(t, service.mutateImageMount(ctx, m, "erofs", "sandbox", platforms.DefaultSpec()))
+	require.Equal(t, target, m.HostPath)
+}
 
 func TestGetImageVolumeSnapshotOpts(t *testing.T) {
 	ctx := context.Background()

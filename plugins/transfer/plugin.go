@@ -116,16 +116,17 @@ func configureDmverityFetchRetention(ic *plugin.InitContext, ms *metadata.DB, lc
 			break
 		}
 	}
-	lc.PullHandlerWrapper = func(_ context.Context, fetcher remotes.Fetcher, store content.Store, requestHasUnpack bool, unpackPlatforms []unpack.Platform) (func(images.Handler) images.Handler, error) {
+	lc.PullHandlerWrapper = func(_ context.Context, fetcher remotes.Fetcher, store content.Store, requestHasUnpack bool, unpackPlatforms []unpack.Platform) (func(images.Handler) images.Handler, func(context.Context) error, error) {
 		for _, up := range unpackPlatforms {
 			if slices.Contains(up.SnapshotterCapabilities, plugins.CapabilityDmverityReferrers) {
-				return snpkg.AppendSignatureHandlerWrapper(fetcher, store), nil
+				wrapper, finish := snpkg.DmverityUnpackHandlers(fetcher, store)
+				return wrapper, finish, nil
 			}
 		}
 		if fetchRetention && !requestHasUnpack {
-			return snpkg.AppendSignatureHandlerWrapper(fetcher, store), nil
+			return snpkg.AppendSignatureHandlerWrapper(fetcher, store), nil, nil
 		}
-		return nil, nil
+		return nil, nil, nil
 	}
 	if fetchRetention {
 		ic.Meta.Capabilities = append(ic.Meta.Capabilities, plugins.CapabilityDmverityReferrers)

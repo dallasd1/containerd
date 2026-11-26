@@ -29,12 +29,14 @@ import (
 	"github.com/containerd/containerd/v2/core/diff"
 	"github.com/containerd/containerd/v2/core/images"
 	"github.com/containerd/containerd/v2/core/images/imagetest"
+	"github.com/containerd/containerd/v2/core/mount"
 	"github.com/containerd/containerd/v2/core/remotes"
 	"github.com/containerd/containerd/v2/core/snapshots"
 	"github.com/containerd/containerd/v2/core/transfer"
 	imageTransfer "github.com/containerd/containerd/v2/core/transfer/image"
 	"github.com/containerd/containerd/v2/core/unpack"
 	snpkg "github.com/containerd/containerd/v2/pkg/snapshotters"
+	"github.com/containerd/containerd/v2/plugins/snapshots/native"
 	"github.com/containerd/platforms"
 	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
@@ -96,6 +98,7 @@ func (testDmverityImageStore) Delete(context.Context, string, ...images.DeleteOp
 
 type testDmverityUnpackImageStore struct {
 	store *imageTransfer.Store
+	check func() error
 }
 
 type testDmveritySnapshotter struct {
@@ -106,11 +109,22 @@ type testDmverityApplier struct {
 	diff.Applier
 }
 
+type testApplyFunc func() (ocispec.Descriptor, error)
+
+func (f testApplyFunc) Apply(context.Context, ocispec.Descriptor, []mount.Mount, ...diff.ApplyOpt) (ocispec.Descriptor, error) {
+	return f()
+}
+
 func (s testDmverityUnpackImageStore) Store(
 	ctx context.Context,
 	desc ocispec.Descriptor,
 	store images.Store,
 ) ([]images.Image, error) {
+	if s.check != nil {
+		if err := s.check(); err != nil {
+			return nil, err
+		}
+	}
 	return s.store.Store(ctx, desc, store)
 }
 
@@ -126,7 +140,7 @@ func TestFetchOnlyPullRetainsDmverityBundleForOfflineUnpack(t *testing.T) {
 			config := store.JSONObject(ocispec.MediaTypeImageConfig, ocispec.Image{})
 			layer := store.RandomBlob(ocispec.MediaTypeImageLayer, 16)
 			manifest := store.Manifest(config, layer)
-			referrer := makeTestDmverityReferrer(store, manifest.Descriptor, layer.Descriptor)
+			referrer := makeTestDmverityReferrer(store, manifest.Descriptor, layer.Descriptor, "signature")
 			fetcher := &testDmverityFetcher{refs: []ocispec.Descriptor{referrer}}
 			index := store.Index(imagetest.AddPlatform(manifest, platforms.DefaultSpec()))
 			source := testDmveritySource{name: "registry.example/image:tag", target: index.Descriptor, fetcher: fetcher}
@@ -178,7 +192,7 @@ func TestExplicitUnpackDoesNotEnableFetchOnlyRetention(t *testing.T) {
 	config := store.JSONObject(ocispec.MediaTypeImageConfig, ocispec.Image{})
 	manifest := store.Manifest(config)
 	layer := store.RandomBlob(ocispec.MediaTypeImageLayer, 16)
-	referrer := makeTestDmverityReferrer(store, manifest.Descriptor, layer.Descriptor)
+	referrer := makeTestDmverityReferrer(store, manifest.Descriptor, layer.Descriptor, "signature")
 	fetcher := &testDmverityFetcher{refs: []ocispec.Descriptor{referrer}}
 	source := testDmveritySource{name: "registry.example/image:tag", target: manifest.Descriptor, fetcher: fetcher}
 	is := imageTransfer.NewStore(source.name,
@@ -225,12 +239,120 @@ func TestFetchOnlyPullPropagatesDmverityDiscoveryError(t *testing.T) {
 	require.Empty(t, info.Labels["containerd.io/gc.ref.content.dmverity"])
 }
 
-func testDmverityPullWrapper(enabled bool) func(context.Context, remotes.Fetcher, content.Store, bool, []unpack.Platform) (func(images.Handler) images.Handler, error) {
-	return func(_ context.Context, fetcher remotes.Fetcher, store content.Store, requestHasUnpack bool, _ []unpack.Platform) (func(images.Handler) images.Handler, error) {
-		if enabled && !requestHasUnpack {
-			return snpkg.AppendSignatureHandlerWrapper(fetcher, store), nil
+func TestPullPublishesDmverityRotationOnlyAfterUnpack(t *testing.T) {
+	for _, mode := range []string{"success", "apply failure", "store failure", "canceled", "not unpacked", "fetch only"} {
+		t.Run(mode, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			store := imagetest.NewContentStore(ctx, t)
+			platform := platforms.MustParse("linux/amd64")
+			diffID := digest.FromString("uncompressed layer")
+			config := store.JSONObject(ocispec.MediaTypeImageConfig, ocispec.Image{
+				Platform: platform,
+				RootFS:   ocispec.RootFS{Type: "layers", DiffIDs: []digest.Digest{diffID}},
+			})
+			layer := store.RandomBlob(ocispec.MediaTypeImageLayer, 16)
+			subject := store.Manifest(config, layer).Descriptor
+			original := makeTestDmverityReferrer(store, subject, layer.Descriptor, "original")
+			replacement := makeTestDmverityReferrer(store, subject, layer.Descriptor, "replacement")
+			fetcher := &testDmverityFetcher{refs: []ocispec.Descriptor{original}}
+			source := testDmveritySource{name: "registry.example/image:tag", target: subject, fetcher: fetcher}
+			sn, err := native.NewSnapshotter(t.TempDir())
+			require.NoError(t, err)
+			defer sn.Close()
+			sentinel := errors.New(mode)
+			applier := testApplyFunc(func() (ocispec.Descriptor, error) {
+				if mode == "apply failure" && fetcher.refs[0].Digest == replacement.Digest {
+					return ocispec.Descriptor{}, sentinel
+				}
+				return ocispec.Descriptor{Digest: diffID}, nil
+			})
+			ts := &localTransferService{
+				content: store.Store,
+				images:  testDmverityImageStore{},
+				config: TransferConfig{
+					PullHandlerWrapper: testDmverityPullWrapper(true),
+					UnpackPlatforms: []unpack.Platform{{
+						Platform:       platforms.OnlyStrict(platform),
+						SnapshotterKey: "erofs",
+						Snapshotter:    sn,
+						Applier:        applier,
+						PrepareLayer:   snpkg.PrepareDmverityLayer,
+					}},
+				},
+			}
+			unpackStore := func(p ocispec.Platform) *imageTransfer.Store {
+				return imageTransfer.NewStore(source.name, imageTransfer.WithUnpack(p, "erofs"))
+			}
+			require.NoError(t, ts.pull(ctx, source, testDmverityUnpackImageStore{store: unpackStore(platform)}, &transfer.Config{}))
+			key, err := snpkg.DmverityImageSnapshotKey(ctx, store.Store, subject, platforms.OnlyStrict(platform))
+			require.NoError(t, err)
+			_, err = sn.Stat(ctx, key)
+			require.NoError(t, err)
+
+			fetcher.refs = []ocispec.Descriptor{replacement}
+			unpackPlatform := platform
+			if mode == "not unpacked" {
+				unpackPlatform = platforms.MustParse("linux/arm64")
+				ts.config.UnpackPlatforms[0].Platform = platforms.OnlyStrict(unpackPlatform)
+			}
+			var dest transfer.ImageStorer = imageTransfer.NewStore(source.name)
+			if mode != "fetch only" {
+				dest = testDmverityUnpackImageStore{
+					store: unpackStore(unpackPlatform),
+					check: func() error {
+						beforeStore, err := snpkg.DmverityImageSnapshotKey(ctx, store.Store, subject, platforms.OnlyStrict(platform))
+						require.NoError(t, err)
+						require.Equal(t, key, beforeStore)
+						switch mode {
+						case "store failure":
+							return sentinel
+						case "canceled":
+							cancel()
+						}
+						return nil
+					},
+				}
+			}
+			err = ts.pull(ctx, source, dest, &transfer.Config{})
+			want := original.Digest
+			switch mode {
+			case "success":
+				require.NoError(t, err)
+				want = replacement.Digest
+			case "apply failure", "store failure":
+				require.ErrorIs(t, err, sentinel)
+			case "canceled":
+				require.ErrorIs(t, err, context.Canceled)
+			default:
+				require.NoError(t, err)
+			}
+			info, err := store.Info(t.Context(), subject.Digest)
+			require.NoError(t, err)
+			require.Equal(t, want.String(), info.Labels["containerd.io/gc.ref.content.dmverity"])
+			if mode == "success" {
+				selected, err := snpkg.DmverityImageSnapshotKey(ctx, store.Store, subject, platforms.OnlyStrict(platform))
+				require.NoError(t, err)
+				require.NotEqual(t, key, selected)
+				_, err = sn.Stat(ctx, selected)
+				require.NoError(t, err)
+			}
+		})
+	}
+}
+
+func testDmverityPullWrapper(enabled bool) func(context.Context, remotes.Fetcher, content.Store, bool, []unpack.Platform) (func(images.Handler) images.Handler, func(context.Context) error, error) {
+	return func(_ context.Context, fetcher remotes.Fetcher, store content.Store, requestHasUnpack bool, matched []unpack.Platform) (func(images.Handler) images.Handler, func(context.Context) error, error) {
+		if enabled {
+			if len(matched) == 1 && matched[0].PrepareLayer != nil {
+				wrapper, finish := snpkg.DmverityUnpackHandlers(fetcher, store)
+				return wrapper, finish, nil
+			}
+			if !requestHasUnpack {
+				return snpkg.AppendSignatureHandlerWrapper(fetcher, store), nil, nil
+			}
 		}
-		return nil, nil
+		return nil, nil, nil
 	}
 }
 
@@ -259,7 +381,7 @@ func TestPullHandlerWrapperRequestContext(t *testing.T) {
 			calls := 0
 			sentinel := errors.New("wrapper creation failure")
 			if mode != "nil" {
-				ts.config.PullHandlerWrapper = func(_ context.Context, f remotes.Fetcher, cs content.Store, requested bool, matched []unpack.Platform) (func(images.Handler) images.Handler, error) {
+				ts.config.PullHandlerWrapper = func(_ context.Context, f remotes.Fetcher, cs content.Store, requested bool, matched []unpack.Platform) (func(images.Handler) images.Handler, func(context.Context) error, error) {
 					calls++
 					require.Same(t, fetcher, f)
 					require.NotNil(t, cs)
@@ -270,9 +392,9 @@ func TestPullHandlerWrapperRequestContext(t *testing.T) {
 						require.Empty(t, matched)
 					}
 					if mode == "error" {
-						return nil, sentinel
+						return nil, nil, sentinel
 					}
-					return func(h images.Handler) images.Handler { return h }, nil
+					return func(h images.Handler) images.Handler { return h }, nil, nil
 				}
 			}
 			var storer transfer.ImageStorer = is
@@ -296,6 +418,7 @@ func TestPullHandlerWrapperRequestContext(t *testing.T) {
 func makeTestDmverityReferrer(
 	store imagetest.ContentStore,
 	subject, imageLayer ocispec.Descriptor,
+	signature string,
 ) ocispec.Descriptor {
 	payload := func(mediaType, data string, annotations map[string]string) ocispec.Descriptor {
 		descriptor := store.Blob(mediaType, []byte(data)).Descriptor
@@ -313,7 +436,7 @@ func makeTestDmverityReferrer(
 		Layers: []ocispec.Descriptor{
 			payload("application/vnd.containerd.erofs.metadata.v1", "metadata", nil),
 			payload("application/vnd.containerd.erofs.dmverity.merkle-tree.v1", "tree", nil),
-			payload("application/vnd.containerd.erofs.dmverity.layer-signature.v1+pkcs7", "signature",
+			payload("application/vnd.containerd.erofs.dmverity.layer-signature.v1+pkcs7", signature,
 				map[string]string{testDmverityRootHash: digest.FromString("root").Encoded()}),
 		},
 	}

@@ -217,9 +217,12 @@ changed. Unpack materializes the B chain if absent. Existing content blobs can
 be reused by digest, without promising block deduplication across snapshot files.
 
 A running container parented by `K2a` stays there, with the old materialized
-signature. Future CRI creation resolves the selected B chain. No signature
-file is overwritten in place. Cached same-root data is not evidence that the
-new signature was selected, nor does selection itself delete the A chain.
+signature. The pull uses B while cached CRI creates still resolve A. Only
+after B's signed chain is unpacked and the image is saved can the pull switch
+the selection to B. Failed or canceled pulls leave A selected. Fetch-only
+pulls can retain a first signed bundle for offline unpack, but do not rotate an
+existing signed selection. No signature file is overwritten in place, and
+selection itself does not delete the A chain.
 
 ## Who keeps each chain alive? The GC ownership fix
 

@@ -138,8 +138,7 @@ func (r dockerFetcher) openReferrers(ctx context.Context, dgst digest.Digest, co
 		rc, cl, err := r.open(ctx, req, mediaType, 0, i == len(fallbackHosts)-1)
 		if err != nil {
 			if errdefs.IsNotFound(err) {
-				// Equivalent to empty referrers list
-				firstErr = err
+				// A missing fallback tag must not mask a discovery error.
 				break
 			}
 			log.G(ctx).WithError(err).WithField("host", host.Host).Debug("error fetching referrers via fallback")

@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"maps"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/containerd/containerd/v2/core/content"
@@ -95,16 +96,30 @@ func PrepareDmverityLayer(_ context.Context, desc ocispec.Descriptor, chainID, p
 // artifacts, using the same preparation policy as unpack. Legacy signed keys
 // are not adopted or modified; the selected chain is materialized alongside them.
 func DmverityImageSnapshotKey(ctx context.Context, store content.Store, target ocispec.Descriptor, platform platforms.MatchComparer) (string, error) {
+	key, err := LookupDmverityImageSnapshotKey(ctx, store, target, platform)
+	if err == nil && key == "" {
+		return "", fmt.Errorf("image %s has no selected signed snapshot chain", target.Digest)
+	}
+	return key, err
+}
+
+// LookupDmverityImageSnapshotKey returns an empty key for an unsigned image.
+// A retained signed observation requires a complete, valid signed chain.
+func LookupDmverityImageSnapshotKey(ctx context.Context, store content.Store, target ocispec.Descriptor, platform platforms.MatchComparer) (string, error) {
 	children := images.LimitManifests(images.FilterPlatforms(images.ChildrenHandler(store), platform), platform, 1)
-	cached := AppendCachedSignatureHandlerWrapper(store)(children)
 	var key string
 	handler := images.HandlerFunc(func(ctx context.Context, desc ocispec.Descriptor) ([]ocispec.Descriptor, error) {
-		selected, err := cached.Handle(ctx, desc)
-		if err != nil {
+		selected, err := children(ctx, desc)
+		if err != nil || !images.IsManifestType(desc.MediaType) {
+			return selected, err
+		}
+		targets, _, err := loadRetainedDmverityBundle(ctx, store, desc, sanitizeDmverityImageLayers(selected))
+		if err != nil || targets == nil {
 			return nil, err
 		}
-		if !images.IsManifestType(desc.MediaType) {
-			return selected, nil
+		selected, err = annotateDmverityTargets(selected, targets)
+		if err != nil {
+			return nil, err
 		}
 		// ChildrenHandler returns the config followed by the ordered layers.
 		if len(selected) == 0 {
@@ -133,13 +148,13 @@ func DmverityImageSnapshotKey(ctx context.Context, store content.Store, target o
 			}
 			key = prepared.Key
 		}
+		if key == "" {
+			return nil, fmt.Errorf("manifest %s has no selected signed snapshot chain", desc.Digest)
+		}
 		return nil, nil
 	})
 	if err := images.Walk(ctx, handler, target); err != nil {
 		return "", err
-	}
-	if key == "" {
-		return "", fmt.Errorf("image %s has no selected signed snapshot chain", target.Digest)
 	}
 	return key, nil
 }
@@ -357,17 +372,34 @@ func readDmverityBundleManifest(
 	return infoMap, nil
 }
 
-// AppendSignatureHandlerWrapper fetches, validates, and retains the dm-verity referrer for an image manifest.
+// AppendSignatureHandlerWrapper retains referrers for fetch-only pulls without rotating an existing selection.
 func AppendSignatureHandlerWrapper(fetcher remotes.Fetcher, store content.Store) func(images.Handler) images.Handler {
 	return func(handler images.Handler) images.Handler {
 		return &dmverityHandler{handler: handler, fetcher: fetcher, store: store}
 	}
 }
 
+// DmverityUnpackHandlers gives unpack the candidate and publishes replacements only after a successful pull.
+func DmverityUnpackHandlers(fetcher remotes.Fetcher, store content.Store) (func(images.Handler) images.Handler, func(context.Context) error) {
+	h := &dmverityHandler{fetcher: fetcher, store: store, stageRotations: true}
+	return func(handler images.Handler) images.Handler {
+		h.handler = handler
+		return h
+	}, h.publishRotations
+}
+
+type dmverityRotation struct {
+	subject, previous, candidate digest.Digest
+}
+
 type dmverityHandler struct {
 	handler images.Handler
 	fetcher remotes.Fetcher
 	store   content.Store
+
+	stageRotations bool
+	mu             sync.Mutex
+	rotations      []dmverityRotation
 }
 
 // AppendCachedSignatureHandlerWrapper restores validated targets from retained referrers.
@@ -420,19 +452,25 @@ func (h *dmverityHandler) Handle(
 			log.G(ctx).WithField("manifest", desc.Digest).WithError(err).
 				Warn("Ignoring malformed latest dm-verity referrer; checking retained selection")
 		} else if discovered && selected == nil {
-			signed, err := recordDmverityObservation(ctx, h.store, desc.Digest, "", imageLayers)
+			current, err := recordDmverityObservation(ctx, h.store, desc.Digest, "", imageLayers)
 			if err != nil {
 				return nil, fmt.Errorf("record absence of dm-verity referrer for %s: %w", desc.Digest, err)
 			}
-			if !signed {
+			if current == "" {
 				return children, nil
 			}
 			requireSigned = true
 		}
 		if selected != nil {
-			_, err := recordDmverityObservation(ctx, h.store, desc.Digest, selected.desc.Digest, imageLayers)
+			current, err := recordDmverityObservation(ctx, h.store, desc.Digest, selected.desc.Digest, imageLayers)
 			if err != nil {
 				return nil, fmt.Errorf("record dm-verity referrer for %s: %w", desc.Digest, err)
+			}
+			if h.stageRotations && current != selected.desc.Digest {
+				h.mu.Lock()
+				h.rotations = append(h.rotations, dmverityRotation{desc.Digest, current, selected.desc.Digest})
+				h.mu.Unlock()
+				return annotateDmverityTargets(children, selected.layers)
 			}
 			requireSigned = true
 		}
@@ -451,61 +489,110 @@ func (h *dmverityHandler) Handle(
 	return annotateDmverityTargets(children, info)
 }
 
+// recordDmverityObservation records first observations and checks root continuity
+// for replacements. It returns the referrer still selected for cached creates.
 func recordDmverityObservation(
 	ctx context.Context,
 	store content.Store,
 	subject, referrer digest.Digest,
 	imageLayers map[string]struct{},
-) (bool, error) {
+) (digest.Digest, error) {
 	if err := dmverityObservationLocks.Lock(ctx, subject.String()); err != nil {
-		return false, err
+		return "", err
 	}
 	defer dmverityObservationLocks.Unlock(subject.String())
 
 	info, err := store.Info(ctx, subject)
 	if err != nil {
-		return false, fmt.Errorf("read current dm-verity observation for manifest %s: %w", subject, err)
+		return "", fmt.Errorf("read current dm-verity observation for manifest %s: %w", subject, err)
 	}
 	currentDigest, currentSigned, currentNoReferrer, err := parseDmverityObservation(info)
 	if err != nil {
-		return false, err
+		return "", err
 	}
 	if referrer == "" {
 		if currentSigned {
-			return true, nil
+			return currentDigest, nil
 		}
 		if currentNoReferrer {
-			return false, nil
+			return "", nil
 		}
 		err := updateDmverityObservation(ctx, store, subject, "", "true")
-		return false, err
+		return "", err
 	}
 
 	if currentSigned {
 		if currentDigest == referrer {
-			return true, nil
+			return currentDigest, nil
 		}
 		subjectDesc := ocispec.Descriptor{Digest: subject}
 		retained, _, err := loadRetainedDmverityBundle(ctx, store, subjectDesc, imageLayers)
 		if err != nil {
-			return false, err
+			return "", err
 		}
 		replacement, err := readDmverityBundle(ctx, store, ocispec.Descriptor{Digest: referrer}, subjectDesc, imageLayers)
 		if err != nil {
-			return false, err
+			return "", err
 		}
 		for layerDigest, target := range retained {
 			next := replacement[layerDigest]
 			if next == nil || !strings.EqualFold(target.RootHash, next.RootHash) {
-				return false, fmt.Errorf("dm-verity referrer replacement for manifest %s changes root hash for layer %s", subject, layerDigest)
+				return "", fmt.Errorf("dm-verity referrer replacement for manifest %s changes root hash for layer %s", subject, layerDigest)
 			}
 		}
+		return currentDigest, nil
 	}
 
 	if err := updateDmverityObservation(ctx, store, subject, referrer.String(), ""); err != nil {
-		return false, err
+		return "", err
 	}
-	return true, nil
+	return referrer, nil
+}
+
+func (h *dmverityHandler) publishRotations(ctx context.Context) error {
+	// Dispatch and unpack have joined their workers; the pull still holds its lease.
+	for _, rotation := range h.rotations {
+		if err := h.publishRotation(ctx, rotation); err != nil {
+			return fmt.Errorf("publish dm-verity replacement for %s: %w", rotation.subject, err)
+		}
+	}
+	return nil
+}
+
+func (h *dmverityHandler) publishRotation(ctx context.Context, rotation dmverityRotation) error {
+	info, err := h.store.Info(ctx, rotation.candidate)
+	if err != nil {
+		return err
+	}
+	// Wait can also succeed for a manifest that was fetched but not unpacked.
+	unpacked := false
+	for label, key := range info.Labels {
+		if key != "" && strings.HasPrefix(label, "containerd.io/gc.ref.snapshot.") &&
+			strings.HasSuffix(label, "/dmverity-"+digest.FromString(key).Encoded()) {
+			unpacked = true
+			break
+		}
+	}
+	if !unpacked {
+		return nil
+	}
+
+	if err := dmverityObservationLocks.Lock(ctx, rotation.subject.String()); err != nil {
+		return err
+	}
+	defer dmverityObservationLocks.Unlock(rotation.subject.String())
+	info, err = h.store.Info(ctx, rotation.subject)
+	if err != nil {
+		return err
+	}
+	current, _, _, err := parseDmverityObservation(info)
+	if err != nil || current != rotation.previous {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return updateDmverityObservation(ctx, h.store, rotation.subject, rotation.candidate.String(), "")
 }
 
 func parseDmverityObservation(info content.Info) (digest.Digest, bool, bool, error) {

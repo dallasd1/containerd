@@ -234,14 +234,16 @@ func (ts *localTransferService) pull(ctx context.Context, ir transfer.ImageFetch
 		}
 	}
 
+	var finishPull func(context.Context) error
 	if ts.config.PullHandlerWrapper != nil {
-		wrapper, err := ts.config.PullHandlerWrapper(ctx, fetcher, store, unpacker != nil, matchedPlatforms)
+		wrapper, finish, err := ts.config.PullHandlerWrapper(ctx, fetcher, store, unpacker != nil, matchedPlatforms)
 		if err != nil {
 			return fmt.Errorf("create pull handler wrapper: %w", err)
 		}
 		if wrapper != nil {
 			handler = wrapper(handler)
 		}
+		finishPull = finish
 	}
 	if unpacker != nil {
 		handler = unpacker.Unpack(handler)
@@ -274,6 +276,11 @@ func (ts *localTransferService) pull(ctx context.Context, ir transfer.ImageFetch
 	imgs, err := is.Store(ctx, desc, ts.images)
 	if err != nil {
 		return err
+	}
+	if finishPull != nil {
+		if err := finishPull(ctx); err != nil {
+			return err
+		}
 	}
 
 	if tops.Progress != nil {
